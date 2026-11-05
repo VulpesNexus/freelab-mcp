@@ -798,8 +798,14 @@ def stop():
 def load_as_module(path):
     """Load this file as a real module, so the running listener's globals are not FontLab's script namespace."""
     if PY2:
+        # open() takes a unicode path through the wide Windows API; imp.load_source does not.
         import imp
-        module = imp.load_source(MODULE_NAME, path)
+        module = imp.new_module(MODULE_NAME)
+        module.__file__ = path
+        sys.modules[MODULE_NAME] = module
+        with open(path, "rb") as handle:
+            source = handle.read()
+        exec(compile(source, MODULE_NAME + ".py", "exec", 0, True), module.__dict__)
     else:
         import importlib.util
         spec = importlib.util.spec_from_file_location(MODULE_NAME, path)
