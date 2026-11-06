@@ -2,7 +2,7 @@
 
 Every FontLab member the listener touches, where it comes from, and how far it is proven. The source is FontLab's own FontLab 7 reference, archived at [fontlabcom/fontlab-python-docs](https://github.com/fontlabcom/fontlab-python-docs) under *docs/archive/fontlab7/* (*fontlab.html*, *fontgate.html*), and the module-level names FontLab 7 imports in its own *startupScript.py*.
 
-Proof levels: **documented** (in the FontLab 7 reference), **stub-tested** (the listener uses it and the spy fakes accept only it), **live** (run in FontLab 7.2 and checked against what FontLab shows). Nothing is live yet.
+Proof levels: **documented** (in the FontLab 7 reference), **stub-tested** (the listener uses it and the spy fakes accept only it), **live** (run in FontLab 7.2 and checked against what FontLab shows). Only the listener loop is live so far; the font reads still need a test font.
 
 | Object | Member | Kind | Used by | Level |
 |---|---|---|---|---|
@@ -23,7 +23,14 @@ Proof levels: **documented** (in the FontLab 7 reference), **stub-tested** (the 
 | `flContour` | `closed` | property | `outline` | documented, stub-tested |
 | `flContour` | `nodes()` | method, list of `flNode` | `outline` | documented, stub-tested |
 | `flNode` | `x`, `y`, `type`, `smooth` | properties | `outline` | documented, stub-tested |
-| `PythonQt.QtCore` | `QTimer`: `setInterval`, `connect("timeout()", …)` (falling back to `timeout.connect(…)` if that raises or returns `False`), `start`, `stop` | Qt | the listener loop | not stub-tested; first live run |
+| `PythonQt.QtCore` | `QTimer`: `setInterval`, `connect("timeout()", …)` (falling back to `timeout.connect(…)` if that raises or returns `False`), `start`, `stop` | Qt | the listener loop | **live** (2026-11-06): `connect("timeout()", ...)` works |
+
+## Found live in FontLab 7.2 (2026-11-06)
+
+- *%LOCALAPPDATA%\FontLab\FontLab 7\startupScript.py* runs at launch, and its `print` output reaches the *Output* panel.
+- A script picked from the *Scripts* menu runs with `__file__` set to its path; modules it loads stay in `sys.modules` between runs.
+- `fontlab.flPreferences()` reads and writes the preferences (`colorWorkspace` and the other `color*` members are `QColor`s); a write is stored in the registry at once and shows on the next repaint.
+- PythonQt's quirks (properties as values, missing enum names, `winId()`, `findChildren`): [DARKMODE.md](DARKMODE.md).
 
 ## Corrections to the earlier FontLab MCP
 
