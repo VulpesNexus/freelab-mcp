@@ -22,7 +22,8 @@ import fakes  # noqa: E402
 import freelab_listener as fl  # noqa: E402
 from freelab_mcp import client, server  # noqa: E402
 
-EXPECTED_TOOLS = {"fontlab_status", "get_current_font", "list_glyphs", "get_glyph", "get_glyph_outline", "run_python"}
+EXPECTED_TOOLS = {"fontlab_status", "get_current_font", "list_glyphs", "get_glyph", "get_glyph_outline", "run_python",
+                  "launch_fontlab", "quit_fontlab", "restart_fontlab"}
 
 
 class ServerCase(unittest.TestCase):
@@ -188,6 +189,102 @@ class ToolTests(ServerCase):
             client.call("ping", timeout=0.5)
         self.assertEqual(ctx.exception.code, "timeout")
         self.assertLess(time.time() - start, 3)
+
+
+class LaunchTests(unittest.TestCase):
+    """launch_fontlab with the process side faked: no FontLab is started by these tests."""
+
+    def setUp(self):
+        self._saved = (server.launcher.fontlab_running, server.launcher.launch, server._call, server.anyio.sleep)
+        self.launched = []
+        self.pings = []
+
+        async def no_sleep(_seconds):
+            return None
+
+        server.anyio.sleep = no_sleep
+
+    def tearDown(self):
+        (server.launcher.fontlab_running, server.launcher.launch, server._call, server.anyio.sleep) = self._saved
+
+    def fake_call(self, answers):
+        async def call(op, args=None, timeout=None):
+            self.pings.append(op)
+            answer = answers.pop(0) if answers else None
+            if answer is None:
+                raise RuntimeError("[not_running] no listener")
+            return answer
+        server._call = call
+
+    def test_already_running_with_listener(self):
+        self.fake_call([{"listener": "0.1.0"}])
+        server.launcher.launch = lambda: self.launched.append(1) or 1
+        result = asyncio.run(server.launch_fontlab())
+        self.assertEqual(result["started"], False)
+        self.assertEqual(self.launched, [])
+
+    def test_running_without_listener_is_not_relaunched(self):
+        self.fake_call([None])
+        server.launcher.fontlab_running = lambda: True
+        server.launcher.launch = lambda: self.launched.append(1) or 1
+        with self.assertRaisesRegex(RuntimeError, "listener_not_running"):
+            asyncio.run(server.launch_fontlab())
+        self.assertEqual(self.launched, [])
+
+    def test_starts_and_waits_for_the_listener(self):
+        self.fake_call([None, None, {"listener": "0.1.0"}])
+        server.launcher.fontlab_running = lambda: False
+        server.launcher.launch = lambda: self.launched.append(1) or 4242
+        result = asyncio.run(server.launch_fontlab(wait_s=60))
+        self.assertEqual((result["started"], result["pid"]), (True, 4242))
+        self.assertEqual(self.launched, [1])
+
+    def test_missing_program(self):
+        self.fake_call([None])
+        server.launcher.fontlab_running = lambda: False
+
+        def missing():
+            raise FileNotFoundError("missing/FontLab 7.exe")
+
+        server.launcher.launch = missing
+        with self.assertRaisesRegex(RuntimeError, "not_found"):
+            asyncio.run(server.launch_fontlab())
+
+    def test_wait_bounds(self):
+        with self.assertRaisesRegex(RuntimeError, "bad_args"):
+            asyncio.run(server.launch_fontlab(wait_s=0))
+        with self.assertRaisesRegex(RuntimeError, "bad_args"):
+            asyncio.run(server.quit_fontlab(wait_s=0))
+
+    def test_quit_refusal_is_passed_on_and_nothing_waits(self):
+        async def call(op, args=None, timeout=None):
+            raise RuntimeError("[unsaved_changes] FontLab has unsaved changes")
+        server._call = call
+        checks = []
+        server.launcher.fontlab_running = lambda: checks.append(1) or True
+        with self.assertRaisesRegex(RuntimeError, "unsaved_changes"):
+            asyncio.run(server.quit_fontlab())
+        self.assertEqual(checks, [])
+
+    def test_quit_waits_for_the_process_to_end(self):
+        self.fake_call([{"quitting": True}])
+        states = [True, True, False]
+        server.launcher.fontlab_running = lambda: states.pop(0)
+        self.assertEqual(asyncio.run(server.quit_fontlab()), {"quit": True})
+
+    def test_quit_reports_a_fontlab_that_stays_open(self):
+        self.fake_call([{"quitting": True}])
+        server.launcher.fontlab_running = lambda: True
+        with self.assertRaisesRegex(RuntimeError, "still_running"):
+            asyncio.run(server.quit_fontlab(wait_s=0.01))
+
+    def test_restart_quits_then_launches(self):
+        self.fake_call([{"quitting": True}, None, {"listener": "0.1.0"}])
+        running = [True, False, False]
+        server.launcher.fontlab_running = lambda: running.pop(0) if running else False
+        server.launcher.launch = lambda: self.launched.append(1) or 77
+        result = asyncio.run(server.restart_fontlab(wait_s=60))
+        self.assertEqual((result["started"], result["pid"]), (True, 77))
 
 
 if __name__ == "__main__":

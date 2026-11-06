@@ -34,6 +34,7 @@ MAX_ACCEPTS_PER_TICK = 8
 DEFAULT_MAX_NODES = 2000
 MAX_NODES_LIMIT = 100000
 MODULE_NAME = "freelab_listener"
+QUIT_DELAY_MS = 300  # time for the reply to the quit request to reach the client
 
 PY2 = sys.version_info[0] == 2
 if PY2:  # pragma: no cover - exercised by the Python 2.7 test run
@@ -312,6 +313,39 @@ def op_status(listener, args):
     return result
 
 
+def unsaved_work():
+    """(workspace has changes, number of open fonts with unsaved changes), read from FontLab.
+
+    A read that fails raises: FontLab must never be quit on a guess.
+    """
+    fl = _fontlab()
+    workspace = fl.flWorkspace.instance()
+    try:
+        workspace_changed = bool(workspace.hasChanges)
+        fonts = sum(1 for package in workspace.packages() if package.hasChanges)
+    except Exception as exc:
+        raise FreeLabError("unreadable", "FontLab could not tell whether there are unsaved changes: %s" % _exc_text(exc))
+    return workspace_changed, fonts
+
+
+@op("unsaved")
+def op_unsaved(listener, args):
+    workspace_changed, fonts = unsaved_work()
+    return {"unsaved": workspace_changed or fonts > 0, "workspace": workspace_changed, "fonts": fonts}
+
+
+@op("quit")
+def op_quit(listener, args):
+    """Close FontLab as its close button would, a moment after replying; refused over any unsaved work."""
+    workspace_changed, fonts = unsaved_work()
+    if workspace_changed or fonts:
+        parts = (["%d font%s" % (fonts, "" if fonts == 1 else "s")] if fonts else []) + (["the workspace"] if workspace_changed else [])
+        raise FreeLabError("unsaved_changes", "FontLab has unsaved changes (%s): save them, or close them in FontLab, "
+                           "first. FreeLab never quits FontLab over unsaved work." % " and ".join(parts))
+    listener.request_quit()
+    return {"quitting": True}
+
+
 @op("font_info")
 def op_font_info(listener, args):
     package, count = current_package()
@@ -530,6 +564,41 @@ class Listener(object):
         self.errors = []
         self._busy = False
         self._reported = set()
+        self.quit_timer = None
+        self.quit_requested = False
+
+    # -- quitting FontLab ----------------------------------------------------
+    def request_quit(self, delay_ms=QUIT_DELAY_MS):
+        """Close FontLab's main window shortly, after this request's reply has gone out.
+
+        Closing the window, rather than ending the application, runs FontLab's own
+        shutdown: its preferences are saved, and it may still ask something on screen.
+        """
+        self.quit_requested = True
+        from PythonQt.QtCore import QTimer  # only inside FontLab
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timer.setInterval(delay_ms)
+        try:
+            connected = timer.connect("timeout()", self._close_main_window) is not False
+        except Exception:
+            connected = False
+        if not connected:
+            timer.timeout.connect(self._close_main_window)
+        timer.start()
+        self.quit_timer = timer  # referenced until it fires
+
+    def _close_main_window(self):
+        try:
+            from PythonQt.QtGui import QApplication
+            app = QApplication.instance()
+            windows = [w for w in app.topLevelWidgets() if w.metaObject().className() == "MainWindow"]
+            if windows:
+                windows[0].close()
+            else:
+                app.quit()
+        except BaseException as exc:  # a Qt timer callback must not raise
+            self.errors.append("quit: %s" % _exc_text(exc))
 
     # -- namespace for run_python ------------------------------------------
     def fresh_namespace(self):
@@ -783,6 +852,9 @@ def main(port=None):
         listener.stop()
         raise
     sys._freelab_listener = listener  # survives FontLab clearing the script context
+    # FontLab may drop modules from sys.modules; a Python 2 module no longer referenced has its
+    # globals set to None, which would break every later tick. Keep this one referenced.
+    sys._freelab_listener_module = sys.modules.get(MODULE_NAME)
     print("FreeLab listener %s on %s:%d (Python %s)" % (VERSION, HOST, listener.port, sys.version.split()[0]))
     return listener
 

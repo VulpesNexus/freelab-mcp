@@ -66,6 +66,54 @@ class ListenerCase(unittest.TestCase):
         return reply["error"]
 
 
+class QuitTests(ListenerCase):
+    def setUp(self):
+        ListenerCase.setUp(self)
+        self.quits = []
+        self.listener.request_quit = lambda delay_ms=0: self.quits.append(delay_ms)
+
+    def test_unsaved_reports_fonts_and_workspace(self):
+        self.state.unsaved = [False, True, True]
+        self.assertEqual(self.ok("unsaved"), {"unsaved": True, "workspace": False, "fonts": 2})
+        self.state.unsaved = [False]
+        self.state.workspace_changed = True
+        self.assertEqual(self.ok("unsaved"), {"unsaved": True, "workspace": True, "fonts": 0})
+
+    def test_quit_is_refused_over_an_unsaved_font(self):
+        self.state.unsaved = [True]
+        error = self.fails("quit", code="unsaved_changes")
+        self.assertIn("1 font", error["message"])
+        self.assertEqual(self.quits, [])
+
+    def test_quit_is_refused_over_an_unsaved_workspace(self):
+        self.state.workspace_changed = True
+        self.fails("quit", code="unsaved_changes")
+        self.assertEqual(self.quits, [])
+
+    def test_quit_is_refused_when_fontlab_cannot_tell(self):
+        class Broken(object):
+            @property
+            def hasChanges(self):
+                raise RuntimeError("no")
+
+            def packages(self):
+                return []
+
+        fontlab = sys.modules["fontlab"]
+        saved = fontlab.flWorkspace
+        fontlab.flWorkspace = type("W", (object,), {"instance": staticmethod(lambda: Broken())})
+        try:
+            self.fails("quit", code="unreadable")
+        finally:
+            fontlab.flWorkspace = saved
+        self.assertEqual(self.quits, [])
+
+    def test_quit_with_nothing_unsaved(self):
+        self.state.unsaved = [False, False]
+        self.assertEqual(self.ok("quit"), {"quitting": True})
+        self.assertEqual(len(self.quits), 1)
+
+
 class ProtocolTests(ListenerCase):
     def test_wrong_token_is_refused_without_echoing_the_id(self):
         reply = self.request("ping", token="0" * 32)

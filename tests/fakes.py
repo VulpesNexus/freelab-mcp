@@ -209,15 +209,33 @@ class NullUnknown(flGlyph):
         return flGlyph.__getattribute__(self, name)
 
 
+class _PackageObject(Native):
+    """What flWorkspace.packages() returns in FontLab 7: generic flObject items that know hasChanges."""
+    _members = ("hasChanges",)
+
+    def __init__(self, unsaved):
+        object.__setattr__(self, "_f_unsaved", unsaved)
+
+    def __getattribute__(self, name):
+        if name == "hasChanges":
+            return object.__getattribute__(self, "_f_unsaved")
+        return Native.__getattribute__(self, name)
+
+
 class _Workspace(Native):
-    _members = ("currentPackage",)
+    _members = ("currentPackage", "hasChanges", "packages")
 
     def __init__(self, state):
         object.__setattr__(self, "_f_state", state)
 
     def __getattribute__(self, name):
+        state = object.__getattribute__(self, "_f_state")
         if name == "currentPackage":
-            return object.__getattribute__(self, "_f_state").current
+            return state.current
+        if name == "hasChanges":
+            return state.workspace_changed
+        if name == "packages":  # a method in FontLab 7: flWorkspace.packages()
+            return lambda: [_PackageObject(unsaved) for unsaved in state.unsaved]
         return Native.__getattribute__(self, name)
 
 
@@ -225,6 +243,8 @@ class FontLabState(object):
     def __init__(self):
         self.fonts = []
         self.current = None
+        self.workspace_changed = False
+        self.unsaved = []  # one flag per open package
 
 
 def square(x0, y0, size):
