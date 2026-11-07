@@ -29,7 +29,7 @@ Proof levels: **documented** (in the FontLab 7 reference), **stub-tested** (the 
 | `flNode` | `x`, `y`, `type`, `smooth` | properties | `outline` | documented, stub-tested |
 | `PythonQt.QtCore` | `QTimer`: `setInterval`, `setSingleShot`, `connect("timeout()", …)` (falling back to `timeout.connect(…)` if that raises or returns `False`), `start`, `stop` | Qt | the listener loop, `quit` | **live** (2026-11-06): `connect("timeout()", ...)` works |
 | `PythonQt.QtGui` | `QApplication.instance()`, `topLevelWidgets()`, `metaObject().className()`, `close()` | Qt | `quit` | stub-tested; **live** (2026-11-07): the main window's class is `MainWindow` |
-| `PythonQt.QtGui` | `QApplication.activeModalWidget()`, its labels' and buttons' `text` | Qt | `dialog` | **live** (2026-11-07): closing with an edited font shows `DlgClosePackage`, *FontLab Warning*, *Save changes to "..." before closing?*, with *Don't Save*, *Cancel*, and *OK* |
+| `PythonQt.QtGui` | `QApplication.activeModalWidget()`, its labels' and buttons' `text` | Qt | `dialog` | **live** (2026-11-07): closing with an edited font shows `DlgClosePackage`, *FontLab Warning*, *Save changes to "…" before closing?*, with *Don't Save*, *Cancel*, and *OK* |
 
 ## Found live in FontLab 7.2 (2026-11-06)
 

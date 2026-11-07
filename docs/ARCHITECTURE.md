@@ -50,7 +50,7 @@ Listener error codes: `bad_json`, `bad_request`, `bad_token`, `bad_protocol`, `e
 | `run_python` | runs code in FontLab, returns printed output, `result`, and any traceback |
 | `unsaved` | whether the workspace or any open font has changes FontLab reports, and how many fonts were edited since they were opened (`edited`: FontLab 7.2 reports an edit only through its undo history) |
 | `dialog` | the window FontLab is waiting on, if any: its class, title, texts, and buttons; it only reads |
-| `quit` | refused with `unsaved_changes` when FontLab reports changes (or `unreadable` when it cannot tell); otherwise closes FontLab's main window a moment after replying, as its close button would. FontLab then asks about each edited font itself (*Save changes to ... before closing?*); `quit_fontlab` reads that question through `dialog`, leaves it on screen, and returns it as `save_prompt` |
+| `quit` | refused with `unsaved_changes` when FontLab reports changes (or `unreadable` when it cannot tell); otherwise closes FontLab's main window a moment after replying, as its close button would. FontLab then asks about each edited font itself (*Save changes to … before closing?*); `quit_fontlab` reads that question through `dialog`, leaves it on screen, and returns it as `save_prompt` |
 
 ## Error model
 
