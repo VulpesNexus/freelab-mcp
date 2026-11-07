@@ -9,17 +9,20 @@ server keeps answering pings and cancellations while FontLab works.
 from __future__ import annotations
 
 import functools
+import time
 from typing import Any
 
 import anyio
 from mcp.server.fastmcp import FastMCP
 
-import time
-
 from . import __version__, launcher
 from .client import DEFAULT_TIMEOUT_S, ListenerError, call
 
 MAX_TIMEOUT_S = 600.0
+# Ping errors that mean no listener answers (FontLab closed, or its listener not started), and those
+# met while a freshly launched FontLab is still starting (old state file, busy loading).
+LISTENER_ABSENT = ("[not_running]", "[connection]", "[empty_reply]")
+LISTENER_STARTING = ("[timeout]", "[bad_state]", "[bad_token]")
 
 mcp = FastMCP(
     "freelab",
@@ -110,7 +113,8 @@ async def run_python(code: str, persist: bool = False, timeout_s: float = 30.0) 
 
     The namespace holds the fontlab, fontgate, FL, and PythonQt modules. Assign to `result` to return a
     value. With persist=True, names survive between calls. The code runs on FontLab's main thread, so
-    FontLab is busy until it finishes (timeout_s, at most 600). It can change or lose work in open fonts:
+    FontLab is busy until it finishes; the server waits up to timeout_s (at most 600), and code still
+    running then keeps running. It can change or lose work in open fonts:
     use it for reads and probes, and change a font only when the user asked for that change.
     """
     if not 0 < timeout_s <= MAX_TIMEOUT_S:
@@ -123,15 +127,16 @@ async def launch_fontlab(wait_s: float = 120.0) -> dict[str, Any]:
     """Start FontLab 7 when it is not running, then wait for its listener (only when the user asked to start FontLab).
 
     The listener answers after a launch only when FontLab's startup script starts it (installed with
-    tools/install-fontlab.ps1 -ListenerAtLaunch). FreeLab never quits or restarts FontLab: that could lose
-    unsaved work, so ask the user to close it.
+    tools/install-fontlab.ps1 -ListenerAtLaunch). To close FontLab, use quit_fontlab or restart_fontlab,
+    which are refused while there is unsaved work.
     """
     if not 0 < wait_s <= MAX_TIMEOUT_S:
         raise RuntimeError(f"[bad_args] wait_s must be above 0 and at most {MAX_TIMEOUT_S:g}.")
     try:
         return {"started": False, "listener": await _call("ping", timeout=5.0)}
-    except RuntimeError:
-        pass
+    except RuntimeError as exc:
+        if not str(exc).startswith(LISTENER_ABSENT):
+            raise  # it answered, or is there but busy: a launch would not help
     if await anyio.to_thread.run_sync(launcher.fontlab_running):
         raise RuntimeError("[listener_not_running] FontLab is running, but its listener is not: in FontLab, choose "
                            "Scripts > FreeLab > Start Listener.")
@@ -144,8 +149,10 @@ async def launch_fontlab(wait_s: float = 120.0) -> dict[str, Any]:
         await anyio.sleep(2.0)
         try:
             return {"started": True, "pid": pid, "listener": await _call("ping", timeout=5.0)}
-        except RuntimeError:
-            continue
+        except RuntimeError as exc:
+            if str(exc).startswith(LISTENER_ABSENT + LISTENER_STARTING):
+                continue
+            raise
     raise RuntimeError(f"[no_listener] FontLab started (process {pid}), but its listener did not answer within "
                        f"{wait_s:g} s. Install with tools/install-fontlab.ps1 -ListenerAtLaunch to start it at launch, "
                        "or choose Scripts > FreeLab > Start Listener.")
@@ -183,6 +190,8 @@ async def restart_fontlab(wait_s: float = 120.0) -> dict[str, Any]:
     Refused while any font or the workspace has unsaved changes. The listener answers after the restart
     only when FontLab's startup script starts it (tools/install-fontlab.ps1 -ListenerAtLaunch).
     """
+    if not 0 < wait_s <= MAX_TIMEOUT_S:  # before closing anything
+        raise RuntimeError(f"[bad_args] wait_s must be above 0 and at most {MAX_TIMEOUT_S:g}.")
     await quit_fontlab(wait_s=min(wait_s, 60.0))
     return await launch_fontlab(wait_s=wait_s)
 

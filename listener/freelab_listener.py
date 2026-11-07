@@ -34,7 +34,8 @@ MAX_ACCEPTS_PER_TICK = 8
 DEFAULT_MAX_NODES = 2000
 MAX_NODES_LIMIT = 100000
 MODULE_NAME = "freelab_listener"
-QUIT_DELAY_MS = 300  # time for the reply to the quit request to reach the client
+QUIT_DELAY_MS = 300  # the main window closes from a later timer tick, once the quit request is handled
+MAX_ERRORS = 100  # errors kept for tests and probes (an error repeating every tick must not grow without end)
 
 PY2 = sys.version_info[0] == 2
 if PY2:  # pragma: no cover - exercised by the Python 2.7 test run
@@ -322,7 +323,7 @@ def unsaved_work():
     workspace = fl.flWorkspace.instance()
     try:
         workspace_changed = bool(workspace.hasChanges)
-        fonts = sum(1 for package in workspace.packages() if package.hasChanges)
+        fonts = sum(1 for package in _real_list(workspace.packages(), "flWorkspace.packages()") if package.hasChanges)
     except Exception as exc:
         raise FreeLabError("unreadable", "FontLab could not tell whether there are unsaved changes: %s" % _exc_text(exc))
     return workspace_changed, fonts
@@ -589,16 +590,21 @@ class Listener(object):
         self.quit_timer = timer  # referenced until it fires
 
     def _close_main_window(self):
+        """Close FontLab's main window (class MainWindow in FontLab 7.2, seen live).
+
+        Never QApplication.quit(): it ends the event loop without FontLab's own shutdown
+        or its last questions. When the window is not found, FontLab stays open, the
+        Output panel says why, and quit_fontlab reports that FontLab is still running.
+        """
         try:
             from PythonQt.QtGui import QApplication
             app = QApplication.instance()
             windows = [w for w in app.topLevelWidgets() if w.metaObject().className() == "MainWindow"]
-            if windows:
-                windows[0].close()
-            else:
-                app.quit()
+            if not windows:
+                raise FreeLabError("not_found", "FontLab's main window was not found, so FontLab was not closed.")
+            windows[0].close()
         except BaseException as exc:  # a Qt timer callback must not raise
-            self.errors.append("quit: %s" % _exc_text(exc))
+            self._record("quit", exc)
 
     # -- namespace for run_python ------------------------------------------
     def fresh_namespace(self):
@@ -640,7 +646,7 @@ class Listener(object):
     def _write_state(self):
         folder = os.path.dirname(self.state_file)
         if folder and not os.path.isdir(folder):
-            os.makedirs(folder)
+            os.makedirs(folder, 0o700)  # the token is readable by its owner only (Windows ignores the mode)
         data = {
             "port": self.port,
             "token": self.token,
@@ -650,7 +656,9 @@ class Listener(object):
             "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         temp = self.state_file + ".tmp"
-        with open(temp, "w") as handle:
+        if os.path.exists(temp):
+            os.remove(temp)
+        with os.fdopen(os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as handle:
             json.dump(data, handle)
         for attempt in range(20):  # a reader may hold the file for a moment
             try:
@@ -722,6 +730,7 @@ class Listener(object):
     def _record(self, key, exc):
         try:
             self.errors.append(_exc_text(exc))
+            del self.errors[:-MAX_ERRORS]
             if key not in self._reported:
                 self._reported.add(key)
                 print(u"FreeLab listener error (shown once): " + _exc_text(exc))
@@ -813,7 +822,8 @@ class Listener(object):
             if not isinstance(token, string_types) or not hmac.compare_digest(_bytes(token), _bytes(self.token)):
                 raise FreeLabError("bad_token", "The token does not match this listener; reread the state file.")
             request_id = request.get("id")  # echoed only once the caller is authenticated
-            if request.get("protocol") != PROTOCOL:
+            protocol = request.get("protocol")
+            if not isinstance(protocol, int) or isinstance(protocol, bool) or protocol != PROTOCOL:
                 raise FreeLabError("bad_protocol", "Protocol %r is not %d." % (request.get("protocol"), PROTOCOL))
             deadline = request.get("deadline")
             if deadline is not None:

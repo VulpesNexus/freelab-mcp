@@ -25,7 +25,6 @@ param([switch]$Uninstall, [switch]$ListenerAtLaunch, [string]$ScriptsDir, [strin
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
-$utf8 = New-Object System.Text.UTF8Encoding $false
 
 if ($ScriptsDir) { $scripts = $ScriptsDir }
 else {
@@ -48,6 +47,18 @@ function Remove-Block([string]$text) {
     return [regex]::Replace($text, $pattern, "`n").TrimEnd("`n") + "`n"
 }
 
+# The block put where it already is (the other repository's block keeps its place), or appended.
+function Set-Block([string]$text, [string]$newBlock) {
+    $re = New-Object System.Text.RegularExpressions.Regex ([regex]::Escape($begin) + '(?s:.*?)' + [regex]::Escape($end) + '[^\n]*')
+    if ($re.IsMatch($text)) {
+        $evaluator = [System.Text.RegularExpressions.MatchEvaluator] { param($m) $newBlock }.GetNewClosure()
+        return $re.Replace($text, $evaluator, 1)
+    }
+    $text = $text.TrimEnd("`n")
+    if ($text) { $text += "`n" }
+    return $text + $newBlock + "`n"
+}
+
 # The one block FreeLab wrote before the MCP and the tools became separate repositories
 # (dark mode and the listener together). Either installer takes it out and says so.
 $legacyPattern = '(?s)\n?# >>> FreeLab \(managed.*?# <<< FreeLab[ \t]*(\n|$)'
@@ -68,10 +79,57 @@ function ConvertTo-PyLiteral([string]$s) {
     return $sb.ToString()
 }
 
+# FontLab's startup script is read as strict UTF-8 (a BOM is kept) and written back with its own
+# line endings, and only when it changes. A file that is not UTF-8, or whose FreeLab markers are
+# not paired, is left alone: rewriting it would replace characters or delete the user's code.
 $current = ''
-if (Test-Path $startup) { $current = [System.IO.File]::ReadAllText($startup) -replace "`r`n", "`n" }
+$normalized = ''
+$bom = $false
+$crlf = $false
+if (Test-Path $startup) {
+    $bytes = [System.IO.File]::ReadAllBytes($startup)
+    $bom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+    $skip = 0
+    if ($bom) { $skip = 3 }
+    $strict = New-Object System.Text.UTF8Encoding $false, $true
+    try { $original = $strict.GetString($bytes, $skip, $bytes.Length - $skip) }
+    catch {
+        Write-Output "$startup is not UTF-8 text, so it is left as it is. Save it as UTF-8 and run this again."
+        exit 1
+    }
+    $crlf = $original.Contains("`r`n")
+    $normalized = $original -replace "`r`n", "`n"
+    $current = $normalized
+}
+function Test-Paired([string]$text, [string]$open, [string]$close) {
+    return ([regex]::Matches($text, '(?m)^' + $open)).Count -eq ([regex]::Matches($text, '(?m)^' + $close + '[ \t]*$')).Count
+}
+if (-not (Test-Paired $current ([regex]::Escape($begin)) ([regex]::Escape($end))) -or
+    -not (Test-Paired $current '# >>> FreeLab \(managed' '# <<< FreeLab')) {
+    Write-Output "$startup has a FreeLab begin marker without its end marker, or the reverse, so it is left as it is. Remove the broken block by hand and run this again."
+    exit 1
+}
+function Test-Changed([string]$text) {
+    return $text.TrimEnd("`n") -ne $normalized.TrimEnd("`n")
+}
+function Save-Startup([string]$text) {
+    if ((Test-Path $startup) -and -not (Test-Path "$startup.freelab-backup")) {
+        [System.IO.File]::Copy($startup, "$startup.freelab-backup")
+        Write-Host "Kept the original startup script as $startup.freelab-backup"
+    }
+    $folder = Split-Path -Parent $startup
+    if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder | Out-Null }
+    if ($crlf) { $text = $text -replace "`n", "`r`n" }
+    [System.IO.File]::WriteAllText($startup, $text, (New-Object System.Text.UTF8Encoding $bom))
+}
 $legacy = [regex]::IsMatch($current, $legacyPattern)
 $hadBlock = $current.Contains($begin)
+if ($ListenerAtLaunch -and -not $Uninstall -and -not (Test-Path $startup)) {
+    # FontLab writes its own startup script (its default imports) when it first starts; one made here
+    # holding only this block could keep FontLab from writing it.
+    Write-Output "FontLab has not made its startup script yet ($startup): start FontLab once, quit it, and run this again."
+    exit 1
+}
 if ($legacy) { $current = [regex]::Replace($current, $legacyPattern, "`n").TrimEnd("`n") + "`n" }
 function Write-LegacyNote {
     if ($legacy) {
@@ -79,23 +137,16 @@ function Write-LegacyNote {
     }
 }
 
-function Save-Startup([string]$text) {
-    if (-not (Test-Path "$startup.freelab-backup")) {
-        [System.IO.File]::Copy($startup, "$startup.freelab-backup")
-        Write-Output "Kept the original startup script as $startup.freelab-backup"
-    }
-    [System.IO.File]::WriteAllText($startup, $text, $utf8)
-}
-
 if ($Uninstall) {
     if (Test-Path $startup) {
-        if ($hadBlock -or $legacy) {
-            Save-Startup (Remove-Block $current)
-            Write-Output "Removed the FreeLab MCP block from $startup"
+        $text = Remove-Block $current
+        if (Test-Changed $text) {
+            Save-Startup $text
+            if ($hadBlock) { Write-Output "Removed the FreeLab MCP block from $startup" }
             Write-LegacyNote
         }
     }
-    foreach ($dir in @($scripts, $rootScripts)) {  # the Scripts folder itself held it before FreeLab 0.3
+    foreach ($dir in @($scripts, $rootScripts)) {  # the Scripts folder itself held it before the repositories split
         $target = Join-Path $dir $listenerName
         if (Test-Path $target) { [System.IO.File]::Delete($target); Write-Output "Removed $target" }
     }
@@ -109,7 +160,7 @@ if (-not (Test-Path $scripts)) { New-Item -ItemType Directory -Path $scripts | O
 $target = Join-Path $scripts $listenerName
 [System.IO.File]::Copy((Join-Path $repo "listener\$listenerName"), $target, $true)
 Write-Output "Copied $listenerName to $scripts"
-$old = Join-Path $rootScripts $listenerName  # before FreeLab 0.3 it sat in the Scripts folder itself
+$old = Join-Path $rootScripts $listenerName  # before the repositories split it sat in the Scripts folder itself
 if (Test-Path $old) { [System.IO.File]::Delete($old); Write-Output "Removed the old $old" }
 
 $text = (Remove-Block $current).TrimEnd("`n")
@@ -123,26 +174,22 @@ def _freelab_mcp_startup():
     path = $listenerPath
     if not os.path.isfile(path):
         return
-    name = "freelab_listener"
-    os.environ["FREELAB_NO_AUTOSTART"] = "1"  # load only; main() below starts it
-    try:
-        if sys.version_info[0] == 2:
-            # open() takes a unicode path through the wide Windows API; imp.load_source does not.
-            import imp
-            module = imp.new_module(name)
-            module.__file__ = path
-            sys.modules[name] = module
-            with open(path, "rb") as handle:
-                source = handle.read()
-            exec(compile(source, name + ".py", "exec", 0, True), module.__dict__)
-        else:
-            import importlib.util
-            spec = importlib.util.spec_from_file_location(name, path)
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[name] = module
-            spec.loader.exec_module(module)
-    finally:
-        del os.environ["FREELAB_NO_AUTOSTART"]
+    name = "freelab_listener"  # loaded under this name, the listener does not start itself; main() below does
+    if sys.version_info[0] == 2:
+        # open() takes a unicode path through the wide Windows API; imp.load_source does not.
+        import imp
+        module = imp.new_module(name)
+        module.__file__ = path
+        sys.modules[name] = module
+        with open(path, "rb") as handle:
+            source = handle.read()
+        exec(compile(source, name + ".py", "exec", 0, True), module.__dict__)
+    else:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
     sys.modules[name] = module
     module.main()
 try:
@@ -151,15 +198,16 @@ except Exception as exc:
     print("FreeLab listener at startup: %s" % (exc,))
 $end
 "@ -replace "`r`n", "`n"
-    $folder = Split-Path -Parent $startup
-    if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder | Out-Null }
-    if (Test-Path $startup) { Save-Startup ($text + $block + "`n") }
-    else { [System.IO.File]::WriteAllText($startup, $text + $block + "`n", $utf8) }
-    Write-Output "Added the FreeLab MCP block to ${startup}: FontLab starts the listener at every launch"
-    Write-LegacyNote
+    $text = Set-Block $current $block
+    if (Test-Changed $text) {
+        Save-Startup $text
+        Write-Output "Added the FreeLab MCP block to ${startup}: FontLab starts the listener at every launch"
+        Write-LegacyNote
+    }
+    else { Write-Output "The FreeLab MCP block in $startup is up to date" }
 }
-elseif ($hadBlock -or $legacy) {
+elseif ((Test-Path $startup) -and (Test-Changed $text)) {
     Save-Startup $text
-    Write-Output "Removed the FreeLab MCP block from ${startup}: start the listener with Scripts > FreeLab > Start Listener"
+    if ($hadBlock) { Write-Output "Removed the FreeLab MCP block from ${startup}: start the listener with Scripts > FreeLab > Start Listener" }
     Write-LegacyNote
 }

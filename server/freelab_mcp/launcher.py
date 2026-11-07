@@ -1,8 +1,8 @@
-"""Start FontLab 7 from the MCP server, on Windows.
+"""Start FontLab 7 from the MCP server, and tell whether it runs, on Windows.
 
-Only starting: FreeLab never quits or restarts FontLab, which could lose unsaved work.
-The listener answers after a launch only when FontLab's startup script starts it
-(tools/install-fontlab.ps1 -ListenerAtLaunch).
+Closing goes through the listener instead (quit_fontlab), which refuses while there is
+unsaved work. The listener answers after a launch only when FontLab's startup script
+starts it (tools/install-fontlab.ps1 -ListenerAtLaunch).
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ import subprocess
 import sys
 
 DEFAULT_EXE = r"C:\Program Files\Fontlab\FontLab 7\FontLab 7.exe"
-IMAGE_NAME = "FontLab 7.exe"
 NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW: tasklist runs without a console flashing
 DETACHED = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: FontLab outlives the server
 
@@ -21,15 +20,22 @@ def fontlab_exe() -> str:
     return os.environ.get("FREELAB_FONTLAB_EXE") or DEFAULT_EXE
 
 
+def image_name() -> str:
+    """The program's file name, as the process list shows it (FREELAB_FONTLAB_EXE may name another)."""
+    return os.path.basename(fontlab_exe())
+
+
 def fontlab_running() -> bool:
     """True when a FontLab 7 process exists (any user session this process can see)."""
     if sys.platform != "win32":
         return False
+    name = image_name()
     out = subprocess.run(
-        ["tasklist", "/FI", "IMAGENAME eq %s" % IMAGE_NAME, "/FO", "CSV", "/NH"],
-        capture_output=True, text=True, errors="replace", creationflags=NO_WINDOW, timeout=30,
+        ["tasklist", "/FI", "IMAGENAME eq %s" % name, "/FO", "CSV", "/NH"],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", creationflags=NO_WINDOW,
+        timeout=30,
     ).stdout
-    return IMAGE_NAME.lower() in out.lower()
+    return ('"%s"' % name).lower() in out.lower()
 
 
 def launch() -> int:
@@ -37,8 +43,10 @@ def launch() -> int:
     exe = fontlab_exe()
     if not os.path.isfile(exe):
         raise FileNotFoundError(exe)
+    # FontLab embeds its own Python 2.7: variables set for this Python 3 must not reach it.
+    env = {k: v for k, v in os.environ.items() if k.upper() not in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP")}
     process = subprocess.Popen(
-        [exe], cwd=os.path.dirname(exe), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        [exe], cwd=os.path.dirname(exe), env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL, creationflags=DETACHED if sys.platform == "win32" else 0, close_fds=True,
     )
     return process.pid

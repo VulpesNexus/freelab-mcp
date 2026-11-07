@@ -25,7 +25,7 @@ The split keeps every FontLab call in one small file that can be read in a sitti
 
 ## Discovery and authentication
 
-On start the listener writes *%LOCALAPPDATA%\FreeLab\listener.json*: its port, a random 128-bit token, its PID, and its version. The server reads that file for every call and sends the token with every request; the listener compares it in constant time. The token keeps other local programs, and stale servers from an earlier FontLab session, from driving FontLab. The default port is 47761; if it is taken, the listener takes any free port and the state file says which. When the listener stops, it deletes the state file, unless a newer listener has already replaced it. `FREELAB_STATE_DIR` moves the file, which the tests use.
+On start the listener writes *%LOCALAPPDATA%\FreeLab\listener.json*: its port, a random 128-bit token, its PID, and its version. The server reads that file for every call and sends the token with every request; the listener compares it in constant time. The token keeps out what cannot read that file: other users' processes, and web pages (the endpoint is not HTTP, and a page cannot read the token). Any program running as the same user can read it, as the server does on every call, so the token is no barrier against those. Outside Windows the folder and the file are created readable by their owner only. The default port is 47761; if it is taken, the listener takes any free port and the state file says which. When the listener stops, it deletes the state file, unless a newer listener has already replaced it. `FREELAB_STATE_DIR` moves the file, which the tests use.
 
 ## Protocol 1
 
@@ -37,7 +37,7 @@ Request, one line of JSON:
 
 Reply, one line: `{"id": 7, "ok": true, "result": …}`, or `{"id": 7, "ok": false, "error": {"code": "no_glyph", "message": "…"}}`. The `id` is echoed only once the token is accepted. `deadline` is optional: seconds since the epoch after which the client has given up, so a request FontLab only reaches later is refused (`expired`) instead of run unseen. The server sets it on every call. A protocol change bumps the number in both halves; the server refuses a listener that speaks another one.
 
-Listener error codes: `bad_json`, `bad_request`, `bad_token`, `bad_protocol`, `expired`, `unknown_op`, `bad_args`, `too_large`, `not_in_fontlab`, `no_font`, `no_current_font`, `no_glyph`, `no_layer`, `unexpected_type`, `unreadable`, `unserializable`, and `exception`, which carries the traceback. The server adds its own: `not_running`, `bad_state`, `timeout`, `connection`, `empty_reply`, and `bad_reply`.
+Listener error codes: `bad_json`, `bad_request`, `bad_token`, `bad_protocol`, `expired`, `unknown_op`, `bad_args`, `too_large`, `not_in_fontlab`, `no_font`, `no_current_font`, `no_glyph`, `no_layer`, `unexpected_type`, `unreadable`, `unserializable`, `unsaved_changes`, and `exception`, which carries the traceback. The client adds `not_running`, `bad_state`, `timeout`, `connection`, `empty_reply`, `bad_reply`, and `too_large` (a request over the listener's 4 MB, refused before it is sent). The server's tools add `bad_args`, `listener_not_running` (FontLab runs without its listener), `not_found` (no FontLab program), `no_listener` (FontLab started, its listener did not answer), and `still_running` (FontLab asked to close, still open).
 
 | Operation | Does |
 |---|---|
@@ -48,6 +48,8 @@ Listener error codes: `bad_json`, `bad_request`, `bad_token`, `bad_protocol`, `e
 | `glyph` | one glyph by name or code point: Unicode values, layers, width, bounding box, counts |
 | `outline` | shapes, contours, and nodes on one layer, capped by `max_nodes` |
 | `run_python` | runs code in FontLab, returns printed output, `result`, and any traceback |
+| `unsaved` | whether the workspace or any open font has unsaved changes |
+| `quit` | refused with `unsaved_changes` when there are any (or `unreadable` when FontLab cannot tell); otherwise closes FontLab's main window a moment after replying, as its close button would |
 
 ## Error model
 

@@ -52,6 +52,7 @@ class ServerCase(unittest.TestCase):
         self.stop_event.set()
         if self.thread:
             self.thread.join(5)
+        errors = list(self.listener.errors) if self.listener else []
         if self.listener:
             self.listener.stop()
         fakes.uninstall()
@@ -60,6 +61,7 @@ class ServerCase(unittest.TestCase):
         else:
             os.environ["FREELAB_STATE_DIR"] = self._old_state
         shutil.rmtree(self.tmp, ignore_errors=True)
+        self.assertEqual(errors, [], "the listener swallowed errors: %r" % errors)
 
     def open_sample(self):
         font = fakes.sample_font()
@@ -85,7 +87,7 @@ class NotRunningTests(ServerCase):
         self.listener = None
         with self.assertRaises(RuntimeError) as ctx:
             asyncio.run(server.fontlab_status())
-        self.assertIn("[not_running]", str(ctx.exception), port)
+        self.assertIn("[not_running]", str(ctx.exception), "port %d" % port)
 
     def test_protocol_mismatch(self):
         client.state_path().write_text(json.dumps({"port": 1, "token": "x", "protocol": 99}))
@@ -277,6 +279,32 @@ class LaunchTests(unittest.TestCase):
         server.launcher.fontlab_running = lambda: True
         with self.assertRaisesRegex(RuntimeError, "still_running"):
             asyncio.run(server.quit_fontlab(wait_s=0.01))
+
+    def test_restart_checks_its_bounds_before_closing(self):
+        self.fake_call([{"quitting": True}])
+        with self.assertRaisesRegex(RuntimeError, "bad_args"):
+            asyncio.run(server.restart_fontlab(wait_s=601))
+        self.assertEqual(self.pings, [], "nothing sent: FontLab stays open")
+
+    def test_a_listener_that_answers_badly_is_not_relaunched(self):
+        async def call(op, args=None, timeout=None):
+            raise RuntimeError("[bad_protocol] the listener speaks protocol 2")
+        server._call = call
+        server.launcher.launch = lambda: self.launched.append(1) or 1
+        with self.assertRaisesRegex(RuntimeError, "bad_protocol"):
+            asyncio.run(server.launch_fontlab())
+        self.assertEqual(self.launched, [])
+
+    def test_image_name_follows_the_program(self):
+        saved = os.environ.get("FREELAB_FONTLAB_EXE")
+        os.environ["FREELAB_FONTLAB_EXE"] = os.path.join("C:" + os.sep, "Apps", "FontLab 7 Beta.exe")
+        try:
+            self.assertEqual(server.launcher.image_name(), "FontLab 7 Beta.exe")
+        finally:
+            if saved is None:
+                os.environ.pop("FREELAB_FONTLAB_EXE", None)
+            else:
+                os.environ["FREELAB_FONTLAB_EXE"] = saved
 
     def test_restart_quits_then_launches(self):
         self.fake_call([{"quitting": True}, None, {"listener": "0.1.0"}])

@@ -10,6 +10,8 @@ Proof levels: **documented** (in the FontLab 7 reference), **stub-tested** (the 
 | `fontlab` module | `ApplicationPath()` | function | `ping` | documented (startup script), stub-tested |
 | `fontlab.flWorkspace` | `instance()` | static method | every font op | documented, stub-tested |
 | `flWorkspace` | `currentPackage` | property, `flPackage` | every font op | documented, stub-tested |
+| `flWorkspace` | `hasChanges` | property, bool | `unsaved`, `quit` | documented, stub-tested, **live** (2026-11-07): a bool |
+| `flWorkspace` | `packages()` | method, list of `flPackage` | `unsaved`, `quit` | documented, stub-tested, **live** (2026-11-07): a real Python list |
 | `flPackage` | `tfn`, `tsn`, `psn`, `ffn`, `path`, `upm`, `glyphsCount`, `master`, `mastersCount`, `versionMajor`, `versionMinor`, `hasChanges`, `isNull` | properties | `font_info`, `status` | documented, stub-tested |
 | `flPackage` | `findName(name)` | method, `flGlyph` | `glyph`, `outline` | documented, stub-tested |
 | `flPackage` | `findUnicode(codepoint)` | method, `flGlyph` | `glyph`, `outline` | documented, stub-tested |
@@ -23,14 +25,15 @@ Proof levels: **documented** (in the FontLab 7 reference), **stub-tested** (the 
 | `flContour` | `closed` | property | `outline` | documented, stub-tested |
 | `flContour` | `nodes()` | method, list of `flNode` | `outline` | documented, stub-tested |
 | `flNode` | `x`, `y`, `type`, `smooth` | properties | `outline` | documented, stub-tested |
-| `PythonQt.QtCore` | `QTimer`: `setInterval`, `connect("timeout()", …)` (falling back to `timeout.connect(…)` if that raises or returns `False`), `start`, `stop` | Qt | the listener loop | **live** (2026-11-06): `connect("timeout()", ...)` works |
+| `PythonQt.QtCore` | `QTimer`: `setInterval`, `setSingleShot`, `connect("timeout()", …)` (falling back to `timeout.connect(…)` if that raises or returns `False`), `start`, `stop` | Qt | the listener loop, `quit` | **live** (2026-11-06): `connect("timeout()", ...)` works |
+| `PythonQt.QtGui` | `QApplication.instance()`, `topLevelWidgets()`, `metaObject().className()`, `close()` | Qt | `quit` | stub-tested; **live** (2026-11-07): the main window's class is `MainWindow` |
 
 ## Found live in FontLab 7.2 (2026-11-06)
 
 - *%LOCALAPPDATA%\FontLab\FontLab 7\startupScript.py* runs at launch, and its `print` output reaches the *Output* panel.
 - A script picked from the *Scripts* menu runs with `__file__` set to its path; modules it loads stay in `sys.modules` between runs.
-- `fontlab.flPreferences()` reads and writes the preferences (`colorWorkspace` and the other `color*` members are `QColor`s); a write is stored in the registry at once and shows on the next repaint.
-- PythonQt's quirks (properties as values, missing enum names, `winId()`, `findChildren`): *docs/DARKMODE.md* in FreeLab, the separate `freelab` repository.
+- PythonQt exposes Qt properties as values, not methods (`widget.styleSheet`, `widget.visible`), and `findChildren(QWidget)` returns an empty list.
+- `QMainWindow.statusBar()` creates a status bar when the window has none, and FontLab's main window has none: a probe must not call it.
 
 ## Corrections to the earlier FontLab MCP
 

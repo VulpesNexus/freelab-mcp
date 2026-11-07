@@ -17,6 +17,7 @@ from typing import Any
 
 PROTOCOL = 1
 DEFAULT_TIMEOUT_S = 10.0
+MAX_REQUEST_BYTES = 4 * 1024 * 1024  # the listener's limit (MAX_REQUEST_BYTES in freelab_listener.py)
 _ids = itertools.count(1)
 
 
@@ -84,6 +85,8 @@ def call(op: str, args: dict[str, Any] | None = None, timeout: float = DEFAULT_T
         "deadline": time.time() + timeout,
     }
     payload = (json.dumps(request) + "\n").encode("utf-8")
+    if len(payload) > MAX_REQUEST_BYTES:  # the listener would close on it mid-send: a reset, not an answer
+        raise ListenerError("too_large", f"The request is {len(payload)} bytes; the listener takes at most {MAX_REQUEST_BYTES}.")
     try:
         with socket.create_connection(("127.0.0.1", state["port"]), timeout=timeout) as sock:
             sock.sendall(payload)

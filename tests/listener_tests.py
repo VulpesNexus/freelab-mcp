@@ -66,6 +66,77 @@ class ListenerCase(unittest.TestCase):
         return reply["error"]
 
 
+class CloseMainWindowTests(ListenerCase):
+    """_close_main_window with PythonQt faked: FontLab's main window, or nothing at all."""
+
+    def setUp(self):
+        ListenerCase.setUp(self)
+        self.closed, self.quit = [], []
+        test = self
+
+        class Meta(object):
+            def __init__(self, name):
+                self.name = name
+
+            def className(self):
+                return self.name
+
+        class Window(object):
+            def __init__(self, name):
+                self.meta = Meta(name)
+
+            def metaObject(self):
+                return self.meta
+
+            def close(self):
+                test.closed.append(self.meta.name)
+
+        class App(object):
+            windows = []
+
+            def topLevelWidgets(self):
+                return list(App.windows)
+
+            def quit(self):
+                test.quit.append(1)
+
+        self.Window, self.App = Window, App
+        app = App()
+        qtgui = type(sys)("PythonQt.QtGui")
+        qtgui.QApplication = type("QApplication", (object,), {"instance": staticmethod(lambda: app)})
+        pythonqt = type(sys)("PythonQt")
+        pythonqt.QtGui = qtgui
+        self._saved_modules = {k: sys.modules.get(k) for k in ("PythonQt", "PythonQt.QtGui")}
+        sys.modules["PythonQt"], sys.modules["PythonQt.QtGui"] = pythonqt, qtgui
+
+    def tearDown(self):
+        for key, module in self._saved_modules.items():
+            if module is None:
+                sys.modules.pop(key, None)
+            else:
+                sys.modules[key] = module
+        ListenerCase.tearDown(self)
+
+    def test_closes_the_main_window(self):
+        self.App.windows = [self.Window("QDialog"), self.Window("MainWindow")]
+        self.listener._close_main_window()
+        self.assertEqual((self.closed, self.quit), (["MainWindow"], []))
+
+    def test_without_a_main_window_nothing_is_ended(self):
+        self.App.windows = [self.Window("QDialog")]
+        self.listener._close_main_window()
+        self.assertEqual((self.closed, self.quit), ([], []), "never QApplication.quit()")
+        self.assertEqual(len(self.listener.errors), 1)
+        del self.listener.errors[:]
+
+    def test_errors_are_capped(self):
+        for i in range(fl.MAX_ERRORS + 5):
+            self.listener._record("tick", RuntimeError(str(i)))
+        self.assertEqual(len(self.listener.errors), fl.MAX_ERRORS)
+        self.assertIn(str(fl.MAX_ERRORS + 4), self.listener.errors[-1])
+        del self.listener.errors[:]
+
+
 class QuitTests(ListenerCase):
     def setUp(self):
         ListenerCase.setUp(self)
@@ -107,6 +178,29 @@ class QuitTests(ListenerCase):
         finally:
             fontlab.flWorkspace = saved
         self.assertEqual(self.quits, [])
+
+    def test_quit_is_refused_when_packages_is_not_a_list(self):
+        class Native(object):  # a container FontLab could return: never iterated
+            def __iter__(self):
+                raise AssertionError("a native container was iterated")
+
+        class Workspace(object):
+            hasChanges = False
+
+            def packages(self):
+                return Native()
+
+        fontlab = sys.modules["fontlab"]
+        saved = fontlab.flWorkspace
+        fontlab.flWorkspace = type("W", (object,), {"instance": staticmethod(lambda: Workspace())})
+        try:
+            self.fails("quit", code="unreadable")
+        finally:
+            fontlab.flWorkspace = saved
+        self.assertEqual(self.quits, [])
+
+    def test_protocol_must_be_the_integer(self):
+        self.fails("ping", protocol=True, code="bad_protocol")
 
     def test_quit_with_nothing_unsaved(self):
         self.state.unsaved = [False, False]
