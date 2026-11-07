@@ -11,7 +11,8 @@ Proof levels: **documented** (in the FontLab 7 reference), **stub-tested** (the 
 | `fontlab.flWorkspace` | `instance()` | static method | every font op | documented, stub-tested |
 | `flWorkspace` | `currentPackage` | property, `flPackage` | every font op | documented, stub-tested |
 | `flWorkspace` | `hasChanges` | property, bool | `unsaved`, `quit` | documented, stub-tested, **live** (2026-11-07): a bool |
-| `flWorkspace` | `packages()` | method, list of `flPackage` | `unsaved`, `quit` | documented, stub-tested, **live** (2026-11-07): a real Python list |
+| `flWorkspace` | `packages()` | method, list of `flObject`, one per open font | `unsaved`, `quit` | documented, stub-tested, **live** (2026-11-07): a real Python list of `flObject` |
+| `flObject` (a package) | `hasChanges` | property, bool | `unsaved`, `quit` | stub-tested, **live** (2026-11-07): a bool; that it turns true after an unsaved edit is not seen yet |
 | `flPackage` | `tfn`, `tsn`, `psn`, `ffn`, `path`, `upm`, `glyphsCount`, `master`, `mastersCount`, `versionMajor`, `versionMinor`, `hasChanges`, `isNull` | properties | `font_info`, `status` | documented, stub-tested |
 | `flPackage` | `findName(name)` | method, `flGlyph` | `glyph`, `outline` | documented, stub-tested |
 | `flPackage` | `findUnicode(codepoint)` | method, `flGlyph` | `glyph`, `outline` | documented, stub-tested |

@@ -193,6 +193,18 @@ class ToolTests(ServerCase):
         self.assertLess(time.time() - start, 3)
 
 
+class ClientLimitTests(unittest.TestCase):
+    def test_oversized_request_is_refused_before_sending(self):
+        saved = client.read_state
+        client.read_state = lambda: {"port": 9, "token": "x", "protocol": client.PROTOCOL}
+        try:
+            with self.assertRaises(client.ListenerError) as ctx:
+                client.call("run_python", {"code": "#" * (client.MAX_REQUEST_BYTES + 1)})
+        finally:
+            client.read_state = saved
+        self.assertEqual(ctx.exception.code, "too_large")
+
+
 class LaunchTests(unittest.TestCase):
     """launch_fontlab with the process side faked: no FontLab is started by these tests."""
 
@@ -279,6 +291,45 @@ class LaunchTests(unittest.TestCase):
         server.launcher.fontlab_running = lambda: True
         with self.assertRaisesRegex(RuntimeError, "still_running"):
             asyncio.run(server.quit_fontlab(wait_s=0.01))
+
+    def test_restart_without_the_program_closes_nothing(self):
+        self.fake_call([{"quitting": True}])
+        saved = server.launcher.program_found
+        server.launcher.program_found = lambda: False
+        try:
+            with self.assertRaisesRegex(RuntimeError, "not_found"):
+                asyncio.run(server.restart_fontlab())
+        finally:
+            server.launcher.program_found = saved
+        self.assertEqual(self.pings, [], "FontLab left open")
+
+    def test_restart_waits_for_closing_whatever_its_wait(self):
+        self.fake_call([{"quitting": True}, None, {"listener": "0.1.0"}])
+        saved = server.launcher.program_found
+        server.launcher.program_found = lambda: True
+        running = [True] * 20 + [False]  # closing takes longer than wait_s would allow
+        server.launcher.fontlab_running = lambda: running.pop(0) if running else False
+        server.launcher.launch = lambda: self.launched.append(1) or 5
+        try:
+            result = asyncio.run(server.restart_fontlab(wait_s=0.01))
+        finally:
+            server.launcher.program_found = saved
+        self.assertEqual((self.launched, result["started"]), ([1], True))
+
+    def test_a_launched_fontlab_still_starting_is_waited_for(self):
+        answers = [RuntimeError("[not_running] none"), RuntimeError("[timeout] busy"), RuntimeError("[bad_state] half"),
+                   {"listener": "0.1.0"}]
+
+        async def call(op, args=None, timeout=None):
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+        server._call = call
+        server.launcher.fontlab_running = lambda: False
+        server.launcher.launch = lambda: self.launched.append(1) or 9
+        result = asyncio.run(server.launch_fontlab(wait_s=60))
+        self.assertEqual((result["started"], result["pid"]), (True, 9))
 
     def test_restart_checks_its_bounds_before_closing(self):
         self.fake_call([{"quitting": True}])

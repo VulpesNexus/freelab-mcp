@@ -19,6 +19,7 @@ from . import __version__, launcher
 from .client import DEFAULT_TIMEOUT_S, ListenerError, call
 
 MAX_TIMEOUT_S = 600.0
+QUIT_WAIT_S = 60.0  # how long a restart waits for FontLab to close
 # Ping errors that mean no listener answers (FontLab closed, or its listener not started), and those
 # met while a freshly launched FontLab is still starting (old state file, busy loading).
 LISTENER_ABSENT = ("[not_running]", "[connection]", "[empty_reply]")
@@ -190,9 +191,13 @@ async def restart_fontlab(wait_s: float = 120.0) -> dict[str, Any]:
     Refused while any font or the workspace has unsaved changes. The listener answers after the restart
     only when FontLab's startup script starts it (tools/install-fontlab.ps1 -ListenerAtLaunch).
     """
-    if not 0 < wait_s <= MAX_TIMEOUT_S:  # before closing anything
+    # Everything that could stop the start is checked before FontLab is closed.
+    if not 0 < wait_s <= MAX_TIMEOUT_S:
         raise RuntimeError(f"[bad_args] wait_s must be above 0 and at most {MAX_TIMEOUT_S:g}.")
-    await quit_fontlab(wait_s=min(wait_s, 60.0))
+    if not await anyio.to_thread.run_sync(launcher.program_found):
+        raise RuntimeError(f"[not_found] FontLab 7 is not at {launcher.fontlab_exe()}; set FREELAB_FONTLAB_EXE to its "
+                           "program file. FontLab was left open.")
+    await quit_fontlab(wait_s=QUIT_WAIT_S)  # closing is not hurried by a short wait for the listener
     return await launch_fontlab(wait_s=wait_s)
 
 

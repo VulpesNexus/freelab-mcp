@@ -25,13 +25,35 @@ def image_name() -> str:
     return os.path.basename(fontlab_exe())
 
 
+def program_found() -> bool:
+    """True when the FontLab program file exists, so a start can be tried."""
+    return os.path.isfile(fontlab_exe())
+
+
+def _session_id() -> int | None:
+    """This process's Windows session: another user's FontLab runs in another one."""
+    try:
+        import ctypes
+        session = ctypes.c_ulong()
+        kernel32 = ctypes.WinDLL("kernel32")
+        if kernel32.ProcessIdToSessionId(kernel32.GetCurrentProcessId(), ctypes.byref(session)):
+            return session.value
+    except (OSError, AttributeError):
+        pass
+    return None
+
+
 def fontlab_running() -> bool:
-    """True when a FontLab 7 process exists (any user session this process can see)."""
+    """True when a FontLab 7 process runs in this user's session."""
     if sys.platform != "win32":
         return False
     name = image_name()
+    filters = ["/FI", "IMAGENAME eq %s" % name]
+    session = _session_id()
+    if session is not None:
+        filters += ["/FI", "SESSION eq %d" % session]
     out = subprocess.run(
-        ["tasklist", "/FI", "IMAGENAME eq %s" % name, "/FO", "CSV", "/NH"],
+        ["tasklist", *filters, "/FO", "CSV", "/NH"],
         stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", creationflags=NO_WINDOW,
         timeout=30,
     ).stdout

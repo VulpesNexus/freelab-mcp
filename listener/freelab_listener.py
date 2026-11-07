@@ -512,11 +512,28 @@ def op_run_python(listener, args):
 # Listener
 # ---------------------------------------------------------------------------
 
+def _environ(name):
+    """An environment variable as Unicode. Python 2.7 on Windows reads os.environ through the ANSI
+    code page, which turns a profile path it cannot spell into question marks; the wide API does not."""
+    if PY2 and os.name == "nt":
+        try:
+            import ctypes
+            size = ctypes.windll.kernel32.GetEnvironmentVariableW(name, None, 0)
+            if not size:
+                return None
+            buffer = ctypes.create_unicode_buffer(size)
+            ctypes.windll.kernel32.GetEnvironmentVariableW(name, buffer, size)
+            return buffer.value
+        except Exception:
+            pass
+    return os.environ.get(name)
+
+
 def state_dir():
-    override = os.environ.get("FREELAB_STATE_DIR")
+    override = _environ("FREELAB_STATE_DIR")
     if override:
         return override
-    base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    base = _environ("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".local", "state")
     return os.path.join(base, "FreeLab")
 
 
@@ -655,8 +672,8 @@ class Listener(object):
             "protocol": PROTOCOL,
             "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
-        temp = self.state_file + ".tmp"
-        if os.path.exists(temp):
+        temp = "%s.%d.tmp" % (self.state_file, os.getpid())  # its own: another listener may be writing too
+        if os.path.exists(temp):  # left by this process's earlier, interrupted write
             os.remove(temp)
         with os.fdopen(os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as handle:
             json.dump(data, handle)

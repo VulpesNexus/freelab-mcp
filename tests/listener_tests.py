@@ -182,7 +182,7 @@ class QuitTests(ListenerCase):
     def test_quit_is_refused_when_packages_is_not_a_list(self):
         class Native(object):  # a container FontLab could return: never iterated
             def __iter__(self):
-                raise AssertionError("a native container was iterated")
+                raise fakes.SpyViolation("a native container was iterated")  # past except Exception
 
         class Workspace(object):
             hasChanges = False
@@ -194,10 +194,19 @@ class QuitTests(ListenerCase):
         saved = fontlab.flWorkspace
         fontlab.flWorkspace = type("W", (object,), {"instance": staticmethod(lambda: Workspace())})
         try:
-            self.fails("quit", code="unreadable")
+            error = self.fails("quit", code="unreadable")
         finally:
             fontlab.flWorkspace = saved
+        self.assertIn("not a list", error["message"])
         self.assertEqual(self.quits, [])
+
+    def test_a_leftover_temporary_state_file_is_replaced(self):
+        leftover = "%s.%d.tmp" % (self.listener.state_file, os.getpid())
+        with open(leftover, "w") as handle:
+            handle.write("half")
+        self.listener.bind()
+        self.assertTrue(os.path.isfile(self.listener.state_file))
+        self.assertFalse(os.path.exists(leftover))
 
     def test_protocol_must_be_the_integer(self):
         self.fails("ping", protocol=True, code="bad_protocol")

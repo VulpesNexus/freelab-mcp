@@ -31,10 +31,9 @@ try {
     $sha = [System.Security.Cryptography.SHA512]::Create()
     $stream = [System.IO.File]::OpenRead($nupkg)
     try { $actual = [Convert]::ToBase64String($sha.ComputeHash($stream)) } finally { $stream.Dispose() }
-    if ($actual -ne $expected) { throw "Package hash mismatch: $actual" }
+    if ($actual -cne $expected) { throw "Package hash mismatch: $actual" }
 
-    $staging = "$dest.partial"
-    if (Test-Path $staging) { [System.IO.Directory]::Delete($staging, $true) }
+    $staging = "$dest.partial-" + [guid]::NewGuid().ToString('N')  # its own: nothing of anyone else's is deleted
     # An interrupted run leaves only the staging folder: anything at the destination is someone else's.
     if (Test-Path $dest) { throw "$dest exists but holds no tools\python.exe: move it away, or set FREELAB_PY27_DIR to another folder." }
     Add-Type -AssemblyName System.IO.Compression.FileSystem
