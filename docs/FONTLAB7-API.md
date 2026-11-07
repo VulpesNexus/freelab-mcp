@@ -38,6 +38,15 @@ Proof levels: **documented** (in the FontLab 7 reference), **stub-tested** (the 
 - PythonQt exposes Qt properties as values, not methods (`widget.styleSheet`, `widget.visible`), and `findChildren(QWidget)` returns an empty list.
 - `QMainWindow.statusBar()` creates a status bar when the window has none, and FontLab's main window has none: a probe must not call it.
 
+## Kerning and outlines, found live (2026-11-08)
+
+Read-only probes, for FreeLab's kerner:
+
+- `flPackage.kerning(master)` returns an `fgKerning`: `keys()`, `items()` (pairs as `fgKerningObjectPair` with values), `asDict()`, `get(pair or ('left', 'right'))`, item assignment (`__setitem__`, `__delitem__`), `getPlainPairs`, `setPlainPairs`, `groups` (`fgKerningGroups`), `addGroup`, `hasGroupKerning()`, `scale`. Writing has not been tried yet.
+- `flPackage.getAllGroups()` lists `(kernGroup, name, id, mark, glyph names)`; feature classes come back with `kernGroup` False.
+- `flPackage.autoKern(left_glyph, right_glyph, master_name)` is FontLab's own pair autokern (it writes into the font: not called).
+- `flGlyph` has no `layer(name)`: use `getLayerByName(master)` or `activeLayer`. `flLayer.shapes` holds `flShape`s with a `transform` (`QTransform`) and `contours`; `flContour.path()` returns a `QPainterPath`, and `draw(pen)` and `drawPoints(point_pen)` follow the pen protocols.
+
 ## Corrections to the earlier FontLab MCP
 
 The calls in Dithilli's server ([PRIOR-ART.md](PRIOR-ART.md)) do not match FontLab 7's documented API: `flWorkspace.instance().currentFont()` does not exist (the current font is the `currentPackage` property), `flPackage` has no `glyphs` list or `info.familyName` (names are `tfn`, `tsn`, …), and `flGlyph` has no `unicode` (Unicode values live on the legacy `fgGlyph`).
