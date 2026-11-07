@@ -210,15 +210,20 @@ class NullUnknown(flGlyph):
 
 
 class _PackageObject(Native):
-    """What flWorkspace.packages() returns in FontLab 7: generic flObject items that know hasChanges."""
-    _members = ("hasChanges",)
+    """What flWorkspace.packages() returns in FontLab 7: generic flObject items.
+
+    unsaved: True (hasChanges), "history" (only hasHistoryStates: an edit, as FontLab 7.2 reports one
+    live), or False."""
+    _members = ("hasChanges", "hasHistoryStates")
 
     def __init__(self, unsaved):
         object.__setattr__(self, "_f_unsaved", unsaved)
 
     def __getattribute__(self, name):
         if name == "hasChanges":
-            return object.__getattribute__(self, "_f_unsaved")
+            return object.__getattribute__(self, "_f_unsaved") is True
+        if name == "hasHistoryStates":
+            return object.__getattribute__(self, "_f_unsaved") is not False
         return Native.__getattribute__(self, name)
 
 

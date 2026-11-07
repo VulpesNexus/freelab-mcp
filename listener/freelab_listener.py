@@ -315,15 +315,19 @@ def op_status(listener, args):
 
 
 def unsaved_work():
-    """(workspace has changes, number of open fonts with unsaved changes), read from FontLab.
+    """(workspace has changes, number of open fonts that may have unsaved changes), read from FontLab.
 
+    A font counts when it has changes or any edit FontLab can still undo: in FontLab 7.2, hasChanges
+    stayed False after an edit to a font (seen live), while hasHistoryStates turned True. A font
+    edited and then saved may count too: quitting is refused rather than risked.
     A read that fails raises: FontLab must never be quit on a guess.
     """
     fl = _fontlab()
     workspace = fl.flWorkspace.instance()
     try:
         workspace_changed = bool(workspace.hasChanges)
-        fonts = sum(1 for package in _real_list(workspace.packages(), "flWorkspace.packages()") if package.hasChanges)
+        fonts = sum(1 for package in _real_list(workspace.packages(), "flWorkspace.packages()")
+                    if package.hasChanges or package.hasHistoryStates)
     except Exception as exc:
         raise FreeLabError("unreadable", "FontLab could not tell whether there are unsaved changes: %s" % _exc_text(exc))
     return workspace_changed, fonts
@@ -341,8 +345,9 @@ def op_quit(listener, args):
     workspace_changed, fonts = unsaved_work()
     if workspace_changed or fonts:
         parts = (["%d font%s" % (fonts, "" if fonts == 1 else "s")] if fonts else []) + (["the workspace"] if workspace_changed else [])
-        raise FreeLabError("unsaved_changes", "FontLab has unsaved changes (%s): save them, or close them in FontLab, "
-                           "first. FreeLab never quits FontLab over unsaved work." % " and ".join(parts))
+        raise FreeLabError("unsaved_changes", "FontLab may have unsaved changes (%s, edited since opening): close FontLab "
+                           "yourself, where it asks about each font. FreeLab never quits FontLab over possibly unsaved "
+                           "work." % " and ".join(parts))
     listener.request_quit()
     return {"quitting": True}
 
@@ -518,12 +523,15 @@ def _environ(name):
     if PY2 and os.name == "nt":
         try:
             import ctypes
-            size = ctypes.windll.kernel32.GetEnvironmentVariableW(name, None, 0)
-            if not size:
-                return None
-            buffer = ctypes.create_unicode_buffer(size)
-            ctypes.windll.kernel32.GetEnvironmentVariableW(name, buffer, size)
-            return buffer.value
+            get = ctypes.WinDLL("kernel32").GetEnvironmentVariableW
+            get.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+            get.restype = ctypes.c_uint32
+            wide = name.decode("ascii") if isinstance(name, bytes) else name  # a byte string finds nothing
+            size = get(wide, None, 0)
+            if size:
+                buffer = ctypes.create_unicode_buffer(size)
+                if get(wide, buffer, size):
+                    return buffer.value
         except Exception:
             pass
     return os.environ.get(name)

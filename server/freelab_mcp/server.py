@@ -170,7 +170,7 @@ async def _wait_for_exit(wait_s: float) -> bool:
 
 @mcp.tool()
 async def quit_fontlab(wait_s: float = 60.0) -> dict[str, Any]:
-    """Close FontLab (only when the user asked). Refused while any font or the workspace has unsaved changes.
+    """Close FontLab (only when the user asked). Refused while any font may have unsaved changes (edited since it was opened) or the workspace has changes.
 
     FontLab closes as its close button would: it saves its preferences, and may still ask something
     on screen, in which case it stays open and this tool says so.
@@ -188,7 +188,7 @@ async def quit_fontlab(wait_s: float = 60.0) -> dict[str, Any]:
 async def restart_fontlab(wait_s: float = 120.0) -> dict[str, Any]:
     """Close FontLab and start it again (only when the user asked), then wait for the listener.
 
-    Refused while any font or the workspace has unsaved changes. The listener answers after the restart
+    Refused while any font may have unsaved changes (edited since it was opened) or the workspace has changes. The listener answers after the restart
     only when FontLab's startup script starts it (tools/install-fontlab.ps1 -ListenerAtLaunch).
     """
     # Everything that could stop the start is checked before FontLab is closed.

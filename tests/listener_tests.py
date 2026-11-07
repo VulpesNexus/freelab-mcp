@@ -156,6 +156,33 @@ class QuitTests(ListenerCase):
         self.assertIn("1 font", error["message"])
         self.assertEqual(self.quits, [])
 
+    def test_quit_is_refused_over_a_font_with_undo_history(self):
+        # FontLab 7.2 left hasChanges False after an edit; only hasHistoryStates told
+        self.state.unsaved = [False, "history"]
+        self.fails("quit", code="unsaved_changes")
+        self.assertEqual(self.quits, [])
+
+    def test_state_folder_follows_the_environment(self):
+        saved = os.environ.get("FREELAB_STATE_DIR")
+        os.environ["FREELAB_STATE_DIR"] = self.tmp
+        try:
+            self.assertEqual(fl.state_dir(), self.tmp)
+        finally:
+            if saved is None:
+                del os.environ["FREELAB_STATE_DIR"]
+            else:
+                os.environ["FREELAB_STATE_DIR"] = saved
+
+    def test_state_folder_is_under_local_app_data(self):
+        saved = os.environ.pop("FREELAB_STATE_DIR", None)
+        try:
+            if os.environ.get("LOCALAPPDATA"):
+                self.assertEqual(os.path.normcase(fl.state_dir()),
+                                 os.path.normcase(os.path.join(os.environ["LOCALAPPDATA"], "FreeLab")))
+        finally:
+            if saved is not None:
+                os.environ["FREELAB_STATE_DIR"] = saved
+
     def test_quit_is_refused_over_an_unsaved_workspace(self):
         self.state.workspace_changed = True
         self.fails("quit", code="unsaved_changes")

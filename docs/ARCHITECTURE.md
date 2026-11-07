@@ -48,7 +48,7 @@ Listener error codes: `bad_json`, `bad_request`, `bad_token`, `bad_protocol`, `e
 | `glyph` | one glyph by name or code point: Unicode values, layers, width, bounding box, counts |
 | `outline` | shapes, contours, and nodes on one layer, capped by `max_nodes` |
 | `run_python` | runs code in FontLab, returns printed output, `result`, and any traceback |
-| `unsaved` | whether the workspace or any open font has unsaved changes |
+| `unsaved` | whether the workspace has changes, or any open font has changes or edits FontLab can still undo (FontLab 7.2 reports an edit only through its undo history) |
 | `quit` | refused with `unsaved_changes` when there are any (or `unreadable` when FontLab cannot tell); otherwise closes FontLab's main window a moment after replying, as its close button would |
 
 ## Error model
