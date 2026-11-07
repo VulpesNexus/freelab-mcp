@@ -159,29 +159,40 @@ async def launch_fontlab(wait_s: float = 120.0) -> dict[str, Any]:
                        "or choose Scripts > FreeLab > Start Listener.")
 
 
-async def _wait_for_exit(wait_s: float) -> bool:
-    deadline = time.monotonic() + wait_s
-    while time.monotonic() < deadline:
-        if not await anyio.to_thread.run_sync(launcher.fontlab_running):
-            return True
-        await anyio.sleep(1.0)
-    return False
-
-
 @mcp.tool()
 async def quit_fontlab(wait_s: float = 60.0) -> dict[str, Any]:
-    """Close FontLab (only when the user asked). Refused while any font may have unsaved changes (edited since it was opened) or the workspace has changes.
+    """Close FontLab (only when the user asked), as its close button would.
 
-    FontLab closes as its close button would: it saves its preferences, and may still ask something
-    on screen, in which case it stays open and this tool says so.
+    Refused when FontLab reports unsaved changes. A font edited since it was opened makes FontLab
+    ask on screen whether to save it: the question is left there for the user, and this tool stops
+    and returns it ([save_prompt]); it never answers it.
     """
     if not 0 < wait_s <= MAX_TIMEOUT_S:
         raise RuntimeError(f"[bad_args] wait_s must be above 0 and at most {MAX_TIMEOUT_S:g}.")
     await _call("quit")
-    if not await _wait_for_exit(wait_s):
-        raise RuntimeError(f"[still_running] FontLab was asked to close but is still running after {wait_s:g} s; "
-                           "it may be asking something on screen.")
-    return {"quit": True}
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        if not await anyio.to_thread.run_sync(launcher.fontlab_running):
+            return {"quit": True}
+        await anyio.sleep(1.0)
+        question = await _open_dialog()
+        if question is not None:
+            code = "save_prompt" if question.get("class") == SAVE_PROMPT_CLASS else "dialog_open"
+            words = " ".join(question.get("text") or []) or question.get("title") or question.get("class")
+            raise RuntimeError(f"[{code}] FontLab is asking: {words} (buttons: {', '.join(question.get('buttons') or [])}). "
+                               "It was left on screen for the user to answer; FontLab stays open until then.")
+    raise RuntimeError(f"[still_running] FontLab was asked to close but is still running after {wait_s:g} s.")
+
+
+SAVE_PROMPT_CLASS = "DlgClosePackage"  # FontLab 7.2's "Save changes to ... before closing?"
+
+
+async def _open_dialog() -> dict[str, Any] | None:
+    """The dialog FontLab is waiting on, or None (none, or the listener already gone)."""
+    try:
+        return (await _call("dialog", timeout=5.0)).get("dialog")
+    except RuntimeError:
+        return None
 
 
 @mcp.tool()

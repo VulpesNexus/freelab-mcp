@@ -221,8 +221,12 @@ class LaunchTests(unittest.TestCase):
     def tearDown(self):
         (server.launcher.fontlab_running, server.launcher.launch, server._call, server.anyio.sleep) = self._saved
 
+    dialog = None  # what the fake FontLab is asking, if anything
+
     def fake_call(self, answers):
         async def call(op, args=None, timeout=None):
+            if op == "dialog":
+                return {"dialog": self.dialog}
             self.pings.append(op)
             answer = answers.pop(0) if answers else None
             if answer is None:
@@ -356,6 +360,15 @@ class LaunchTests(unittest.TestCase):
                 os.environ.pop("FREELAB_FONTLAB_EXE", None)
             else:
                 os.environ["FREELAB_FONTLAB_EXE"] = saved
+
+    def test_a_save_prompt_is_reported_at_once(self):
+        self.fake_call([{"quitting": True, "edited": 1}])
+        self.dialog = {"class": "DlgClosePackage", "title": "FontLab Warning",
+                       "text": ['Save changes to "Test" before closing?'], "buttons": ["Don't Save", "Cancel", "OK"]}
+        server.launcher.fontlab_running = lambda: True
+        with self.assertRaisesRegex(RuntimeError, r"\[save_prompt\].*Save changes to \"Test\"") as ctx:
+            asyncio.run(server.quit_fontlab(wait_s=60))
+        self.assertIn("left on screen", str(ctx.exception))
 
     def test_restart_quits_then_launches(self):
         self.fake_call([{"quitting": True}, None, {"listener": "0.1.0"}])

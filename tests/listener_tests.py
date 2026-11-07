@@ -145,10 +145,10 @@ class QuitTests(ListenerCase):
 
     def test_unsaved_reports_fonts_and_workspace(self):
         self.state.unsaved = [False, True, True]
-        self.assertEqual(self.ok("unsaved"), {"unsaved": True, "workspace": False, "fonts": 2})
+        self.assertEqual(self.ok("unsaved"), {"unsaved": True, "workspace": False, "fonts": 2, "edited": 2})
         self.state.unsaved = [False]
         self.state.workspace_changed = True
-        self.assertEqual(self.ok("unsaved"), {"unsaved": True, "workspace": True, "fonts": 0})
+        self.assertEqual(self.ok("unsaved"), {"unsaved": True, "workspace": True, "fonts": 0, "edited": 0})
 
     def test_quit_is_refused_over_an_unsaved_font(self):
         self.state.unsaved = [True]
@@ -156,11 +156,16 @@ class QuitTests(ListenerCase):
         self.assertIn("1 font", error["message"])
         self.assertEqual(self.quits, [])
 
-    def test_quit_is_refused_over_a_font_with_undo_history(self):
-        # FontLab 7.2 left hasChanges False after an edit; only hasHistoryStates told
+    def test_an_edited_font_goes_through_fontlabs_own_question(self):
+        # FontLab 7.2 left hasChanges False after an edit (only hasHistoryStates told), and asked to
+        # save it on closing: the quit goes ahead, and FontLab asks
         self.state.unsaved = [False, "history"]
-        self.fails("quit", code="unsaved_changes")
-        self.assertEqual(self.quits, [])
+        self.assertEqual(self.ok("quit"), {"quitting": True, "edited": 1})
+        self.assertEqual(len(self.quits), 1)
+        self.assertEqual(self.ok("unsaved"), {"unsaved": False, "workspace": False, "fonts": 0, "edited": 1})
+
+    def test_dialog_outside_fontlab_is_none(self):
+        self.assertEqual(self.ok("dialog"), {"dialog": None})
 
     def test_state_folder_follows_the_environment(self):
         saved = os.environ.get("FREELAB_STATE_DIR")
@@ -240,7 +245,7 @@ class QuitTests(ListenerCase):
 
     def test_quit_with_nothing_unsaved(self):
         self.state.unsaved = [False, False]
-        self.assertEqual(self.ok("quit"), {"quitting": True})
+        self.assertEqual(self.ok("quit"), {"quitting": True, "edited": 0})
         self.assertEqual(len(self.quits), 1)
 
 

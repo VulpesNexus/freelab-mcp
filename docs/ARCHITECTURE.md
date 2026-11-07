@@ -37,7 +37,7 @@ Request, one line of JSON:
 
 Reply, one line: `{"id": 7, "ok": true, "result": …}`, or `{"id": 7, "ok": false, "error": {"code": "no_glyph", "message": "…"}}`. The `id` is echoed only once the token is accepted. `deadline` is optional: seconds since the epoch after which the client has given up, so a request FontLab only reaches later is refused (`expired`) instead of run unseen. The server sets it on every call. A protocol change bumps the number in both halves; the server refuses a listener that speaks another one.
 
-Listener error codes: `bad_json`, `bad_request`, `bad_token`, `bad_protocol`, `expired`, `unknown_op`, `bad_args`, `too_large`, `not_in_fontlab`, `no_font`, `no_current_font`, `no_glyph`, `no_layer`, `unexpected_type`, `unreadable`, `unserializable`, `unsaved_changes`, and `exception`, which carries the traceback. The client adds `not_running`, `bad_state`, `timeout`, `connection`, `empty_reply`, `bad_reply`, and `too_large` (a request over the listener's 4 MB, refused before it is sent). The server's tools add `bad_args`, `listener_not_running` (FontLab runs without its listener), `not_found` (no FontLab program), `no_listener` (FontLab started, its listener did not answer), and `still_running` (FontLab asked to close, still open).
+Listener error codes: `bad_json`, `bad_request`, `bad_token`, `bad_protocol`, `expired`, `unknown_op`, `bad_args`, `too_large`, `not_in_fontlab`, `no_font`, `no_current_font`, `no_glyph`, `no_layer`, `unexpected_type`, `unreadable`, `unserializable`, `unsaved_changes`, and `exception`, which carries the traceback. The client adds `not_running`, `bad_state`, `timeout`, `connection`, `empty_reply`, `bad_reply`, and `too_large` (a request over the listener's 4 MB, refused before it is sent). The server's tools add `bad_args`, `listener_not_running` (FontLab runs without its listener), `not_found` (no FontLab program), `no_listener` (FontLab started, its listener did not answer), `save_prompt` (FontLab asks whether to save a font, and waits for the user), `dialog_open` (it asks something else), and `still_running` (FontLab asked to close, still open).
 
 | Operation | Does |
 |---|---|
@@ -48,8 +48,9 @@ Listener error codes: `bad_json`, `bad_request`, `bad_token`, `bad_protocol`, `e
 | `glyph` | one glyph by name or code point: Unicode values, layers, width, bounding box, counts |
 | `outline` | shapes, contours, and nodes on one layer, capped by `max_nodes` |
 | `run_python` | runs code in FontLab, returns printed output, `result`, and any traceback |
-| `unsaved` | whether the workspace has changes, or any open font has changes or edits FontLab can still undo (FontLab 7.2 reports an edit only through its undo history) |
-| `quit` | refused with `unsaved_changes` when there are any (or `unreadable` when FontLab cannot tell); otherwise closes FontLab's main window a moment after replying, as its close button would |
+| `unsaved` | whether the workspace or any open font has changes FontLab reports, and how many fonts were edited since they were opened (`edited`: FontLab 7.2 reports an edit only through its undo history) |
+| `dialog` | the window FontLab is waiting on, if any: its class, title, texts, and buttons; it only reads |
+| `quit` | refused with `unsaved_changes` when FontLab reports changes (or `unreadable` when it cannot tell); otherwise closes FontLab's main window a moment after replying, as its close button would. FontLab then asks about each edited font itself (*Save changes to ... before closing?*); `quit_fontlab` reads that question through `dialog`, leaves it on screen, and returns it as `save_prompt` |
 
 ## Error model
 

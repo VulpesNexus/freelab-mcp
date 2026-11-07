@@ -17,6 +17,7 @@ import errno
 import hmac
 import json
 import os
+import re
 import socket
 import sys
 import time
@@ -315,41 +316,86 @@ def op_status(listener, args):
 
 
 def unsaved_work():
-    """(workspace has changes, number of open fonts that may have unsaved changes), read from FontLab.
+    """(workspace has changes, fonts with changes, fonts edited since opening), read from FontLab.
 
-    A font counts when it has changes or any edit FontLab can still undo: in FontLab 7.2, hasChanges
-    stayed False after an edit to a font (seen live), while hasHistoryStates turned True. A font
-    edited and then saved may count too: quitting is refused rather than risked.
-    A read that fails raises: FontLab must never be quit on a guess.
+    FontLab 7.2 reported an edit to a font only through hasHistoryStates (its undo history):
+    hasChanges stayed False, though FontLab itself asked to save it on closing. So an edited font
+    does not refuse a quit here: closing goes through FontLab's own question, which the server
+    reports (see op_dialog). A read that fails raises: FontLab must never be quit on a guess.
     """
     fl = _fontlab()
     workspace = fl.flWorkspace.instance()
     try:
         workspace_changed = bool(workspace.hasChanges)
-        fonts = sum(1 for package in _real_list(workspace.packages(), "flWorkspace.packages()")
-                    if package.hasChanges or package.hasHistoryStates)
+        packages = _real_list(workspace.packages(), "flWorkspace.packages()")
+        changed = sum(1 for package in packages if package.hasChanges)
+        edited = sum(1 for package in packages if package.hasChanges or package.hasHistoryStates)
     except Exception as exc:
         raise FreeLabError("unreadable", "FontLab could not tell whether there are unsaved changes: %s" % _exc_text(exc))
-    return workspace_changed, fonts
+    return workspace_changed, changed, edited
 
 
 @op("unsaved")
 def op_unsaved(listener, args):
-    workspace_changed, fonts = unsaved_work()
-    return {"unsaved": workspace_changed or fonts > 0, "workspace": workspace_changed, "fonts": fonts}
+    workspace_changed, changed, edited = unsaved_work()
+    return {"unsaved": workspace_changed or changed > 0, "workspace": workspace_changed, "fonts": changed,
+            "edited": edited}
 
 
 @op("quit")
 def op_quit(listener, args):
-    """Close FontLab as its close button would, a moment after replying; refused over any unsaved work."""
-    workspace_changed, fonts = unsaved_work()
-    if workspace_changed or fonts:
-        parts = (["%d font%s" % (fonts, "" if fonts == 1 else "s")] if fonts else []) + (["the workspace"] if workspace_changed else [])
-        raise FreeLabError("unsaved_changes", "FontLab may have unsaved changes (%s, edited since opening): close FontLab "
-                           "yourself, where it asks about each font. FreeLab never quits FontLab over possibly unsaved "
-                           "work." % " and ".join(parts))
+    """Close FontLab as its close button would, a moment after replying.
+
+    Refused when FontLab reports unsaved changes outright. A font that was only edited goes through
+    FontLab's own question on closing ("Save changes to ... before closing?"), which stays on screen
+    for the user; the server reads it through op_dialog and says so.
+    """
+    workspace_changed, changed, edited = unsaved_work()
+    if workspace_changed or changed:
+        parts = (["%d font%s" % (changed, "" if changed == 1 else "s")] if changed else []) + (["the workspace"] if workspace_changed else [])
+        raise FreeLabError("unsaved_changes", "FontLab has unsaved changes (%s): save them, or close them in FontLab, "
+                           "first. FreeLab never quits FontLab over unsaved work." % " and ".join(parts))
     listener.request_quit()
-    return {"quitting": True}
+    return {"quitting": True, "edited": edited}
+
+
+def _prop(obj, name):
+    """A Qt property: PythonQt gives most as values, some as methods."""
+    value = getattr(obj, name)
+    return value() if callable(value) else value
+
+
+_TAGS = re.compile(r"<[^>]+>")
+
+
+@op("dialog")
+def op_dialog(listener, args):
+    """The window FontLab is waiting on (its active modal dialog): class, title, texts, and buttons. Reads only."""
+    try:
+        from PythonQt.QtGui import QApplication  # only inside FontLab
+    except ImportError:
+        return {"dialog": None}
+    dialog = QApplication.instance().activeModalWidget()
+    if dialog is None:
+        return {"dialog": None}
+    texts, buttons = [], []
+
+    def walk(widget):
+        for child in widget.children():
+            if not child.isWidgetType() or not child.isVisible():
+                continue
+            if child.inherits("QAbstractButton"):
+                text = _TAGS.sub("", _prop(child, "text") or u"").replace("&", "").strip()
+                if text:
+                    buttons.append(text)
+            elif child.inherits("QLabel"):
+                text = _TAGS.sub("", _prop(child, "text") or u"").strip()
+                if text:
+                    texts.append(text)
+            walk(child)
+    walk(dialog)
+    return {"dialog": {"class": dialog.metaObject().className(), "title": _prop(dialog, "windowTitle"),
+                       "text": texts, "buttons": buttons}}
 
 
 @op("font_info")
