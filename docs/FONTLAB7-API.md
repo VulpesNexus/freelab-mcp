@@ -30,7 +30,7 @@ Proof levels: **documented** (in the FontLab 7 reference), **stub-tested** (the 
 - *%LOCALAPPDATA%\FontLab\FontLab 7\startupScript.py* runs at launch, and its `print` output reaches the *Output* panel.
 - A script picked from the *Scripts* menu runs with `__file__` set to its path; modules it loads stay in `sys.modules` between runs.
 - `fontlab.flPreferences()` reads and writes the preferences (`colorWorkspace` and the other `color*` members are `QColor`s); a write is stored in the registry at once and shows on the next repaint.
-- PythonQt's quirks (properties as values, missing enum names, `winId()`, `findChildren`): [DARKMODE.md](DARKMODE.md).
+- PythonQt's quirks (properties as values, missing enum names, `winId()`, `findChildren`): *docs/DARKMODE.md* in FreeLab, the separate `freelab` repository.
 
 ## Corrections to the earlier FontLab MCP
 
