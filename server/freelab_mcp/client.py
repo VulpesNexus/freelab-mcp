@@ -42,7 +42,7 @@ def state_path() -> Path:
 
 
 START_HINT = (
-    "Start it in FontLab: Scripts > FreeLab: Start Listener, or open "
+    "Start it in FontLab: Scripts > FreeLab > Start Listener, or open "
     "freelab_listener.py in the Scripting panel and run it."
 )
 

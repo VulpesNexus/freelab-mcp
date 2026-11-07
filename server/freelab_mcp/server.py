@@ -134,7 +134,7 @@ async def launch_fontlab(wait_s: float = 120.0) -> dict[str, Any]:
         pass
     if await anyio.to_thread.run_sync(launcher.fontlab_running):
         raise RuntimeError("[listener_not_running] FontLab is running, but its listener is not: in FontLab, choose "
-                           "Scripts > FreeLab: Start Listener.")
+                           "Scripts > FreeLab > Start Listener.")
     try:
         pid = await anyio.to_thread.run_sync(launcher.launch)
     except FileNotFoundError as exc:
@@ -148,7 +148,7 @@ async def launch_fontlab(wait_s: float = 120.0) -> dict[str, Any]:
             continue
     raise RuntimeError(f"[no_listener] FontLab started (process {pid}), but its listener did not answer within "
                        f"{wait_s:g} s. Install with tools/install-fontlab.ps1 -ListenerAtLaunch to start it at launch, "
-                       "or choose Scripts > FreeLab: Start Listener.")
+                       "or choose Scripts > FreeLab > Start Listener.")
 
 
 async def _wait_for_exit(wait_s: float) -> bool:
