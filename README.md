@@ -55,3 +55,7 @@ It runs the listener and server tests under Python 3, then the listener tests un
 - [docs/FONTLAB7-API.md](docs/FONTLAB7-API.md): the FontLab calls in use and how far each is proven.
 - [docs/PRIOR-ART.md](docs/PRIOR-ART.md): the existing FontLab MCP servers, and why FreeLab MCP does not build on them.
 - [docs/ROADMAP.md](docs/ROADMAP.md): what comes next.
+
+## License
+
+**GPL-3.0-or-later** ([LICENSE](LICENSE)). Copyright © 2026 Vixen420. It comes with no warranty.
