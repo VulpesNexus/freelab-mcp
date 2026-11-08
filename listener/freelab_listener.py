@@ -350,11 +350,16 @@ def op_quit(listener, args):
     FontLab's own question on closing ("Save changes to ... before closing?"), which stays on screen
     for the user; the server reads it through op_dialog and says so.
     """
+    if listener.quit_in_progress():
+        raise FreeLabError("quit_in_progress", "FontLab is already closing (it may be asking on screen whether to save): "
+                           "answer it in FontLab, or wait.")
     workspace_changed, changed, edited = unsaved_work()
     if workspace_changed or changed:
         parts = (["%d font%s" % (changed, "" if changed == 1 else "s")] if changed else []) + (["the workspace"] if workspace_changed else [])
         raise FreeLabError("unsaved_changes", "FontLab has unsaved changes (%s): save them, or close them in FontLab, "
                            "first. FreeLab never quits FontLab over unsaved work." % " and ".join(parts))
+    if listener.deadline is not None and time.time() > listener.deadline:
+        raise FreeLabError("expired", "The client gave up while FontLab checked for unsaved work; FontLab was not closed.")
     listener.request_quit()
     return {"quitting": True, "edited": edited}
 
@@ -375,9 +380,11 @@ def op_dialog(listener, args):
         from PythonQt.QtGui import QApplication  # only inside FontLab
     except ImportError:
         return {"dialog": None}
-    dialog = QApplication.instance().activeModalWidget()
+    app = QApplication.instance()
+    main_window, others = _top_windows(app)
+    dialog = app.activeModalWidget()
     if dialog is None:
-        return {"dialog": None}
+        return {"dialog": None, "main_window": main_window, "windows": others}
     texts, buttons = [], []
 
     def walk(widget):
@@ -385,17 +392,53 @@ def op_dialog(listener, args):
             if not child.isWidgetType() or not child.isVisible():
                 continue
             if child.inherits("QAbstractButton"):
-                text = _TAGS.sub("", _prop(child, "text") or u"").replace("&", "").strip()
-                if text:
-                    buttons.append(text)
+                if not (child.inherits("QCheckBox") or child.inherits("QRadioButton")):
+                    text = _MNEMONIC.sub(r"\1", _prop(child, "text") or u"").strip()  # "&Save" -> "Save", "&&" -> "&"
+                    if text:
+                        buttons.append(text)
             elif child.inherits("QLabel"):
-                text = _TAGS.sub("", _prop(child, "text") or u"").strip()
+                text = _label_text(child)
                 if text:
                     texts.append(text)
             walk(child)
     walk(dialog)
     return {"dialog": {"class": dialog.metaObject().className(), "title": _prop(dialog, "windowTitle"),
-                       "text": texts, "buttons": buttons}}
+                       "text": texts, "buttons": buttons}, "main_window": main_window, "windows": others}
+
+
+def _top_windows(app):
+    """(whether FontLab's main window is open, the titles of the other visible top-level windows)."""
+    main_window, others = False, []
+    try:
+        for widget in app.topLevelWidgets():
+            if not widget.isVisible():
+                continue
+            if widget.metaObject().className() == "MainWindow":
+                main_window = True
+            else:
+                others.append(_text(_prop(widget, "windowTitle") or widget.metaObject().className()))
+    except Exception:
+        pass
+    return main_window, others
+
+
+_MNEMONIC = re.compile(r"&(.)")
+_RICH = re.compile(r"^[^\n]*<[A-Za-z!/][^>]*>")  # a tag before the first line break: Qt's mightBeRichText, roughly
+_ENTITIES = ((u"&lt;", u"<"), (u"&gt;", u">"), (u"&quot;", u'"'), (u"&#39;", u"'"), (u"&nbsp;", u" "), (u"&amp;", u"&"))
+
+
+def _label_text(label):
+    """A label's text as shown: rich text without its tags and entities, plain text word for word."""
+    text = _prop(label, "text") or u""
+    try:
+        text_format = int(_prop(label, "textFormat"))  # Qt::PlainText 0, RichText 1, AutoText 2
+    except Exception:
+        text_format = 2
+    if text_format == 1 or (text_format == 2 and _RICH.search(text)):
+        text = _TAGS.sub(u"", text)
+        for entity, character in _ENTITIES:
+            text = text.replace(entity, character)
+    return text.strip()
 
 
 @op("font_info")
@@ -638,6 +681,8 @@ class Listener(object):
         self._reported = set()
         self.quit_timer = None
         self.quit_requested = False
+        self.closing = False  # inside the main window's close(), which may wait on FontLab's save question
+        self.deadline = None  # the request being handled: its deadline (seconds since the epoch), or None
 
     # -- quitting FontLab ----------------------------------------------------
     def request_quit(self, delay_ms=QUIT_DELAY_MS):
@@ -646,6 +691,8 @@ class Listener(object):
         Closing the window, rather than ending the application, runs FontLab's own
         shutdown: its preferences are saved, and it may still ask something on screen.
         """
+        if self.quit_in_progress():  # never drop a timer whose callback may be running (see quit_in_progress)
+            raise FreeLabError("quit_in_progress", "FontLab is already closing.")
         self.quit_requested = True
         from PythonQt.QtCore import QTimer  # only inside FontLab
         timer = QTimer()
@@ -660,6 +707,20 @@ class Listener(object):
         timer.start()
         self.quit_timer = timer  # referenced until it fires
 
+    def quit_in_progress(self):
+        """A quit is under way: its timer not fired yet, or the main window's close() still running (it
+        waits inside FontLab's save question). Replacing self.quit_timer then would let Python free a
+        Qt timer whose callback is on the stack."""
+        if self.closing:
+            return True
+        timer = self.quit_timer
+        if timer is None:
+            return False
+        try:
+            return bool(_prop(timer, "active"))
+        except Exception:
+            return True  # cannot tell: refused rather than risked
+
     def _close_main_window(self):
         """Close FontLab's main window (class MainWindow in FontLab 7.2, seen live).
 
@@ -673,7 +734,11 @@ class Listener(object):
             windows = [w for w in app.topLevelWidgets() if w.metaObject().className() == "MainWindow"]
             if not windows:
                 raise FreeLabError("not_found", "FontLab's main window was not found, so FontLab was not closed.")
-            windows[0].close()
+            self.closing = True
+            try:
+                windows[0].close()
+            finally:
+                self.closing = False
         except BaseException as exc:  # a Qt timer callback must not raise
             self._record("quit", exc)
 
@@ -912,6 +977,7 @@ class Listener(object):
             if not isinstance(args, dict):
                 raise FreeLabError("bad_args", "args must be a JSON object.")
             self.requests += 1
+            self.deadline = deadline
             result = handler(self, args)
             return {"id": request_id, "ok": True, "result": to_jsonable(result)}
         except FreeLabError as exc:

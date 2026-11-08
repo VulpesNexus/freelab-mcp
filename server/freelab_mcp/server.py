@@ -181,10 +181,24 @@ async def quit_fontlab(wait_s: float = 60.0) -> dict[str, Any]:
             words = " ".join(question.get("text") or []) or question.get("title") or question.get("class")
             raise RuntimeError(f"[{code}] FontLab is asking: {words} (buttons: {', '.join(question.get('buttons') or [])}). "
                                "It was left on screen for the user to answer; FontLab stays open until then.")
+    left = await _windows_left()
+    if left is not None and left.get("main_window") is False:
+        others = ", ".join(left.get("windows") or []) or "none visible"
+        raise RuntimeError(f"[still_running] FontLab's main window closed, but its process is still running after "
+                           f"{wait_s:g} s: a window without a parent (a script's dialog) keeps it open ({others}). "
+                           "Close that window to end FontLab.")
     raise RuntimeError(f"[still_running] FontLab was asked to close but is still running after {wait_s:g} s.")
 
 
 SAVE_PROMPT_CLASS = "DlgClosePackage"  # FontLab 7.2's "Save changes to ... before closing?"
+
+
+async def _windows_left() -> dict[str, Any] | None:
+    """Whether FontLab's main window is open and which other windows are, or None (no listener)."""
+    try:
+        return await _call("dialog", timeout=5.0)
+    except RuntimeError:
+        return None
 
 
 async def _open_dialog() -> dict[str, Any] | None:
@@ -199,8 +213,10 @@ async def _open_dialog() -> dict[str, Any] | None:
 async def restart_fontlab(wait_s: float = 120.0) -> dict[str, Any]:
     """Close FontLab and start it again (only when the user asked), then wait for the listener.
 
-    Refused while any font may have unsaved changes (edited since it was opened) or the workspace has changes. The listener answers after the restart
-    only when FontLab's startup script starts it (tools/install-fontlab.ps1 -ListenerAtLaunch).
+    Refused while FontLab reports unsaved changes. A font edited since it was opened makes FontLab ask on
+    screen whether to save it: the question is left there for the user, and the restart stops ([save_prompt]).
+    The listener answers after the restart only when FontLab's startup script starts it
+    (tools/install-fontlab.ps1 -ListenerAtLaunch).
     """
     # Everything that could stop the start is checked before FontLab is closed.
     if not 0 < wait_s <= MAX_TIMEOUT_S:

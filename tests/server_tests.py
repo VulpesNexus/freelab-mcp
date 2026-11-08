@@ -296,6 +296,21 @@ class LaunchTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "still_running"):
             asyncio.run(server.quit_fontlab(wait_s=0.01))
 
+    def test_quit_names_a_window_that_keeps_fontlab_running(self):
+        self.fake_call([{"quitting": True}])
+        server.launcher.fontlab_running = lambda: True
+        saved = server._windows_left
+
+        async def left():
+            return {"dialog": None, "main_window": False, "windows": ["FreeLab Auto Kerning"]}
+
+        server._windows_left = left
+        try:
+            with self.assertRaisesRegex(RuntimeError, "main window closed.*FreeLab Auto Kerning"):
+                asyncio.run(server.quit_fontlab(wait_s=0.01))
+        finally:
+            server._windows_left = saved
+
     def test_restart_without_the_program_closes_nothing(self):
         self.fake_call([{"quitting": True}])
         saved = server.launcher.program_found

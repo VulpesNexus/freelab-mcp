@@ -129,6 +129,84 @@ class CloseMainWindowTests(ListenerCase):
         self.assertEqual(len(self.listener.errors), 1)
         del self.listener.errors[:]
 
+    def test_closing_is_marked_while_the_main_window_closes(self):
+        seen = []
+        listener = self.listener
+
+        class Main(self.Window):
+            def close(self):
+                seen.append(listener.quit_in_progress())
+
+        self.App.windows = [Main("MainWindow")]
+        self.listener._close_main_window()
+        self.assertEqual(seen, [True], "a quit asked meanwhile is refused")
+        self.assertFalse(self.listener.quit_in_progress(), "and allowed again once close() returns (Cancel)")
+
+    def test_a_second_quit_never_replaces_a_running_timer(self):
+        class Timer(object):
+            active = True
+
+        self.listener.quit_timer = Timer()
+        with self.assertRaises(fl.FreeLabError) as raised:
+            self.listener.request_quit()
+        self.assertEqual(raised.exception.code, "quit_in_progress")
+        Timer.active = False
+        self.assertFalse(self.listener.quit_in_progress())
+        self.listener.quit_timer = None
+
+    def test_dialog_reads_the_question_as_shown(self):
+        class Meta(object):
+            def __init__(self, name):
+                self.name = name
+
+            def className(self):
+                return self.name
+
+        class Widget(object):
+            def __init__(self, kind, text=u"", text_format=2, children=()):
+                self.kind, self.text, self.textFormat, self._children = kind, text, text_format, list(children)
+                self.windowTitle = u"FontLab Warning"
+
+            def children(self):
+                return self._children
+
+            def isWidgetType(self):
+                return True
+
+            def isVisible(self):
+                return True
+
+            def inherits(self, name):
+                bases = {"QLabel": ("QLabel",), "QPushButton": ("QPushButton", "QAbstractButton"),
+                         "QCheckBox": ("QCheckBox", "QAbstractButton"), "QDialog": ("QDialog",)}
+                return name in bases[self.kind]
+
+            def metaObject(self):
+                return Meta("DlgClosePackage" if self.kind == "QDialog" else self.kind)
+
+        dialog = Widget("QDialog", children=[
+            Widget("QLabel", u'Save changes to "Foo <Bold>" before closing?', 0),
+            Widget("QLabel", u"<b>Kerning</b> &amp; classes", 1),
+            Widget("QPushButton", u"&Don't Save"), Widget("QPushButton", u"A&&B"),
+            Widget("QCheckBox", u"Do not ask again")])
+
+        class Shown(self.Window):
+            def isVisible(self):
+                return True
+
+            windowTitle = u"FreeLab Auto Kerning"
+
+        self.App.windows = [Shown("QDialog")]
+        self.App.activeModalWidget = lambda app: dialog
+        try:
+            reply = self.ok("dialog")
+        finally:
+            del self.App.activeModalWidget
+        self.assertEqual(reply["dialog"]["text"], [u'Save changes to "Foo <Bold>" before closing?', u"Kerning & classes"],
+                         "plain text word for word; rich text without its tags and entities")
+        self.assertEqual(reply["dialog"]["buttons"], [u"Don't Save", u"A&B"], "mnemonics dropped, a literal & kept, no check box")
+        self.assertEqual((reply["main_window"], reply["windows"]), (False, [u"FreeLab Auto Kerning"]))
+
     def test_errors_are_capped(self):
         for i in range(fl.MAX_ERRORS + 5):
             self.listener._record("tick", RuntimeError(str(i)))
@@ -242,6 +320,29 @@ class QuitTests(ListenerCase):
 
     def test_protocol_must_be_the_integer(self):
         self.fails("ping", protocol=True, code="bad_protocol")
+
+    def test_quit_is_refused_while_fontlab_is_closing(self):
+        self.listener.closing = True
+        try:
+            self.fails("quit", code="quit_in_progress")
+        finally:
+            self.listener.closing = False
+        self.assertEqual(self.quits, [])
+
+    def test_quit_is_refused_when_the_client_gave_up_meanwhile(self):
+        saved = fl.unsaved_work
+        listener = self.listener
+
+        def slow():  # FontLab busy: the client's deadline passes while this runs
+            listener.deadline = time.time() - 1
+            return False, 0, 0
+
+        fl.unsaved_work = slow
+        try:
+            self.fails("quit", code="expired")
+        finally:
+            fl.unsaved_work = saved
+        self.assertEqual(self.quits, [], "FontLab not closed")
 
     def test_quit_with_nothing_unsaved(self):
         self.state.unsaved = [False, False]

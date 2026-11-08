@@ -13,7 +13,7 @@ Proof levels: **documented** (in the FontLab 7 reference), **stub-tested** (the 
 | `flWorkspace` | `hasChanges` | property, bool | `unsaved`, `quit` | documented, stub-tested, **live** (2026-11-07): a bool |
 | `flWorkspace` | `packages()` | method, list of `flObject`, one per open font | `unsaved`, `quit` | documented, stub-tested, **live** (2026-11-07): a real Python list of `flObject` |
 | `flObject` (a package) | `hasChanges` | property, bool | `unsaved`, `quit` | stub-tested, **live** (2026-11-07): stayed `False` after an edit to the font, as did `isChanged`, the workspace's `hasChanges`, and every window's `windowModified` |
-| `flObject` (a package) | `hasHistoryStates` | property, bool | `unsaved`, `quit` | documented, stub-tested, **live** (2026-11-07): `True` after that edit; it may stay `True` after saving, so a quit is then refused rather than risked |
+| `flObject` (a package) | `hasHistoryStates` | property, bool | `unsaved`, `quit` | documented, stub-tested, **live** (2026-11-07): `True` after that edit, and FontLab asked whether to save the font on closing: `quit` goes ahead and leaves that question on screen for the user (it may stay `True` after saving, and the question then simply does not appear) |
 | `flPackage` | `tfn`, `tsn`, `psn`, `ffn`, `path`, `upm`, `glyphsCount`, `master`, `mastersCount`, `versionMajor`, `versionMinor`, `hasChanges`, `isNull` | properties | `font_info`, `status` | documented, stub-tested |
 | `flPackage` | `findName(name)` | method, `flGlyph` | `glyph`, `outline` | documented, stub-tested |
 | `flPackage` | `findUnicode(codepoint)` | method, `flGlyph` | `glyph`, `outline` | documented, stub-tested |
@@ -40,11 +40,15 @@ Proof levels: **documented** (in the FontLab 7 reference), **stub-tested** (the 
 
 ## Kerning and outlines, found live (2026-11-08)
 
-Read-only probes, for FreeLab's kerner:
+Probes for FreeLab's kerner (read-only, except the writes noted, made in memory and undone):
 
-- `flPackage.kerning(master)` returns an `fgKerning`: `keys()`, `items()` (pairs as `fgKerningObjectPair` with values), `asDict()`, `get(pair or ('left', 'right'))`, item assignment (`__setitem__`, `__delitem__`), `getPlainPairs`, `setPlainPairs`, `groups` (`fgKerningGroups`), `addGroup`, `hasGroupKerning()`, `scale`. Writing has not been tried yet.
+- `flPackage.kerning(master)` returns an `fgKerning`: `keys()`, `items()` (pairs as `fgKerningObjectPair` with values), `asDict()`, `get(('left', 'right'))`, item assignment, `remove(pair)`, `getPlainPairs`, `getPlainPairsDict`, `setPlainPairs`, `groups` (`fgKerningGroups`), `addGroup`, `renameGroup`, `hasGroupKerning()`, `scale`.
+- **Reading** (2026-11-08): `get(('left', 'right'))` reads that pair's own entry only and misses kerning classes: a font kerned by classes gives `None` for pairs FontLab kerns. `getPlainPairsDict()` resolves the classes: every kerned glyph pair, flattened, with the value FontLab applies (47,224 pairs in 0.02 s on a font of 2,361 entries). `get` and assignment refuse keys of `(name, is class)` tuples and `fgKerningObjectPair`s in practice.
+- **Writing** (2026-11-08, in memory, then undone): `kerning[(a, b)] = value` takes a name that is also a class's name as the class, even when a glyph has that name (writing `('A', 'V')` with a class *A* kerns the whole class). `remove((a, b))` removes an entry the same way; `del kerning[pair]` removes it but raises. `renameGroup(old, new)` keeps the class's pairs, so a glyph named like a class can be written with the class renamed for the moment. `groups[name] = (members, flag)` makes a class, or replaces one and keeps its pairs; the flag `KernLeft` means first in a pair, `KernRight` second, `KernBothSide` either.
+- **Unsaved state**: a script's kerning write does not mark the font modified (`isChanged` and `hasChanges` stay `False`), so FontLab may close it without asking. A script that writes should call `package.setFlag(2)` (`ofChanged`, from `flObjectFlags`). `package.changed` is a method that marks the font modified: never call it to read it.
+- `fontlab.flPackage()` registers a new, empty font in the workspace and makes it the current one: a probe must not make one in the user's session. Closing such fonts while one of them was current crashed FontLab on its next repaint.
 - `flPackage.getAllGroups()` lists `(kernGroup, name, id, mark, glyph names)`; feature classes come back with `kernGroup` False.
-- `flPackage.autoKern(left_glyph, right_glyph, master_name)` is FontLab's own pair autokern (it writes into the font: not called).
+- `flPackage.autoKern(left_glyph, right_glyph, master_name)` is FontLab's own pair autokern: it returns the pair's value (as text or a number) without writing it (FreeLab's Auto Kerning calls it, 2026-11-08).
 - `flGlyph` has no `layer(name)`: use `getLayerByName(master)` or `activeLayer`. `flLayer.shapes` holds `flShape`s with a `transform` (`QTransform`) and `contours`; `flContour.path()` returns a `QPainterPath`, and `draw(pen)` and `drawPoints(point_pen)` follow the pen protocols.
 
 ## Corrections to the earlier FontLab MCP
