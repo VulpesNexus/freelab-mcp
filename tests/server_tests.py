@@ -74,7 +74,7 @@ class NotRunningTests(ServerCase):
         with self.assertRaises(RuntimeError) as ctx:
             asyncio.run(server.fontlab_status())
         self.assertIn("[not_running]", str(ctx.exception))
-        self.assertIn("Start Listener", str(ctx.exception))
+        self.assertIn("Start MCP Listener", str(ctx.exception))
 
     def test_stale_state_file(self):
         self.start_listener()

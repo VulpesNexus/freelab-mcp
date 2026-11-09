@@ -29,7 +29,7 @@ FreeLab, the separate `freelab` repository, holds tools that run inside FontLab,
 
 ## Use
 
-1. In FontLab, choose *Scripts > FreeLab > Start Listener* (or open the file in the *Scripting* panel and run it), unless it starts at launch. The *Output* panel shows the listener's version and port. Run it again to restart it.
+1. In FontLab, choose *Scripts > FreeLab > Start MCP Listener* (or open the file in the *Scripting* panel and run it), unless it starts at launch. The *Output* panel shows the listener's version and port. Run it again to restart it.
 2. Ask the AI app, for example, "check the FontLab connection" or "describe the glyph A".
 
 Tools: `fontlab_status`, `get_current_font`, `list_glyphs`, `get_glyph`, `get_glyph_outline`, and `run_python`, which runs code inside FontLab for probing. `launch_fontlab`, `quit_fontlab`, and `restart_fontlab` start and close FontLab when you ask; FontLab closes as its close button would: when a font has unsaved edits, FontLab asks whether to save it, and the tool leaves that question on screen for you and says so; it never answers it.

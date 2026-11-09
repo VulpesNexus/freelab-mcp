@@ -243,6 +243,6 @@ $end
 }
 elseif ((Test-Path $startup) -and (Test-Changed $text)) {
     Save-Startup $text
-    if ($hadBlock) { Write-Output "Removed the FreeLab MCP block from ${startup}: start the listener with Scripts > FreeLab > Start Listener" }
+    if ($hadBlock) { Write-Output "Removed the FreeLab MCP block from ${startup}: start the listener with Scripts > FreeLab > Start MCP Listener" }
     Write-LegacyNote
 }

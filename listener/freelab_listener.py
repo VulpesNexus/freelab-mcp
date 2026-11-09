@@ -1,4 +1,4 @@
-#FLM: Start Listener
+#FLM: Start MCP Listener
 # -*- coding: utf-8 -*-
 """FreeLab listener: runs inside FontLab and answers the FreeLab MCP server.
 
