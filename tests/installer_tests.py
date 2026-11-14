@@ -66,6 +66,18 @@ class InstallerTests(unittest.TestCase):
         code, out = self.run_installer("-ListenerAtLaunch")
         self.assertEqual((code, self.read()), (0, before), "a second install changes nothing")
 
+    def test_block_keeps_a_running_listener(self):
+        """FontLab may run the startup script again in a session; a running listener must not be restarted."""
+        self.write(b"mine = 1\n")
+        code, out = self.run_installer("-ListenerAtLaunch")
+        self.assertEqual(code, 0, out)
+        check = ("import sys\nsys._freelab_listener = 'running'\n"
+                 "exec(compile(open(sys.argv[1], encoding='utf-8-sig').read(), 'startupScript.py', 'exec'))\n"
+                 "print(sys._freelab_listener, 'freelab_listener' in sys.modules)\n")
+        proc = subprocess.run([sys.executable, "-c", check, str(self.startup)], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, creationflags=NO_WINDOW, timeout=60)
+        self.assertEqual(proc.stdout.split(), ["running", "False"], proc.stdout + proc.stderr)
+
     def test_block_is_updated_where_it_is(self):
         self.write(MINE + b"# >>> FreeLab MCP (managed)\nold = 1\n# <<< FreeLab MCP\n" + TOOLS)
         code, out = self.run_installer("-ListenerAtLaunch")

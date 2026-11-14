@@ -206,6 +206,8 @@ if ($ListenerAtLaunch) {
 $begin (managed by FreeLab MCP tools/install-fontlab.ps1; -Uninstall removes it)
 def _freelab_mcp_startup():
     import os, sys
+    if getattr(sys, "_freelab_listener", None) is not None:
+        return  # FontLab may run this script again in a session: keep the running listener and its requests
     path = $listenerPath
     if not os.path.isfile(path):
         return

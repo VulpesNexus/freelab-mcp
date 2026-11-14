@@ -596,7 +596,15 @@ def op_run_python(listener, args):
             error = _format_exc()
     finally:
         sys.stdout, sys.stderr = saved
-    reply = {"output": captured.value(), "result": to_jsonable(namespace.get("result"))}
+    try:
+        reply = {"output": captured.value(), "result": to_jsonable(namespace.get("result"))}
+    finally:
+        if not args.get("persist"):
+            # A function the code defined holds this namespace as its globals, a cycle only a later garbage
+            # collection breaks. Qt objects the code made would then die in some unrelated request (a crash in
+            # FontLab once surfaced in tab docking's timer that way), so they die here, in their own request.
+            # A deferred callback that needs these names must run with persist.
+            namespace.clear()
     if error is not None:
         reply["error"] = error
     return reply
@@ -827,6 +835,12 @@ class Listener(object):
                 self.timer.stop()
             except Exception:
                 pass
+            # Kept, never dropped: stop() can run inside this timer's own tick (a request whose code runs
+            # the startup script again), and PythonQt would then delete the QTimer while it emits.
+            retired = getattr(sys, "_freelab_retired_timers", None)
+            if retired is None:
+                retired = sys._freelab_retired_timers = []
+            retired.append(self.timer)
             self.timer = None
         for client in self.clients:
             self._close(client)

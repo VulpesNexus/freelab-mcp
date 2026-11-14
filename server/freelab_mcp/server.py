@@ -113,7 +113,8 @@ async def run_python(code: str, persist: bool = False, timeout_s: float = 30.0) 
     """Run Python inside FontLab (Python 2.7 in FontLab 7) and return its printed output and `result`.
 
     The namespace holds the fontlab, fontgate, FL, and PythonQt modules. Assign to `result` to return a
-    value. With persist=True, names survive between calls. The code runs on FontLab's main thread, so
+    value. With persist=True, names survive between calls; without it, the namespace is cleared when the
+    call returns, so a deferred callback (a timer) that needs its names must use persist=True. The code runs on FontLab's main thread, so
     FontLab is busy until it finishes; the server waits up to timeout_s (at most 600), and code still
     running then keeps running. It can change or lose work in open fonts:
     use it for reads and probes, and change a font only when the user asked for that change.

@@ -651,6 +651,21 @@ class RunPythonTests(ListenerCase):
         fresh = self.ok("run_python", {"code": "result = 'kept' in dir()"})
         self.assertFalse(fresh["result"])
 
+    def test_fresh_namespace_dies_with_its_request(self):
+        # Without the clear, f's globals cycle would keep k alive until a later garbage collection.
+        code = ("import sys\nclass K(object):\n    def __del__(self, sys=sys):\n        sys._freelab_freed = 1\n"  # 1, not True: 2.7 looks True up in the cleared builtins
+                "k = K()\ndef f():\n    return k\nresult = 1")
+        sys._freelab_freed = 0
+        try:
+            self.assertEqual(self.ok("run_python", {"code": code})["result"], 1)
+            self.assertEqual(sys._freelab_freed, 1)
+        finally:
+            del sys._freelab_freed
+
+    def test_persistent_namespace_is_kept(self):
+        self.ok("run_python", {"code": "def f():\n    return 5", "persist": True})
+        self.assertEqual(self.ok("run_python", {"code": "result = f()", "persist": True})["result"], 5)
+
     def test_result_is_cleared_between_persistent_calls(self):
         self.ok("run_python", {"code": "result = 1", "persist": True})
         self.assertIsNone(self.ok("run_python", {"code": "x = 2", "persist": True})["result"])
@@ -827,6 +842,33 @@ class SocketTests(ListenerCase):
                 self.assertEqual(json.load(handle)["token"], newer.token)
         finally:
             newer.stop()
+
+
+class RetiredTimerTests(unittest.TestCase):
+    def test_stop_keeps_its_timer_referenced(self):
+        """stop() may run inside the timer's own tick; dropping the QTimer then would let PythonQt delete it
+        while it emits."""
+        class Timer(object):
+            stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+        folder = tempfile.mkdtemp(prefix="freelab-retired-")
+        listener = fl.Listener(port=0, state_file=os.path.join(folder, "listener.json"))
+        timer = listener.timer = Timer()
+        saved = getattr(sys, "_freelab_retired_timers", None)
+        try:
+            listener.stop()
+            self.assertTrue(timer.stopped)
+            self.assertIsNone(listener.timer)
+            self.assertIs(sys._freelab_retired_timers[-1], timer)
+        finally:
+            if saved is None:
+                del sys._freelab_retired_timers
+            else:
+                sys._freelab_retired_timers = saved
+            shutil.rmtree(folder, ignore_errors=True)
 
 
 if __name__ == "__main__":
