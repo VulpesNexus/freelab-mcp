@@ -15,7 +15,8 @@
 # removed without the other.
 #
 # The first change to the startup script keeps the original as
-# startupScript.py.freelab-backup. Quit FontLab first or restart it afterwards:
+# startupScript.py.freelab-backup, and each change keeps the file it replaced as
+# startupScript.py.freelab-previous. Quit FontLab first or restart it afterwards:
 # FontLab reads its Scripts folder and startup script when it starts.
 #
 # ASCII only: Windows PowerShell 5.1 reads a BOM-less script in the ANSI code page.
@@ -42,34 +43,80 @@ $listenerName = 'freelab_listener.py'
 $begin = '# >>> FreeLab MCP'
 $end = '# <<< FreeLab MCP'
 
-function Remove-Block([string]$text) {
-    $re = New-Object System.Text.RegularExpressions.Regex ('(?s)\n?' + [regex]::Escape($begin) + '.*?' + [regex]::Escape($end) + '[^\n]*\n?')
-    # a block at the very top leaves no blank first line; elsewhere one line break stays between its neighbors
-    $evaluator = [System.Text.RegularExpressions.MatchEvaluator] { param($m) if ($m.Index -eq 0) { '' } else { "`n" } }
-    return $re.Replace($text, $evaluator).TrimEnd("`n") + "`n"
+# FreeLab's markers are whole lines, from the start of the line. A line starting "# >>> FreeLab" opens a
+# block and one starting "# <<< FreeLab" closes it, in turn; a block of this installer's opens with
+# $begin alone or followed by a space and a note, and closes with $end alone. Marker text anywhere else
+# (a string in the user's code, an indented comment) is the user's, never a marker. This one recognizer
+# serves the check and every change: the check once took markers at the start of a line while the
+# changes took marker text anywhere, and deleted the user's code between two quoted markers.
+$ownOpen = '^' + [regex]::Escape($begin) + '(?:[ \t].*)?$'
+$ownClose = '^' + [regex]::Escape($end) + '[ \t]*$'
+# The one block FreeLab wrote before the MCP and the tools became separate repositories
+# (dark mode and the listener together). Either installer takes it out and says so.
+$legacyOpen = '^# >>> FreeLab \(managed.*$'
+$legacyClose = '^# <<< FreeLab[ \t]*$'
+
+# The blocks a pair of markers delimits, as (first line, last line) index pairs; $null when the file's
+# FreeLab markers do not pair: a block opened inside another, closed without being opened, never
+# closed, or opened by one kind of marker and closed by another (another FreeLab block's markers count).
+function Find-Blocks([string[]]$lines, [string]$open, [string]$close) {
+    $found = New-Object System.Collections.ArrayList
+    $start = -1
+    $mine = $false
+    for ($i = 0; $i -lt $lines.Length; $i++) {
+        $line = $lines[$i]
+        if ($line.StartsWith('# >>> FreeLab', [System.StringComparison]::Ordinal)) {
+            if ($start -ge 0) { return $null }
+            $start = $i
+            $mine = $line -cmatch $open
+        }
+        elseif ($line.StartsWith('# <<< FreeLab', [System.StringComparison]::Ordinal)) {
+            if ($start -lt 0) { return $null }
+            if (($line -cmatch $close) -ne $mine) { return $null }
+            if ($mine) { [void]$found.Add(@($start, $i)) }
+            $start = -1
+        }
+    }
+    if ($start -ge 0) { return $null }
+    return ,$found
 }
+
+function Split-Lines([string]$text) { return ,$text.Split([char]10) }
+
+# The text without the blocks of that kind (the lines between their markers, markers included).
+function Remove-Blocks([string]$text, [string]$open, [string]$close) {
+    $lines = Split-Lines $text
+    $blocks = Find-Blocks $lines $open $close
+    if ($null -eq $blocks) { throw "unpaired FreeLab markers" }  # (checked before: never reached)
+    $drop = @{}
+    foreach ($block in $blocks) { for ($i = $block[0]; $i -le $block[1]; $i++) { $drop[$i] = $true } }
+    $kept = New-Object System.Collections.Generic.List[string]
+    for ($i = 0; $i -lt $lines.Length; $i++) { if (-not $drop.ContainsKey($i)) { $kept.Add($lines[$i]) } }
+    return ([string]::Join("`n", $kept)).TrimEnd("`n") + "`n"
+}
+
+function Remove-Block([string]$text) { return Remove-Blocks $text $ownOpen $ownClose }
 
 # The block put where it already is (the other repository's block keeps its place), or appended.
 function Set-Block([string]$text, [string]$newBlock) {
-    $re = New-Object System.Text.RegularExpressions.Regex ([regex]::Escape($begin) + '(?s:.*?)' + [regex]::Escape($end) + '[^\n]*')
-    if ($re.IsMatch($text)) {
+    $lines = Split-Lines $text
+    $blocks = Find-Blocks $lines $ownOpen $ownClose
+    if ($null -eq $blocks) { throw "unpaired FreeLab markers" }  # (checked before: never reached)
+    if ($blocks.Count -gt 0) {
         # the first copy replaced, any later one (a duplicated block) taken out
-        $seen = @{ first = $true }
-        $evaluator = [System.Text.RegularExpressions.MatchEvaluator] {
-            param($m)
-            if ($seen.first) { $seen.first = $false; return $newBlock }
-            return ''
-        }.GetNewClosure()
-        return $re.Replace($text, $evaluator)
+        $drop = @{}
+        foreach ($block in $blocks) { for ($i = $block[0]; $i -le $block[1]; $i++) { $drop[$i] = $true } }
+        $kept = New-Object System.Collections.Generic.List[string]
+        for ($i = 0; $i -lt $lines.Length; $i++) {
+            if ($i -eq $blocks[0][0]) { $kept.Add($newBlock) }
+            elseif (-not $drop.ContainsKey($i)) { $kept.Add($lines[$i]) }
+        }
+        return [string]::Join("`n", $kept)
     }
     $text = $text.TrimEnd("`n")
     if ($text) { $text += "`n" }
     return $text + $newBlock + "`n"
 }
-
-# The one block FreeLab wrote before the MCP and the tools became separate repositories
-# (dark mode and the listener together). Either installer takes it out and says so.
-$legacyPattern = '(?s)\n?# >>> FreeLab \(managed.*?# <<< FreeLab[ \t]*(\n|$)'
 
 # A Python string literal that is pure ASCII: backslashes doubled, everything
 # outside ASCII as \uXXXX, so Python 2 reads it whatever the code page.
@@ -119,25 +166,11 @@ if (Test-Path $startup) {
         $current = $normalized
     }
 }
-# Each begin marker must be followed by its end marker before the next begin: counting them was not
+# Each begin marker must be followed by its own end marker before the next begin: counting them was not
 # enough (an end marker above its begin marker let a later install delete the code between them).
-function Test-Paired([string]$text, [string]$open, [string]$close) {
-    $inside = $false
-    foreach ($line in $text -split "`n") {
-        if ($line -match ('^' + $open)) {
-            if ($inside) { return $false }
-            $inside = $true
-        }
-        elseif ($line -match ('^' + $close + '[ \t]*$')) {
-            if (-not $inside) { return $false }
-            $inside = $false
-        }
-    }
-    return -not $inside
-}
-if (-not (Test-Paired $current ([regex]::Escape($begin)) ([regex]::Escape($end))) -or
-    -not (Test-Paired $current '# >>> FreeLab \(managed' '# <<< FreeLab')) {
-    Write-Output "$startup has a FreeLab begin marker without its end marker, or the reverse, so it is left as it is. Remove the broken block by hand and run this again."
+$currentLines = Split-Lines $current
+if ($null -eq (Find-Blocks $currentLines $ownOpen $ownClose) -or $null -eq (Find-Blocks $currentLines $legacyOpen $legacyClose)) {
+    Write-Output "$startup has a FreeLab begin marker without its end marker, or the reverse, or two blocks' markers mixed, so it is left as it is. Remove the broken block by hand and run this again."
     exit 1
 }
 function Test-Changed([string]$text) {
@@ -155,17 +188,29 @@ function Save-Startup([string]$text) {
     $folder = Split-Path -Parent $startup
     if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder | Out-Null }
     if ($crlf) { $text = $text -replace "`n", "`r`n" }
-    [System.IO.File]::WriteAllText($startup, $text, (New-Object System.Text.UTF8Encoding $bom))
+    # Written whole beside it, then put in its place, the file it replaces kept as .freelab-previous
+    # (each update: the first install's copy is the user's file before FreeLab, not their later changes)
+    $temp = "$startup.freelab-new"
+    try {
+        [System.IO.File]::WriteAllText($temp, $text, (New-Object System.Text.UTF8Encoding $bom))
+        if ([System.IO.File]::Exists($startup)) { [System.IO.File]::Replace($temp, $startup, "$startup.freelab-previous", $true) }
+        else { [System.IO.File]::Move($temp, $startup) }
+    }
+    catch {
+        if ([System.IO.File]::Exists($temp)) { [System.IO.File]::Delete($temp) }
+        Write-Output "Could not write ${startup}: $($_.Exception.Message) It is left as it was."
+        exit 1
+    }
 }
-$legacy = [regex]::IsMatch($current, $legacyPattern)
-$hadBlock = $current.Contains($begin)
+$legacy = (Find-Blocks $currentLines $legacyOpen $legacyClose).Count -gt 0
+$hadBlock = (Find-Blocks $currentLines $ownOpen $ownClose).Count -gt 0
 if ($ListenerAtLaunch -and -not $Uninstall -and -not (Test-Path $startup)) {
     # FontLab writes its own startup script (its default imports) when it first starts; one made here
     # holding only this block could keep FontLab from writing it.
     Write-Output "FontLab has not made its startup script yet ($startup): start FontLab once, quit it, and run this again."
     exit 1
 }
-if ($legacy) { $current = [regex]::Replace($current, $legacyPattern, "`n").TrimEnd("`n") + "`n" }
+if ($legacy) { $current = Remove-Blocks $current $legacyOpen $legacyClose }
 function Write-LegacyNote {
     if ($legacy) {
         Write-Output 'Removed the combined FreeLab block of earlier versions, which also applied dark mode at launch. To keep that, run tools\install-fontlab.ps1 from FreeLab.'

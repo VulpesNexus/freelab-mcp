@@ -823,6 +823,54 @@ class SocketTests(ListenerCase):
         finally:
             sock.close()
 
+    def test_a_client_that_stops_reading_never_holds_up_a_tick(self):
+        """Review of 2026-11-15: the reply went out through a blocking sendall from the GUI timer, so a
+        client that asked for a large reply and read none of it froze FontLab for up to 5 s."""
+        ticks = []
+
+        def timed():
+            started = time.time()
+            self.listener_tick()
+            ticks.append(time.time() - started)
+        self.listener_tick, self.listener.tick = self.listener.tick, timed
+        saved = fl.SEND_TIMEOUT_S
+        fl.SEND_TIMEOUT_S = 1.5
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            sock.settimeout(5)
+            sock.connect(("127.0.0.1", self.listener.port))
+            sock.sendall(self.line("run_python", {"code": "result = 'x' * (24 * 1024 * 1024)"}))  # (never read)
+            deadline = time.time() + 10
+            while time.time() < deadline and not any(c.outgoing is not None for c in self.listener.clients):
+                time.sleep(0.01)
+            self.assertTrue(any(c.outgoing is not None for c in self.listener.clients), "the reply is queued")
+            ticks[:] = []
+            deadline = time.time() + 10
+            while self.listener.clients and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(self.listener.clients, [], "dropped once its reply took too long")
+            self.assertTrue(ticks, "the timer kept ticking")
+            self.assertLess(max(ticks), 0.5, "no tick waits on the client (longest %.2f s)" % max(ticks))
+        finally:
+            fl.SEND_TIMEOUT_S = saved
+            sock.close()
+
+    def test_a_large_reply_reaches_a_client_that_reads(self):
+        reply = self.send_raw(self.line("run_python", {"code": "result = 'y' * (3 * 1024 * 1024)"}))
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(len(reply["result"]["result"]), 3 * 1024 * 1024)
+
+    def test_a_reply_past_the_limit_is_an_error(self):
+        saved = fl.MAX_REPLY_BYTES
+        fl.MAX_REPLY_BYTES = 4096
+        try:
+            reply = self.send_raw(self.line("run_python", {"code": "result = 'z' * 10000"}, request_id=5))
+        finally:
+            fl.MAX_REPLY_BYTES = saved
+        self.assertFalse(reply["ok"], reply)
+        self.assertEqual((reply["id"], reply["error"]["code"]), (5, "too_large"))
+
     def test_stop_removes_own_state_file(self):
         path = self.listener.state_file
         self.stop_event.set()
@@ -842,6 +890,60 @@ class SocketTests(ListenerCase):
                 self.assertEqual(json.load(handle)["token"], newer.token)
         finally:
             newer.stop()
+
+
+class ReplyQueueTests(ListenerCase):
+    """The reply sent without blocking, a slice per tick, on a socket that takes a little at a time."""
+
+    class Sock(object):
+        def __init__(self, takes):
+            self.takes, self.sent, self.closed, self.blocking = list(takes), b"", False, []
+
+        def setblocking(self, flag):
+            self.blocking.append(flag)
+
+        def settimeout(self, value):
+            self.blocking.append(value is None)
+
+        def sendall(self, data):
+            raise AssertionError("sendall blocks until everything is sent")
+
+        def send(self, data):
+            take = self.takes.pop(0) if self.takes else 0
+            if not take:
+                raise socket.error(10035, "would block")
+            self.sent += data[:take]
+            return len(data[:take])
+
+        def close(self):
+            self.closed = True
+
+    def test_the_reply_goes_out_over_several_ticks(self):
+        sock = self.Sock([5, 0, 7, 0, 100000])
+        client = fl._Client(sock)
+        self.listener.clients.append(client)
+        self.listener._reply(client, {"ok": True, "result": u"abcdefghijklmnopqrstuvwxyz"})
+        self.assertNotIn(True, sock.blocking, "never switched to blocking")
+        self.assertEqual(len(sock.sent), 5)
+        self.assertIn(client, self.listener.clients, "kept until it has it all")
+        self.listener._flush(client)  # (the next tick's)
+        self.assertEqual(len(sock.sent), 12)
+        self.assertIn(client, self.listener.clients)
+        self.listener._flush(client)
+        self.assertEqual(json.loads(sock.sent.decode("utf-8"))["result"], u"abcdefghijklmnopqrstuvwxyz")
+        self.assertTrue(sock.closed)
+        self.assertNotIn(client, self.listener.clients)
+
+    def test_a_reply_not_taken_in_time_drops_the_client(self):
+        sock = self.Sock([])
+        client = fl._Client(sock)
+        self.listener.clients.append(client)
+        self.listener._reply(client, {"ok": True, "result": u"x"})
+        self.assertIn(client, self.listener.clients)
+        client.send_deadline = time.time() - 1
+        self.listener._flush(client)
+        self.assertTrue(sock.closed)
+        self.assertNotIn(client, self.listener.clients)
 
 
 class RetiredTimerTests(unittest.TestCase):

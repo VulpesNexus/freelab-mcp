@@ -163,6 +163,71 @@ class InstallerTests(unittest.TestCase):
         code, out = self.run_installer("-ListenerAtLaunch")
         self.assertEqual((code, self.read()), (1, data), out)
 
+    # Review of 2026-11-15: the check took markers at the start of a line only, the changes took marker text
+    # anywhere, so an install or uninstall deleted the user's code between two quoted markers
+
+    QUOTED = (b'print("# >>> FreeLab MCP")\nuser_work()\nprint("# <<< FreeLab MCP")\nkeep_me()\n'
+              b'text = """\n    # >>> FreeLab MCP (indented)\n    middle()\n    # <<< FreeLab MCP\n"""\n'
+              b'print("# >>> FreeLab (managed")\nlegacy_work()\nprint("# <<< FreeLab")\n')
+
+    def test_marker_text_in_the_users_code_is_kept_byte_for_byte(self):
+        original = b"\xef\xbb\xbf" + (MINE + self.QUOTED + TOOLS).replace(b"\n", b"\r\n")
+        self.write(original)
+        code, out = self.run_installer("-ListenerAtLaunch")
+        self.assertEqual(code, 0, out)
+        data = self.read()
+        self.assertTrue(data.startswith(original.rstrip(b"\r\n")), "everything before the new block as it was: " + out)
+        self.assertEqual(data.count(b"\n# >>> FreeLab MCP (managed by"), 1, "the block appended once")
+        self.assertNotIn("combined FreeLab block", out, "quoted legacy markers are not a legacy block")
+        code, out = self.run_installer("-Uninstall")
+        self.assertEqual((code, self.read()), (0, original), out)
+        code, out = self.run_installer()
+        self.assertEqual((code, self.read()), (0, original), "a plain install: nothing to take out")
+
+    def test_a_block_between_quoted_markers_is_found_and_replaced_alone(self):
+        data = MINE + self.QUOTED + b"# >>> FreeLab MCP (managed)\nold = 1\n# <<< FreeLab MCP\n" + TOOLS
+        self.write(data)
+        code, out = self.run_installer("-ListenerAtLaunch")
+        self.assertEqual(code, 0, out)
+        text = self.read()
+        self.assertTrue(text.startswith(MINE + self.QUOTED), "the user's code as it was")
+        self.assertTrue(text.endswith(TOOLS))
+        self.assertNotIn(b"old = 1", text)
+        self.assertEqual(self.run_installer("-Uninstall")[0], 0)
+        self.assertEqual(self.read(), MINE + self.QUOTED + TOOLS)
+
+    def test_a_block_opened_by_one_kind_and_closed_by_another_is_refused(self):
+        for data in (MINE + b"# >>> FreeLab MCP (managed)\nmine = 1\n# <<< FreeLab tools\n",
+                     MINE + b"# >>> FreeLab tools (managed)\nmine = 1\n# <<< FreeLab MCP\n",
+                     MINE + b"# >>> FreeLab (managed)\nmine = 1\n# <<< FreeLab MCP\n",
+                     MINE + b"# >>> FreeLab MCP (managed)\n# >>> FreeLab tools\nmine = 1\n# <<< FreeLab tools\n"
+                            b"# <<< FreeLab MCP\n"):
+            self.write(data)
+            for flags in (("-ListenerAtLaunch",), ("-Uninstall",)):
+                code, out = self.run_installer(*flags)
+                self.assertEqual((code, self.read()), (1, data), out)
+                self.assertIn("left as it is", out)
+
+    def test_each_update_keeps_the_file_it_replaced(self):
+        first = MINE + TOOLS
+        self.write(first)
+        code, out = self.run_installer("-ListenerAtLaunch")
+        self.assertEqual(code, 0, out)
+        backup = self.tmp / "startupScript.py.freelab-backup"
+        previous = self.tmp / "startupScript.py.freelab-previous"
+        self.assertEqual(backup.read_bytes(), first, "the first install's copy")
+        self.assertEqual(previous.read_bytes(), first)
+        edited = self.read() + b"later = 2\n"  # (the user's change after the install)
+        self.write(edited)
+        code, out = self.run_installer("-Uninstall")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(previous.read_bytes(), edited, "the file as it was just before this change")
+        self.assertEqual(backup.read_bytes(), first, "the first install's copy stays")
+        self.assertIn(b"later = 2", self.read())
+        self.assertEqual(sorted(p.name for p in self.tmp.glob("startupScript.py*")),
+                         ["startupScript.py", "startupScript.py.freelab-backup", "startupScript.py.freelab-previous"],
+                         "no temporary file left")
+
     def test_missing_startup_script_is_not_created(self):
         code, out = self.run_installer("-ListenerAtLaunch")
         self.assertEqual(code, 1, out)

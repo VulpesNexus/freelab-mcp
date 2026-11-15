@@ -20,7 +20,7 @@ FreeLab, the separate `freelab` repository, holds tools that run inside FontLab,
 
 ## Install
 
-1. Start FontLab once, so that it writes its startup script, then quit it and run *tools/install-fontlab.ps1*. It copies the listener into FontLab's user *Scripts* folder (*Documents\FontLab\FontLab 7\Scripts\FreeLab*). With `-ListenerAtLaunch`, it also adds a marked block to FontLab's startup script that starts the listener at every launch; the original startup script is kept as *startupScript.py.freelab-backup*. `-Uninstall` takes it all out again, leaving FreeLab's tools alone. Either way it also removes the single block that FreeLab wrote before the MCP and the tools were split, which started dark mode too; run FreeLab's installer again to keep that. The startup script must be UTF-8 text, and its line endings are kept. Scripts run from that folder, not from this repository: Python 2.7 cannot open files whose path the Windows ANSI code page cannot spell.
+1. Start FontLab once, so that it writes its startup script, then quit it and run *tools/install-fontlab.ps1*. It copies the listener into FontLab's user *Scripts* folder (*Documents\FontLab\FontLab 7\Scripts\FreeLab*). With `-ListenerAtLaunch`, it also adds a marked block to FontLab's startup script that starts the listener at every launch; the original startup script is kept as *startupScript.py.freelab-backup*, and each change keeps the file it replaced as *startupScript.py.freelab-previous*. `-Uninstall` takes it all out again, leaving FreeLab's tools alone. Either way it also removes the single block that FreeLab wrote before the MCP and the tools were split, which started dark mode too; run FreeLab's installer again to keep that. The startup script must be UTF-8 text, and its line endings are kept. Scripts run from that folder, not from this repository: Python 2.7 cannot open files whose path the Windows ANSI code page cannot spell.
 2. Register the server with your MCP client. For Claude Code:
 
    ```
@@ -37,7 +37,8 @@ Tools: `fontlab_status`, `get_current_font`, `list_glyphs`, `get_glyph`, `get_gl
 ## What it does not do
 
 - It does not write to fonts through dedicated tools yet; only `run_python` can, and only when asked to.
-- It never saves, exports, or closes a font.
+- Its read tools (`fontlab_status`, `get_current_font`, `list_glyphs`, `get_glyph`, `get_glyph_outline`) never save, export, or close a font. `run_python` runs whatever code it is given, with FontLab's access to your files and the network, and `quit_fontlab` and `restart_fontlab` close FontLab (FontLab asks about unsaved fonts itself).
+- It is no security boundary: any program running as you can read the listener's token in *%LOCALAPPDATA%\FreeLab\listener.json*, and so run code in FontLab ([docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#discovery-and-authentication)).
 - It reads the font in front only, and outline coordinates are shape-local: each shape's transform is reported, not applied.
 - FontLab 8 is untested. The listener is written to run there too.
 

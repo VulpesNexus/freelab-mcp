@@ -29,6 +29,9 @@ HOST = "127.0.0.1"
 DEFAULT_PORT = 47761
 POLL_MS = 25
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
+MAX_REPLY_BYTES = 64 * 1024 * 1024  # a larger reply is replaced by a too_large error (ask for less: a page, max_nodes)
+SEND_BYTES_PER_TICK = 4 * 1024 * 1024  # a reply goes out without blocking, at most this much per tick
+SEND_TIMEOUT_S = 10.0  # a client that has not taken its whole reply by then is dropped
 MAX_CLIENTS = 16
 CLIENT_TIMEOUT_S = 5.0
 MAX_ACCEPTS_PER_TICK = 8
@@ -672,6 +675,9 @@ class _Client(object):
         self.sock = sock
         self.buffer = bytearray()
         self.started = time.time()
+        self.outgoing = None  # the reply being sent (bytes), and how much of it went out
+        self.sent = 0
+        self.send_deadline = None
 
 
 class Listener(object):
@@ -904,7 +910,10 @@ class Listener(object):
             self.clients.append(_Client(sock))
         for client in list(self.clients):
             try:
-                self._service(client)
+                if client.outgoing is not None:
+                    self._flush(client)
+                else:
+                    self._service(client)
             except Exception as exc:
                 self._record("client", exc)
                 self._drop(client)
@@ -935,17 +944,44 @@ class Listener(object):
             self._drop(client)
 
     def _reply(self, client, reply):
+        """The reply queued on its client and sent without blocking: what the socket takes now, the rest
+        a slice per tick (_flush). A blocking sendall here, from FontLab's GUI timer, froze FontLab for
+        up to 5 s behind a client that asked for a large reply and read none of it."""
         try:
             payload = _bytes(json.dumps(reply)) + b"\n"
         except Exception:
             payload = _LAST_RESORT
-        try:
-            client.sock.setblocking(True)
-            client.sock.settimeout(CLIENT_TIMEOUT_S)
-            client.sock.sendall(payload)
-        except socket.error:
-            pass
-        self._drop(client)
+        if len(payload) > MAX_REPLY_BYTES:
+            request_id = reply.get("id") if isinstance(reply, dict) else None
+            payload = _bytes(json.dumps({"id": request_id, "ok": False, "error": {
+                "code": "too_large", "message": "The reply is %d bytes, more than the %d the listener sends: ask for "
+                                                "less (a page of glyph names, fewer outline nodes, a smaller "
+                                                "result)." % (len(payload), MAX_REPLY_BYTES)}})) + b"\n"
+        client.buffer = bytearray()
+        client.outgoing, client.sent = payload, 0
+        client.send_deadline = time.time() + SEND_TIMEOUT_S
+        self._flush(client)
+
+    def _flush(self, client):
+        """As much of the client's reply as its socket takes now, up to SEND_BYTES_PER_TICK; the client
+        dropped once it has it all, when its socket fails, or past its deadline (a client that stopped
+        reading)."""
+        payload, budget = client.outgoing, SEND_BYTES_PER_TICK
+        while budget > 0 and client.sent < len(payload):
+            end = min(len(payload), client.sent + min(budget, 256 * 1024))
+            try:
+                count = client.sock.send(payload[client.sent:end])
+            except socket.error as exc:
+                if exc.args and exc.args[0] in _WOULD_BLOCK:
+                    break
+                self._drop(client)
+                return
+            if not count:
+                break
+            client.sent += count
+            budget -= count
+        if client.sent >= len(payload) or time.time() > client.send_deadline:
+            self._drop(client)
 
     def _close(self, client):
         try:
