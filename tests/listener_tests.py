@@ -662,6 +662,16 @@ class RunPythonTests(ListenerCase):
         finally:
             del sys._freelab_freed
 
+    def test_a_deferred_callback_keeps_builtins_and_imports(self):
+        # A callback left behind (a timer, here held on sys) runs after the clear: it must still reach
+        # builtins and import, or FontLab's script runner crashes when it triggers a menu action.
+        code = "import sys\ndef later():\n    import os\n    return len(os.sep), True\nsys._freelab_later = later\nresult = 1"
+        try:
+            self.assertEqual(self.ok("run_python", {"code": code})["result"], 1)
+            self.assertEqual(sys._freelab_later(), (1, True))
+        finally:
+            del sys._freelab_later
+
     def test_persistent_namespace_is_kept(self):
         self.ok("run_python", {"code": "def f():\n    return 5", "persist": True})
         self.assertEqual(self.ok("run_python", {"code": "result = f()", "persist": True})["result"], 5)

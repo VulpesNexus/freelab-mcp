@@ -607,7 +607,14 @@ def op_run_python(listener, args):
             # collection breaks. Qt objects the code made would then die in some unrelated request (a crash in
             # FontLab once surfaced in tab docking's timer that way), so they die here, in their own request.
             # A deferred callback that needs these names must run with persist.
+            builtins = namespace.get("__builtins__")
             namespace.clear()
+            if builtins is not None:
+                # Kept: a deferred callback the code left (a timer) still runs with these globals, and without
+                # __builtins__ Python 2.7's import fails from its frame. FontLab's script runner imports sys
+                # from the calling frame, so a menu action triggered from such a callback crashed FontLab
+                # (PyObjToStringList(NULL) in PythonQt, 2026-11-16). Builtins hold none of the code's objects.
+                namespace["__builtins__"] = builtins
     if error is not None:
         reply["error"] = error
     return reply
