@@ -1,8 +1,8 @@
 # FreeLab MCP
 
-An MCP server that lets an AI app such as Claude Code read the font open in FontLab 7, and start and close FontLab when asked.
+An MCP server that lets an AI app such as Claude Code read the fonts open in FontLab 7, make a small set of undoable edits to them, and start and close FontLab when asked.
 
-**Status: 0.1.0.** The listener runs in FontLab 7.2, and `fontlab_status` and `run_python` drove the whole development of FreeLab's dark mode, but the font reads are not proven live yet: [docs/FONTLAB7-API.md](docs/FONTLAB7-API.md) tracks each call.
+**Status: 1.0.0.** Every read and write tool was proven live in FontLab 7.2 on test fonts (TrueType and CFF, multiple masters, Japanese, Arabic, and Hebrew): [docs/FONTLAB7-API.md](docs/FONTLAB7-API.md) tracks each FontLab call and how far it is proven.
 
 FreeLab, the separate `freelab` repository, holds tools that run inside FontLab, starting with a dark mode. Neither needs the other; installed together, they share FontLab's *Scripts > FreeLab* menu.
 
@@ -30,16 +30,22 @@ FreeLab, the separate `freelab` repository, holds tools that run inside FontLab,
 ## Use
 
 1. In FontLab, choose *Scripts > FreeLab > Start MCP Listener* (or open the file in the *Scripting* panel and run it), unless it starts at launch. The *Output* panel shows the listener's version and port. Run it again to restart it.
-2. Ask the AI app, for example, "check the FontLab connection" or "describe the glyph A".
+2. Ask the AI app, for example, "check the FontLab connection", "describe the glyph A", or "kern A and V by −40 in the font in front".
 
-Tools: `fontlab_status`, `get_current_font`, `list_glyphs`, `get_glyph`, `get_glyph_outline`, and `run_python`, which runs code inside FontLab for probing. `launch_fontlab`, `quit_fontlab`, and `restart_fontlab` start and close FontLab when you ask; FontLab closes as its close button would: when a font has unsaved edits, FontLab asks whether to save it, and the tool leaves that question on screen for you and says so; it never answers it.
+Tools:
+
+- **Reads.** `fontlab_status`, `list_fonts` (each open font's id), `get_current_font`, `list_glyphs`, `get_glyph` (metrics, ink box, components, anchors), `get_glyph_outline`, `get_kerning` (one pair, a page of pairs, the classes), and `get_features` (tags, a feature's code, the prefix). Each takes `font`: a font's id, path, PostScript name, or full name; without it, the font in front.
+- **Writes.** `set_kerning_pair`, `remove_kerning_pair`, `set_glyph_metrics` (advance width and sidebearings), `rename_glyph`, `set_glyph_unicodes`, `add_component_glyph`, `set_anchor`, `remove_anchor`, and `set_feature_code`. Each needs `font` (and takes `font_name` to confirm it), checks everything before it changes anything, makes one step in FontLab's *History*, marks the font modified, and returns the values before and after; a change FontLab did not keep is put back, or else recorded and said. `undo` takes the last step back, as *Edit > Undo* does; given a write's History state and title, it takes back that write only.
+- **Probing.** `run_python` runs code inside FontLab.
+- **FontLab itself.** `launch_fontlab`, `quit_fontlab`, and `restart_fontlab` start and close FontLab when you ask; FontLab closes as its close button would: when a font has unsaved edits, FontLab asks whether to save it, and the tool leaves that question on screen for you and says so; it never answers it.
 
 ## What it does not do
 
-- It does not write to fonts through dedicated tools yet; only `run_python` can, and only when asked to.
-- Its read tools (`fontlab_status`, `get_current_font`, `list_glyphs`, `get_glyph`, `get_glyph_outline`) never save, export, or close a font. `run_python` runs whatever code it is given, with FontLab's access to your files and the network, and `quit_fontlab` and `restart_fontlab` close FontLab (FontLab asks about unsaved fonts itself).
+- No tool saves, exports, or closes a font. `run_python` runs whatever code it is given, with FontLab's access to your files and the network, and `quit_fontlab` and `restart_fontlab` close FontLab (FontLab asks about unsaved fonts itself).
+- `undo` works on the font in front only, since FontLab's *Edit > Undo* does, and no tool brings a font to the front: click its tab in FontLab.
+- `rename_glyph` refuses a glyph that kerning, a class, or feature code uses: FontLab's rename updates only the components that use it. `set_kerning_pair` cannot write a pair of a glyph whose name is also a kerning class's (FontLab names imported classes after their key glyph); it writes the class pair when given `@name`. `set_feature_code` stores code without compiling it: FontLab compiles feature code when the font is exported.
 - It is no security boundary: any program running as you can read the listener's token in *%LOCALAPPDATA%\FreeLab\listener.json*, and so run code in FontLab ([docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#discovery-and-authentication)).
-- It reads the font in front only, and outline coordinates are shape-local: each shape's transform is reported, not applied.
+- Outline coordinates are shape-local: each shape's transform is reported, not applied.
 - FontLab 8 is untested. The listener is written to run there too.
 
 ## Tests

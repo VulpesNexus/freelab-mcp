@@ -24,10 +24,11 @@ _ids = itertools.count(1)
 class ListenerError(RuntimeError):
     """The listener could not be reached or refused the request."""
 
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, data: Any = None):
         super().__init__(message)
         self.code = code
         self.message = message
+        self.data = data  # the listener's error["data"], when it sent one
 
 
 def state_dir() -> Path:
@@ -128,5 +129,6 @@ def call(op: str, args: dict[str, Any] | None = None, timeout: float = DEFAULT_T
         raise ListenerError("bad_reply", "The listener answered a different request.")
     if not reply.get("ok"):
         error = reply.get("error") or {}
-        raise ListenerError(error.get("code", "error"), error.get("message", "The listener reported an error."))
+        raise ListenerError(error.get("code", "error"), error.get("message", "The listener reported an error."),
+                            error.get("data"))
     return reply.get("result")

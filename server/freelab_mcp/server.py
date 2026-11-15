@@ -9,11 +9,13 @@ server keeps answering pings and cancellations while FontLab works.
 from __future__ import annotations
 
 import functools
+import json
 import time
-from typing import Any
+from typing import Annotated, Any
 
 import anyio
 from mcp.server.fastmcp import FastMCP
+from pydantic import Strict
 
 from . import __version__, launcher
 from .client import DEFAULT_TIMEOUT_S, ListenerError, call
@@ -28,29 +30,58 @@ LISTENER_STARTING = ("[timeout]", "[bad_state]", "[bad_token]")
 mcp = FastMCP(
     "freelab",
     instructions=(
-        "FreeLab reads the font open in FontLab through a listener script the user starts inside FontLab. "
-        "Start with fontlab_status; if FontLab is not running and the user wants it, launch_fontlab starts it. Tools act on the font in front. Reads that FontLab could not answer are "
-        "listed under 'unreadable' and must not be reported as empty or zero. Outline coordinates are "
-        "shape-local: each shape's transform is reported, not applied. run_python executes code inside "
-        "FontLab with full access to the open fonts; prefer the read tools, and never save or close fonts "
-        "unless the user asks."
+        "FreeLab reads and edits fonts open in FontLab through a listener script that runs inside FontLab. "
+        "Start with fontlab_status; if FontLab is not running and the user wants it, launch_fontlab starts it. "
+        "list_fonts gives each open font's id. Read tools act on the font named by font (its id, path, "
+        "PostScript name, or full name), or on the font in front when none is named. Write tools need font: "
+        "they never guess which font to change, and font_name (its path or name) confirms an id. Each write is one step of FontLab's History (Edit > Undo, or "
+        "the undo tool, takes it back), marks the font modified, and returns what changed; nothing is ever "
+        "saved, exported, or closed. Make a write only when the user asked for that change. Reads that FontLab "
+        "could not answer are listed under 'unreadable' and must not be reported as empty or zero. Outline "
+        "coordinates are shape-local: each shape's transform is reported, not applied. run_python executes "
+        "code inside FontLab with full access to the open fonts; prefer the dedicated tools."
     ),
 )
+
+WRITE_TIMEOUT_S = 120.0  # a History step waits on the clipboard when another program holds it (17 s each, seen live)
+# Numbers are strict: true is not 1. Optional names are str with "" for left out, not str | None: FastMCP
+# parses a string given for any other type as JSON first, so a glyph named null became None.
+Number = Annotated[float, Strict()]
+Int = Annotated[int, Strict()]
+FontRef = Int | str  # (strict: true is no font id)
 
 
 async def _call(op: str, args: dict[str, Any] | None = None, timeout: float = DEFAULT_TIMEOUT_S) -> Any:
     try:
         return await anyio.to_thread.run_sync(functools.partial(call, op, args, timeout=timeout))
     except ListenerError as exc:
-        raise RuntimeError(f"[{exc.code}] {exc.message}") from None
+        extra = f" {json.dumps(exc.data, ensure_ascii=False)}" if exc.data is not None else ""
+        raise RuntimeError(f"[{exc.code}] {exc.message}{extra}") from None
 
 
-def _glyph_args(name: str | None, unicode: int | None, layer: str | None) -> dict[str, Any]:
+async def _write(op: str, args: dict[str, Any]) -> Any:
+    return await _call(op, {k: v for k, v in args.items() if v is not None and v != ""}, timeout=WRITE_TIMEOUT_S)
+
+
+def _named(font_name: str, args: dict[str, Any], font: FontRef) -> dict[str, Any]:
+    """A write's arguments: the font, and font_name to confirm it by its path or name when given."""
+    args["font_name"] = font_name
+    return _font(args, font)
+
+
+def _font(args: dict[str, Any], font: FontRef | None) -> dict[str, Any]:
+    if font is not None:
+        args["font"] = font
+    return args
+
+
+def _glyph_args(name: str, unicode: int | None, layer: str, key: str = "name") -> dict[str, Any]:
+    name, layer = name or None, layer or None
     if (name is None) == (unicode is None):
-        raise RuntimeError("[bad_args] Give exactly one of name or unicode.")
+        raise RuntimeError(f"[bad_args] Give exactly one of {key} or unicode.")
     args: dict[str, Any] = {}
     if name is not None:
-        args["name"] = name
+        args[key] = name
     if unicode is not None:
         args["unicode"] = unicode
     if layer is not None:
@@ -67,45 +98,215 @@ async def fontlab_status() -> dict[str, Any]:
 
 
 @mcp.tool()
-async def get_current_font() -> dict[str, Any]:
-    """Return the font in front: names, path, units per em, glyph count, master, version, unsaved changes."""
-    return await _call("font_info")
+async def list_fonts() -> dict[str, Any]:
+    """List the open fonts: each one's id (what the other tools take as font), names, path, masters, glyph
+    count, and whether it is the font in front."""
+    return await _call("fonts")
 
 
 @mcp.tool()
-async def list_glyphs(offset: int = 0, limit: int = 500) -> dict[str, Any]:
-    """List glyph names of the font in front, a page at a time (limit 1–5000)."""
-    return await _call("glyph_names", {"offset": offset, "limit": limit})
+async def get_current_font(font: FontRef | None = None) -> dict[str, Any]:
+    """Describe a font: id, names, path, units per em, glyph count, masters, version, unsaved changes.
+
+    font: its id from list_fonts, its path, PostScript name, or full name; the font in front when left out.
+    """
+    return await _call("font_info", _font({}, font))
 
 
 @mcp.tool()
-async def get_glyph(name: str | None = None, unicode: int | None = None, layer: str | None = None) -> dict[str, Any]:
+async def list_glyphs(offset: Int = 0, limit: Int = 500, font: FontRef | None = None) -> dict[str, Any]:
+    """List a font's glyph names, a page at a time (limit 1–5000), in the font's order."""
+    return await _call("glyph_names", _font({"offset": offset, "limit": limit}, font))
+
+
+@mcp.tool()
+async def get_glyph(name: str = "", unicode: Int | None = None, layer: str = "",
+                    font: FontRef | None = None) -> dict[str, Any]:
     """Describe one glyph, found by name or by Unicode code point (an integer, e.g. 65 for A).
 
-    Returns its Unicode values, layers, and, for one layer, its advance width, bounding box, and shape
-    and node counts. By default the layer named after the font's current master is read, else the
-    active layer; the reply says which. Sidebearings, when present, are derived from the bounding box,
-    not from FontLab's metrics.
+    Returns its Unicode values, layers, and, for one layer: advance width, ink box, sidebearings (from the
+    ink box, as FontLab measures them), shape and node counts, components (each one's glyph and transform),
+    and anchors. bounding_box is FontLab's stored box of all the nodes (off-curve points included), which can
+    lag behind after an edit to a component's glyph; ink_box is measured when asked. By default the layer
+    named after the font's current master is read, else the active layer; the reply says which.
     """
-    return await _call("glyph", _glyph_args(name, unicode, layer))
+    return await _call("glyph", _font(_glyph_args(name, unicode, layer), font))
 
 
 @mcp.tool()
 async def get_glyph_outline(
-    name: str | None = None,
-    unicode: int | None = None,
-    layer: str | None = None,
-    max_nodes: int = 2000,
+    name: str = "",
+    unicode: Int | None = None,
+    layer: str = "",
+    max_nodes: Int = 2000,
+    font: FontRef | None = None,
 ) -> dict[str, Any]:
     """Return a glyph's shapes, contours, and nodes (x, y, type, smooth) on one layer.
 
     Coordinates are shape-local; each shape's transform [m11, m12, m21, m22, dx, dy] is reported
-    but not applied. Large glyphs are cut at max_nodes: the reply and any cut contour are marked
-    truncated.
+    but not applied. A component shape names the glyph it draws (component). Large glyphs are cut at
+    max_nodes: the reply and any cut contour are marked truncated.
     """
     args = _glyph_args(name, unicode, layer)
     args["max_nodes"] = max_nodes
-    return await _call("outline", args)
+    return await _call("outline", _font(args, font))
+
+
+@mcp.tool()
+async def get_kerning(
+    font: FontRef | None = None,
+    master: str = "",
+    left: str = "",
+    right: str = "",
+    offset: Int = 0,
+    limit: Int = 500,
+    classes: bool = False,
+) -> dict[str, Any]:
+    """Read a master's kerning (the font's current master when master is left out).
+
+    With left and right (glyph names, or @ and a class name such as @V): that pair's own value, null when
+    the font has no such pair. Without them: a page of the master's own pairs, classes written with @.
+    Values are those FontLab stores; class pairs are not expanded to glyph pairs. classes=True adds the
+    kerning classes: each one's side (KernLeft, KernRight, KernBothSide) and glyphs.
+    """
+    args: dict[str, Any] = {"offset": offset, "limit": limit, "classes": classes}
+    for key, value in (("master", master), ("left", left), ("right", right)):
+        if value:
+            args[key] = value
+    return await _call("kerning", _font(args, font))
+
+
+@mcp.tool()
+async def get_features(font: FontRef | None = None, tag: str = "", prefix: bool = False) -> dict[str, Any]:
+    """List a font's OpenType feature tags; with tag, return that feature's code as FontLab keeps it (the
+    whole block); with prefix=True, the code before the features (languagesystem lines, classes)."""
+    args: dict[str, Any] = {"prefix": prefix}
+    if tag:
+        args["tag"] = tag
+    return await _call("features", _font(args, font))
+
+
+# -- Writes: each one names its font, is one History step, and returns what changed --------------------
+
+
+@mcp.tool()
+async def set_kerning_pair(font: FontRef, left: str, right: str, value: Number, master: str = "", font_name: str = "") -> dict[str, Any]:
+    """Set one kerning pair's value in a master (the font's current master when left out).
+
+    left and right are glyph names, or @ and a kerning class's name (@V); a class must kern on that side.
+    A glyph whose name is also a class's name is refused: FontLab would write the class's pair. FontLab keeps
+    kerning in whole units (-19.5 is stored as -20; the reply says so). Returns the value before (null: a new
+    pair) and after. Only the pair's own entry changes; other pairs and the classes are left as they are.
+    """
+    return await _write("set_kerning", _named(font_name, {"left": left, "right": right, "value": value, "master": master}, font))
+
+
+@mcp.tool()
+async def remove_kerning_pair(font: FontRef, left: str, right: str, master: str = "", font_name: str = "") -> dict[str, Any]:
+    """Remove one kerning pair's own entry from a master (glyph names, or @class names, as get_kerning shows them)."""
+    return await _write("remove_kerning", _named(font_name, {"left": left, "right": right, "master": master}, font))
+
+
+@mcp.tool()
+async def set_glyph_metrics(
+    font: FontRef,
+    glyph: str = "",
+    unicode: Int | None = None,
+    layer: str = "",
+    advance_width: Number | None = None,
+    left_sidebearing: Number | None = None,
+    right_sidebearing: Number | None = None,
+    font_name: str = "",
+) -> dict[str, Any]:
+    """Set a glyph's advance width and sidebearings on one layer (the font's current master by default).
+
+    Give one or two of the three. A new left sidebearing moves the outline, its components and anchors
+    with it, and keeps the right sidebearing unless advance_width or right_sidebearing is given; a new
+    advance width alone keeps the outline where it is; advance_width with right_sidebearing moves the
+    outline so both hold. FontLab keeps whole units: the reply's after shows what it kept. Sidebearings are measured from the ink box, as
+    FontLab measures them. Glyphs that use this glyph as a component move with its outline. A layer whose
+    metrics come from an expression in FontLab is refused for the value the expression sets.
+    """
+    args = _glyph_args(glyph, unicode, layer, key="glyph")
+    args.update({"advance_width": advance_width, "left_sidebearing": left_sidebearing,
+                 "right_sidebearing": right_sidebearing})
+    return await _write("set_metrics", _named(font_name, args, font))
+
+
+@mcp.tool()
+async def rename_glyph(font: FontRef, glyph: str, new_name: str, font_name: str = "") -> dict[str, Any]:
+    """Rename a glyph. Components that use it follow the new name. Refused while kerning pairs, classes, or
+    feature code use the old name: FontLab's rename does not update those."""
+    return await _write("rename_glyph", _named(font_name, {"glyph": glyph, "new_name": new_name}, font))
+
+
+@mcp.tool()
+async def set_glyph_unicodes(font: FontRef, unicodes: list[Int], glyph: str = "",
+                             unicode: Int | None = None, font_name: str = "") -> dict[str, Any]:
+    """Replace a glyph's Unicode values with the code points given (integers; [] clears them). The glyph is
+    found by name (glyph) or by one of its current code points (unicode). A code point another glyph has
+    is refused."""
+    args = _glyph_args(glyph, unicode, None, key="glyph")
+    args["unicodes"] = unicodes
+    return await _write("set_unicodes", _named(font_name, args, font))
+
+
+@mcp.tool()
+async def add_component_glyph(
+    font: FontRef,
+    name: str,
+    components: list[dict[str, Any]],
+    unicodes: list[Int] | None = None,
+    advance_width: Number | None = None,
+    font_name: str = "",
+) -> dict[str, Any]:
+    """Add a new glyph made of components: components is a list of {"glyph": name, "x": offset, "y": offset}.
+
+    It is built in every master where each component's glyph has a layer (the others are listed as
+    skipped). Its advance width is advance_width, else the first component's in each master. A name or
+    code point the font already has is refused.
+    """
+    return await _write("add_component_glyph", _named(font_name, {"name": name, "components": components, "unicodes": unicodes,
+                                                      "advance_width": advance_width}, font))
+
+
+@mcp.tool()
+async def set_anchor(font: FontRef, glyph: str, name: str, x: Number, y: Number, layer: str = "", font_name: str = "") -> dict[str, Any]:
+    """Add an anchor to a glyph's layer (the font's current master by default), or move the one of that name."""
+    return await _write("set_anchor", _named(font_name, {"glyph": glyph, "name": name, "x": x, "y": y, "layer": layer}, font))
+
+
+@mcp.tool()
+async def remove_anchor(font: FontRef, glyph: str, name: str, layer: str = "", font_name: str = "") -> dict[str, Any]:
+    """Remove a glyph's anchor of that name from one layer (the font's current master by default)."""
+    return await _write("remove_anchor", _named(font_name, {"glyph": glyph, "name": name, "layer": layer}, font))
+
+
+@mcp.tool()
+async def set_feature_code(font: FontRef, tag: str, code: str, font_name: str = "") -> dict[str, Any]:
+    """Set an OpenType feature's code, adding the feature when the font has none of that tag.
+
+    code is the whole block as FontLab keeps it: feature liga { ... } liga; (get_features shows the current
+    one). It is stored, not compiled: FontLab compiles feature code when the font is exported, and only
+    then reports errors in it.
+    """
+    return await _write("set_feature", _named(font_name, {"tag": tag, "code": code}, font))
+
+
+@mcp.tool()
+async def undo(font: FontRef, expected_state: Int | None = None, expected_title: str = "",
+               font_name: str = "") -> dict[str, Any]:
+    """Undo the last step of a font's History, as Edit > Undo does in FontLab.
+
+    FontLab's Undo acts on the font in front, so font must be that font. To undo a write of yours, give its
+    history.history_state as expected_state and its history.title as expected_title: nothing is undone if
+    anything else has changed the font since, or if the step Undo would take back is not that write (a
+    retried undo cannot take back a second step). A write's own "(before)" step (the font recorded before
+    its first write) is undone with it, so each write is one undo. The reply names the steps undone and the
+    one Undo would take back next.
+    """
+    return await _write("undo", _font({"expected_state": expected_state, "expected_title": expected_title,
+                                       "font_name": font_name}, font))
 
 
 @mcp.tool()

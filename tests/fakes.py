@@ -19,13 +19,19 @@ class SpyViolation(BaseException):
 
 class Native(object):
     _members = ()
+    _settable = ()  # members the listener may assign to
 
     def __getattribute__(self, name):
-        if name.startswith("__") or name.startswith("_f_") or name == "_members":
+        if name.startswith("__") or name.startswith("_f_") or name in ("_members", "_settable"):
             return object.__getattribute__(self, name)
         if name not in object.__getattribute__(self, "_members"):
             raise SpyViolation("%s.%s is not a member the listener may use" % (type(self).__name__, name))
         return object.__getattribute__(self, name)
+
+    def __setattr__(self, name, value):
+        if not name.startswith("_f_") and name not in object.__getattribute__(self, "_settable"):
+            raise SpyViolation("%s.%s is not a member the listener may set" % (type(self).__name__, name))
+        object.__setattr__(self, name, value)
 
     def __getitem__(self, key):
         raise SpyViolation("subscript on native %s" % type(self).__name__)
@@ -55,6 +61,17 @@ class QRectF(object):
         return self._v[3]
 
 
+class QPointF(object):
+    def __init__(self, x=0.0, y=0.0):
+        self._v = (float(x), float(y))
+
+    def x(self):
+        return self._v[0]
+
+    def y(self):
+        return self._v[1]
+
+
 class QTransform(object):
     def __init__(self, m11=1.0, m12=0.0, m21=0.0, m22=1.0, dx=0.0, dy=0.0):
         self._v = (m11, m12, m21, m22, dx, dy)
@@ -76,6 +93,10 @@ class QTransform(object):
 
     def dy(self):
         return self._v[5]
+
+    def translate(self, dx, dy):  # (a plain translation is all the listener builds)
+        m11, m12, m21, m22, x, y = self._v
+        return QTransform(m11, m12, m21, m22, x + dx, y + dy)
 
 
 class flNode(Native):
@@ -99,69 +120,362 @@ class flContour(Native):
         return list(self._f_nodes)
 
 
-class flShape(Native):
-    _members = ("name", "isComponent", "transform", "contours")
+class flShapeData(Native):
+    _members = ("componentGlyph",)
 
-    def __init__(self, contours, name="", transform=None, component=False):
+    def __init__(self, component_glyph=""):
+        object.__setattr__(self, "componentGlyph", component_glyph)
+
+
+class flShape(Native):
+    _members = ("name", "isComponent", "transform", "contours", "shapeData")
+
+    def __init__(self, contours, name="", transform=None, component=False, component_glyph=""):
         object.__setattr__(self, "contours", list(contours))
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "transform", transform or QTransform())
         object.__setattr__(self, "isComponent", component)
+        object.__setattr__(self, "shapeData", flShapeData(component_glyph if component else ""))
+
+
+class flPinPoint(Native):
+    """An anchor: fontlab.flPinPoint(QPointF), with a settable name and point."""
+    _members = ("name", "point")
+    _settable = ("name", "point")
+
+    def __init__(self, point, name=""):
+        object.__setattr__(self, "point", point)
+        object.__setattr__(self, "name", name)
 
 
 class flLayer(Native):
-    _members = ("name", "shapes", "advanceWidth", "boundingBox", "shapesCount", "nodesCount", "isNull")
+    _members = ("name", "shapes", "advanceWidth", "boundingBox", "shapesCount", "nodesCount", "isNull", "inkBox",
+                "anchors", "findAnchor", "addAnchor", "removeAnchor", "applyTransform", "metricsLeft", "metricsRight",
+                "metricsWidth", "setGlyphComponents")
+    _settable = ("advanceWidth",)
 
-    def __init__(self, name, shapes=(), width=500.0, bbox=None):
+    def __init__(self, name, shapes=(), width=500.0, bbox=None, anchors=(), ink=None):
         object.__setattr__(self, "name", name)
-        object.__setattr__(self, "shapes", list(shapes))
-        object.__setattr__(self, "advanceWidth", width)
+        object.__setattr__(self, "_f_shapes", list(shapes))
+        object.__setattr__(self, "_f_width", float(width))
+        object.__setattr__(self, "_f_round", False)  # FontLab keeps whole advance widths: set True to act so
         object.__setattr__(self, "boundingBox", bbox or QRectF(0, 0, 0, 0))
-        object.__setattr__(self, "shapesCount", len(shapes))
+        object.__setattr__(self, "_f_ink", ink)
+        object.__setattr__(self, "_f_anchors", list(anchors))
         object.__setattr__(self, "isNull", False)
+        object.__setattr__(self, "metricsLeft", "")
+        object.__setattr__(self, "metricsRight", "")
+        object.__setattr__(self, "metricsWidth", "")
+        object.__setattr__(self, "_f_package", None)
+        object.__setattr__(self, "_f_refuse_width", False)  # True: advanceWidth writes are not kept
+        object.__setattr__(self, "_f_raise_transform", False)  # True: applyTransform raises
+        object.__setattr__(self, "_f_anchor_drift", 0.0)  # anchors added land this far off
+
+    @property
+    def shapes(self):
+        return list(self._f_shapes)
+
+    @property
+    def shapesCount(self):
+        return len(self._f_shapes)
+
+    @property
+    def anchors(self):
+        return list(self._f_anchors)
+
+    def _get_width(self):
+        return self._f_width
+
+    def _set_width(self, value):
+        if self._f_refuse_width:
+            return
+        object.__setattr__(self, "_f_width", float(round(value)) if self._f_round else float(value))
+
+    advanceWidth = property(_get_width, _set_width)
 
     def nodesCount(self):  # a method in FontLab 7's reference: int nodesCount()
-        return sum(len(c.nodes()) for s in self.shapes for c in s.contours)
+        return sum(len(c.nodes()) for s in self._f_shapes for c in s.contours)
+
+    def inkBox(self):
+        """The on-curve extremes, each shape moved by its transform's offset (a stand-in for FontLab's ink box)."""
+        if self._f_ink is not None:
+            return self._f_ink
+        xs, ys = [], []
+        for shape in self._f_shapes:
+            for contour in shape.contours:
+                for node in contour.nodes():
+                    if node.type != "off":
+                        xs.append(node.x + shape.transform.dx())
+                        ys.append(node.y + shape.transform.dy())
+        if not xs:
+            return QRectF(0, 0, 0, 0)
+        return QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+
+    def findAnchor(self, name):
+        for anchor in self._f_anchors:
+            if anchor.name == name:
+                return anchor
+        return None
+
+    def addAnchor(self, anchor):
+        if self._f_anchor_drift:
+            anchor.point = QPointF(anchor.point.x() + self._f_anchor_drift, anchor.point.y())
+        self._f_anchors.append(anchor)
+
+    def removeAnchor(self, anchor):
+        self._f_anchors.remove(anchor)
+
+    def applyTransform(self, transform):
+        """A translation, as FontLab applies it: outlines' nodes, components' offsets, and anchors move."""
+        if self._f_raise_transform:
+            raise RuntimeError("applyTransform failed")
+        dx, dy = transform.dx(), transform.dy()
+        object.__setattr__(self, "_f_ink", None if self._f_ink is None else QRectF(
+            self._f_ink.x() + dx, self._f_ink.y() + dy, self._f_ink.width(), self._f_ink.height()))
+        for shape in self._f_shapes:
+            if shape.isComponent:
+                object.__setattr__(shape, "transform", shape.transform.translate(dx, dy))
+                continue
+            for contour in shape.contours:
+                for node in contour.nodes():
+                    object.__setattr__(node, "x", node.x + dx)
+                    object.__setattr__(node, "y", node.y + dy)
+        for anchor in self._f_anchors:
+            anchor.point = QPointF(anchor.point.x() + dx, anchor.point.y() + dy)
+
+    def setGlyphComponents(self, components, width, package, colorize):
+        """Components of the package's glyphs; FontLab keeps none of them where one's glyph has no such layer."""
+        shapes = []
+        for component in components:
+            base = package._f_find(component._f_name)
+            layer = None if base is None else base._f_layer(self.name)
+            if layer is None:
+                return False
+            contours = [c for s in layer.shapes for c in s.contours]
+            shapes.append(flShape(contours, transform=component.transform, component=True,
+                                  component_glyph=component._f_name))
+        if package._f_drop_components:
+            shapes = shapes[:-1]
+        object.__setattr__(self, "_f_shapes", shapes)
+        self.advanceWidth = width
+        return True
 
 
 class fgGlyph(Native):
     _members = ("unicodes",)
+    _settable = ("unicodes",)
 
-    def __init__(self, unicodes):
-        object.__setattr__(self, "unicodes", list(unicodes))
+    def __init__(self, unicodes, owner=None):
+        object.__setattr__(self, "_f_unicodes", list(unicodes))
+        object.__setattr__(self, "_f_owner", owner)
+        object.__setattr__(self, "_f_layers_when_set", None)  # how many layers its glyph had when they were set
+
+    def _get(self):
+        return list(self._f_unicodes)
+
+    def _set(self, values):
+        object.__setattr__(self, "_f_unicodes", list(values))
+        owner = self._f_owner
+        object.__setattr__(self, "_f_layers_when_set", None if owner is None else len(owner._f_layers))
+
+    unicodes = property(_get, _set)
 
 
 class flGlyph(Native):
-    _members = ("name", "layers", "activeLayer", "fgGlyph", "mark", "tags", "note", "isNull")
+    _members = ("name", "layers", "activeLayer", "fgGlyph", "mark", "tags", "note", "isNull", "getLayerByName",
+                "update", "currentHistoryState", "initialHistoryState")
+    _settable = ("name",)
 
     def __init__(self, name, layers, unicodes=(), active=None):
         object.__setattr__(self, "name", name)
-        object.__setattr__(self, "layers", list(layers))
+        object.__setattr__(self, "_f_layers", list(layers))
         object.__setattr__(self, "activeLayer", active if active is not None else (layers[0] if layers else None))
-        object.__setattr__(self, "fgGlyph", fgGlyph(unicodes))
+        object.__setattr__(self, "fgGlyph", fgGlyph(unicodes, self))
         object.__setattr__(self, "mark", 0)
         object.__setattr__(self, "tags", [])
         object.__setattr__(self, "note", "")
         object.__setattr__(self, "isNull", False)
+        object.__setattr__(self, "_f_states", [0])
+        object.__setattr__(self, "_f_snapshots", [])
+        object.__setattr__(self, "_f_updates", 0)
+
+    @property
+    def layers(self):
+        return list(self._f_layers) if isinstance(self._f_layers, list) else self._f_layers  # (a test's native stand-in)
+
+    def _f_layer(self, name):
+        for layer in self._f_layers:
+            if layer.name == name:
+                return layer
+        return None
+
+    def getLayerByName(self, name, create=False):
+        layer = self._f_layer(name)
+        if layer is None and create:
+            layer = flLayer(name, width=0.0)
+            self._f_layers.append(layer)
+        return layer
+
+    def update(self):
+        object.__setattr__(self, "_f_updates", self._f_updates + 1)
+
+    def currentHistoryState(self):
+        return self._f_states[-1]
+
+    def initialHistoryState(self):
+        return 0
+
+
+class fgFeatures(Native):
+    """fgPackage.features: the feature code, by tag, in FontLab's order, and its prefix."""
+    _members = ("keys", "get_feature", "set_feature", "get_prefix", "remove")
+
+    def __init__(self, features=(), prefix=""):
+        object.__setattr__(self, "_f_features", list(features))
+        object.__setattr__(self, "_f_prefix", prefix)
+        object.__setattr__(self, "_f_refuse", None)
+        object.__setattr__(self, "_f_garble_skip", None)  # code stored right even when garbling (a restore)
+
+    def keys(self):
+        return [tag for tag, _code in self._f_features]
+
+    def get_feature(self, tag):
+        for key, code in self._f_features:
+            if key == tag:
+                return code
+        return ""
+
+    def set_feature(self, tag, code):
+        """Stored as given, ending with a line break (FontLab adds one, live); _f_refuse: "drop" keeps
+        nothing, "garble" keeps something else."""
+        if self._f_refuse == "drop":
+            return
+        if self._f_refuse == "garble" and code != self._f_garble_skip:
+            code = code + "# garbled"
+        elif not code.endswith("\n"):
+            code = code + "\n"
+        for index, (key, _code) in enumerate(self._f_features):
+            if key == tag:
+                self._f_features[index] = (tag, code)
+                return
+        self._f_features.append((tag, code))
+
+    def get_prefix(self):
+        return self._f_prefix
+
+    def remove(self, tag):
+        object.__setattr__(self, "_f_features", [(key, code) for key, code in self._f_features if key != tag])
 
 
 class fgFont(Native):
-    _members = ("keys",)
+    _members = ("keys", "id", "features", "rebuildMaps")
 
-    def __init__(self, names):
+    def __init__(self, names, package=None, font_id=1, features=None):
         object.__setattr__(self, "_f_names", list(names))
+        object.__setattr__(self, "_f_package", package)
+        object.__setattr__(self, "id", font_id)
+        object.__setattr__(self, "features", features or fgFeatures())
+        object.__setattr__(self, "_f_rebuilds", 0)
 
     def keys(self):
+        if self._f_package is not None:
+            return [g.name for g in self._f_package._f_glyphs]
         return list(self._f_names)
+
+    def rebuildMaps(self):
+        object.__setattr__(self, "_f_rebuilds", self._f_rebuilds + 1)
+        if self._f_package is not None:
+            self._f_package._f_rebuild()
+
+
+class fgKerningObject(Native):
+    _members = ("id", "mode")
+
+    def __init__(self, ident, mode):
+        object.__setattr__(self, "id", ident)
+        object.__setattr__(self, "mode", mode)
+
+
+class fgKerningObjectPair(Native):
+    _members = ("left", "right")
+
+    def __init__(self, left, right):
+        object.__setattr__(self, "left", left)
+        object.__setattr__(self, "right", right)
+
+
+class fgKerningGroups(Native):
+    _members = ("asDict",)
+
+    def __init__(self, groups):
+        object.__setattr__(self, "_f_groups", groups)
+
+    def asDict(self):
+        return dict((name, (list(members), side)) for name, (members, side) in self._f_groups.items())
+
+
+class fgKerning(Native):
+    """flPackage.kerning(master). A name that is also a class's is taken as the class, as FontLab does
+    (live, 2026-11-08): pairs are keyed (name, mode) on each side."""
+    _members = ("keys", "items", "get", "remove", "groups")
+
+    def __init__(self, groups=None, pairs=()):
+        object.__setattr__(self, "_f_groups", dict(groups or {}))
+        object.__setattr__(self, "groups", fgKerningGroups(self._f_groups))
+        object.__setattr__(self, "_f_pairs", [])  # [((left, mode), (right, mode), value)]
+        object.__setattr__(self, "_f_drop", False)  # True: writes are not kept
+        object.__setattr__(self, "_f_round", False)  # True: values kept in whole units, as FontLab does
+        object.__setattr__(self, "_f_skew", 0.0)  # every value written lands this far off (restores too)
+        for left, right, value in pairs:
+            self._f_pairs.append((left, right, float(value)))
+
+    def _f_key(self, name):
+        return (name, "groupMode" if name in self._f_groups else "glyphMode")
+
+    def _f_find_pair(self, pair):
+        left, right = self._f_key(pair[0]), self._f_key(pair[1])
+        for index, (l, r, _v) in enumerate(self._f_pairs):
+            if l == left and r == right:
+                return index
+        return None
+
+    def keys(self):
+        return [fgKerningObjectPair(fgKerningObject(*l), fgKerningObject(*r)) for l, r, _v in self._f_pairs]
+
+    def items(self):
+        return [(fgKerningObjectPair(fgKerningObject(*l), fgKerningObject(*r)), v) for l, r, v in self._f_pairs]
+
+    def get(self, pair):
+        index = self._f_find_pair(pair)
+        return None if index is None else self._f_pairs[index][2]
+
+    def __setitem__(self, pair, value):
+        if self._f_drop:
+            return
+        index = self._f_find_pair(pair)
+        value = value + self._f_skew
+        entry = (self._f_key(pair[0]), self._f_key(pair[1]), float(round(value) if self._f_round else value))
+        if index is None:
+            self._f_pairs.append(entry)
+        else:
+            self._f_pairs[index] = entry
+
+    def remove(self, pair):
+        index = self._f_find_pair(pair)
+        if index is not None and not self._f_drop:
+            del self._f_pairs[index]
 
 
 class flPackage(Native):
     _members = (
-        "tfn", "tsn", "psn", "ffn", "path", "upm", "glyphsCount", "master", "mastersCount",
+        "tfn", "tsn", "psn", "ffn", "path", "upm", "glyphsCount", "master", "mastersCount", "masters",
         "versionMajor", "versionMinor", "hasChanges", "fgPackage", "findName", "findUnicode", "isNull",
+        "kerning", "getAllGroups", "renameGlyph", "addGlyph", "deleteGlyph", "setFlag", "currentHistoryState",
+        "initialHistoryState",
     )
 
-    def __init__(self, family, style, glyphs, master="Regular", path="fixtures/Test.vfc"):
+    def __init__(self, family, style, glyphs, master="Regular", path="fixtures/Test.vfc", masters=None, font_id=1,
+                 kerning=None, classes=(), features=None):
         object.__setattr__(self, "_f_glyphs", list(glyphs))
         object.__setattr__(self, "tfn", family)
         object.__setattr__(self, "tsn", style)
@@ -169,26 +483,102 @@ class flPackage(Native):
         object.__setattr__(self, "ffn", family + " " + style)
         object.__setattr__(self, "path", path)
         object.__setattr__(self, "upm", 1000.0)
-        object.__setattr__(self, "glyphsCount", len(glyphs))
         object.__setattr__(self, "master", master)
-        object.__setattr__(self, "mastersCount", 1)
+        object.__setattr__(self, "masters", list(masters or [master]))
+        object.__setattr__(self, "mastersCount", len(self.masters))
         object.__setattr__(self, "versionMajor", 1)
         object.__setattr__(self, "versionMinor", 0)
         object.__setattr__(self, "hasChanges", False)
-        object.__setattr__(self, "fgPackage", fgFont([g.name for g in glyphs]))
+        object.__setattr__(self, "fgPackage", fgFont([g.name for g in glyphs], self, font_id, features))
         object.__setattr__(self, "isNull", False)
+        object.__setattr__(self, "_f_kerning", dict(kerning or {}))
+        object.__setattr__(self, "_f_classes", list(classes))  # feature classes: (name, glyph names)
+        object.__setattr__(self, "_f_flags", [])
+        object.__setattr__(self, "_f_states", [0])
+        object.__setattr__(self, "_f_snapshots", [])
+        object.__setattr__(self, "_f_drop_components", False)
+        object.__setattr__(self, "_f_refuse_delete", False)
+        object.__setattr__(self, "_f_rename_ignored", False)
+        object.__setattr__(self, "_f_unicode_map", {})
+        self._f_rebuild()
 
-    def findName(self, name):
+    @property
+    def glyphsCount(self):
+        return len(self._f_glyphs)
+
+    def _f_rebuild(self):
+        """FontLab's code point lookup: rebuilt by fgPackage.rebuildMaps(), not when a glyph's values change."""
+        mapping = {}
+        for glyph in self._f_glyphs:
+            for value in glyph.fgGlyph._f_unicodes:
+                mapping.setdefault(value, glyph)
+        object.__setattr__(self, "_f_unicode_map", mapping)
+        object.__setattr__(self, "_f_name_map", dict((g.name, g) for g in self._f_glyphs))
+
+    def _f_find(self, name):
         for glyph in self._f_glyphs:
             if glyph.name == name:
                 return glyph
         return None
 
+    def findName(self, name):
+        """FontLab's name lookup, from a map rebuildMaps() rebuilds: after a rename it still finds the glyph
+        under its old name and not under its new one (the stale lookup a write must not trust)."""
+        found = self._f_name_map.get(name)
+        return found if found is not None and found in self._f_glyphs else None
+
     def findUnicode(self, codepoint):
-        for glyph in self._f_glyphs:
-            if codepoint in glyph.fgGlyph.unicodes:
-                return glyph
-        return None
+        return self._f_unicode_map.get(codepoint)
+
+    def kerning(self, master):
+        if master not in self._f_kerning:
+            self._f_kerning[master] = fgKerning()
+        return self._f_kerning[master]
+
+    def getAllGroups(self):
+        groups = [(False, name, i, 0, list(members)) for i, (name, members) in enumerate(self._f_classes)]
+        first = self._f_kerning.get(self.masters[0])
+        if first is not None:
+            for name, (members, _side) in sorted(first._f_groups.items()):
+                groups.append((True, name, 100 + len(groups), 0, list(members)))
+        return groups
+
+    def renameGlyph(self, glyph, name, rename):
+        """Renames the glyph whose fgGlyph is given; with rename, the components that use it follow."""
+        if self._f_rename_ignored:
+            return True  # (says it renamed, and did not)
+        for item in self._f_glyphs:
+            if item.fgGlyph is glyph:
+                old = item.name
+                object.__setattr__(item, "name", name)
+                if rename:
+                    for other in self._f_glyphs:
+                        for layer in other._f_layers:
+                            for shape in layer._f_shapes:
+                                if shape.isComponent and shape.shapeData.componentGlyph == old:
+                                    object.__setattr__(shape.shapeData, "componentGlyph", name)
+                return True
+        return False
+
+    def addGlyph(self, glyph):
+        """FontLab adds a copy of the glyph, without its layers: they are made on the font's glyph."""
+        self._f_glyphs.append(flGlyph(glyph.name, [], glyph.fgGlyph._f_unicodes))
+        self._f_name_map[glyph.name] = self._f_glyphs[-1]
+
+    def deleteGlyph(self, glyph):
+        if self._f_refuse_delete:
+            return False
+        self._f_glyphs.remove(glyph)
+        return True
+
+    def setFlag(self, flag, value=True):
+        self._f_flags.append((flag, value))
+
+    def currentHistoryState(self):
+        return self._f_states[-1]
+
+    def initialHistoryState(self):
+        return 0
 
 
 class _BrokenPath(flPackage):
@@ -210,14 +600,16 @@ class NullUnknown(flGlyph):
 
 
 class _PackageObject(Native):
-    """What flWorkspace.packages() returns in FontLab 7: generic flObject items.
+    """What flWorkspace.packages() returns in FontLab 7: generic flObject items, which fontlab.flPackage
+    wraps.
 
     unsaved: True (hasChanges), "history" (only hasHistoryStates: an edit, as FontLab 7.2 reports one
     live), or False."""
     _members = ("hasChanges", "hasHistoryStates")
 
-    def __init__(self, unsaved):
+    def __init__(self, unsaved, font=None):
         object.__setattr__(self, "_f_unsaved", unsaved)
+        object.__setattr__(self, "_f_font", font)
 
     def __getattribute__(self, name):
         if name == "hasChanges":
@@ -240,7 +632,10 @@ class _Workspace(Native):
         if name == "hasChanges":
             return state.workspace_changed
         if name == "packages":  # a method in FontLab 7: flWorkspace.packages()
-            return lambda: [_PackageObject(unsaved) for unsaved in state.unsaved]
+            if state.unsaved is not None:
+                fonts = list(state.fonts) + [None] * len(state.unsaved)
+                return lambda: [_PackageObject(unsaved, fonts[i]) for i, unsaved in enumerate(state.unsaved)]
+            return lambda: [_PackageObject(False, font) for font in state.fonts]
         return Native.__getattribute__(self, name)
 
 
@@ -249,7 +644,222 @@ class FontLabState(object):
         self.fonts = []
         self.current = None
         self.workspace_changed = False
-        self.unsaved = []  # one flag per open package
+        self.unsaved = None  # one flag per open package; None: each open font, none unsaved
+        self.steps = []  # (title, recorded objects) of every notifyChangesApplied
+        self.content_updates = []  # notifyPackageContentUpdated's ids
+        self.fail_history = None  # "before", "step", or "always": notifyChangesApplied raises then
+        self.undone = 0  # Undo triggers
+        self.undo_moves = True  # False: Undo does nothing (a step FontLab refused to take back)
+        self.history = []  # FontLab's History: (title, objects) steps, last on top
+        self.redo = []
+
+    def undo(self):
+        """Edit > Undo: the top step's objects go back to their states before it, and Redo names it."""
+        self.undone += 1
+        if not self.undo_moves or not self.history:
+            return
+        title, items = self.history.pop()
+        self.redo.append(title)
+        for item in items:
+            if len(item._f_states) > 1:
+                item._f_states.pop()
+            item._f_snapshots.pop()
+            if item._f_snapshots:  # (nothing earlier recorded: it stays as written)
+                _restore(item, item._f_snapshots[-1])
+
+    def undo_text(self):  # (FontLab shows step titles in title case, with a mnemonic)
+        return ("&Undo " + self.history[-1][0].title()) if self.history else "&Undo"
+
+    def redo_text(self):
+        return ("&Redo " + self.redo[-1].title()) if self.redo else "&Redo"
+
+
+_COUNTER = [0]
+
+
+def _notify(state, title, objects, recursive):
+    before = title.endswith("(before)")
+    if state.fail_history == "always" or state.fail_history == ("before" if before else "step"):
+        raise RuntimeError("History refused")
+    items = objects if isinstance(objects, list) else [objects]
+    state.steps.append((title, list(items)))
+    state.history.append((title, list(items)))
+    state.redo = []
+    _COUNTER[0] += 1
+    for item in items:
+        item._f_states.append(_COUNTER[0])
+        item._f_snapshots.append(_snapshot(item))
+
+
+# FontLab's History, by value: a step records each object as it is after the change; Undo puts each object
+# back as the step before recorded it, and leaves one the History holds nothing earlier of as it is. The font
+# recorded holds its glyph list, every layer, its kerning, and its feature code; a glyph its name and code points.
+def _copy_layer(layer):
+    copy = flLayer(layer.name, [_copy_shape(s) for s in layer._f_shapes], width=layer._f_width, bbox=layer.boundingBox,
+                   anchors=[flPinPoint(QPointF(a.point.x(), a.point.y()), a.name) for a in layer._f_anchors],
+                   ink=layer._f_ink)
+    for key in ("metricsLeft", "metricsRight", "metricsWidth", "_f_round", "_f_refuse_width", "_f_raise_transform",
+                "_f_anchor_drift"):
+        object.__setattr__(copy, key, object.__getattribute__(layer, key))
+    return copy
+
+
+def _copy_shape(shape):
+    contours = [flContour([flNode(n.x, n.y, n.type, n.smooth) for n in c.nodes()], c.closed) for c in shape.contours]
+    copy = flShape(contours, shape.name, shape.transform, shape.isComponent, shape.shapeData.componentGlyph)
+    return copy
+
+
+def _snapshot(item):
+    if isinstance(item, flPackage):
+        return {"glyphs": list(item._f_glyphs),
+                "layers": dict((id(g), [_copy_layer(l) for l in g._f_layers]) for g in item._f_glyphs),
+                "kerning": dict((m, (list(k._f_pairs), dict(k._f_groups))) for m, k in item._f_kerning.items()),
+                "features": (list(item.fgPackage.features._f_features), item.fgPackage.features._f_prefix)}
+    return {"name": item.name, "unicodes": list(item.fgGlyph._f_unicodes)}
+
+
+def _restore(item, snap):
+    if isinstance(item, flPackage):
+        object.__setattr__(item, "_f_glyphs", list(snap["glyphs"]))
+        for glyph in item._f_glyphs:
+            object.__setattr__(glyph, "_f_layers", [_copy_layer(l) for l in snap["layers"].get(id(glyph), [])])
+        for master, (pairs, groups) in snap["kerning"].items():
+            kerning = item.kerning(master)
+            object.__setattr__(kerning, "_f_pairs", list(pairs))
+            kerning._f_groups.clear()
+            kerning._f_groups.update(groups)
+        features = item.fgPackage.features
+        object.__setattr__(features, "_f_features", list(snap["features"][0]))
+        object.__setattr__(features, "_f_prefix", snap["features"][1])
+    else:
+        object.__setattr__(item, "name", snap["name"])
+        object.__setattr__(item.fgGlyph, "_f_unicodes", list(snap["unicodes"]))
+
+
+class _GlyphComponent(Native):
+    _members = ("transform",)
+    _settable = ("transform",)
+
+    def __init__(self, name):
+        object.__setattr__(self, "_f_name", name)
+        object.__setattr__(self, "transform", QTransform())
+
+
+def install(state):
+    """Put fake fontlab and fontgate modules into sys.modules; returns the fontlab module."""
+    fontlab = types.ModuleType("fontlab")
+    workspace = _Workspace(state)
+
+    class flWorkspace(object):
+        @staticmethod
+        def instance():
+            return workspace
+
+    class flItems(object):
+        @staticmethod
+        def notifyChangesApplied(title, objects, recursive):
+            _notify(state, title, objects, recursive)
+
+        @staticmethod
+        def notifyPackageContentUpdated(font_id):
+            state.content_updates.append(font_id)
+
+    def wrap(item):
+        font = object.__getattribute__(item, "_f_font")
+        if font is None:
+            raise RuntimeError("flPackage: not a font")
+        return font
+
+    fontlab.flWorkspace = flWorkspace
+    fontlab.flItems = flItems
+    fontlab.flPackage = wrap
+    fontlab.flGlyph = lambda: flGlyph("", [])
+    fontlab.GlyphComponent = _GlyphComponent
+    fontlab.flPinPoint = flPinPoint
+    fontlab.CountFonts = lambda: len(state.fonts)
+    fontlab.ApplicationPath = lambda: "FontLab 7 (fake)"
+    sys.modules["fontlab"] = fontlab
+    sys.modules["fontgate"] = types.ModuleType("fontgate")
+    return fontlab
+
+
+def uninstall():
+    for name in ("fontlab", "fontgate"):
+        sys.modules.pop(name, None)
+
+
+QT_MODULES = ("PythonQt", "PythonQt.QtCore", "PythonQt.QtGui")
+
+
+def install_qt(state):
+    """Fake PythonQt: QPointF, QTransform, and FontLab's main window with its Edit > Undo action. Returns
+    what it replaced, for uninstall_qt."""
+    saved = dict((name, sys.modules.get(name)) for name in QT_MODULES)
+
+    class QAction(object):
+        pass
+
+    class Undo(QAction):
+        objectName = "actionUndo"
+
+        @property
+        def enabled(self):
+            return bool(state.history)
+
+        @property
+        def text(self):
+            return state.undo_text()
+
+        def trigger(self):
+            state.undo()
+
+    class Redo(QAction):
+        objectName = "actionRedo"
+
+        @property
+        def enabled(self):
+            return bool(state.redo)
+
+        @property
+        def text(self):
+            return state.redo_text()
+
+    class Meta(object):
+        def className(self):
+            return "MainWindow"
+
+    class MainWindow(object):
+        def metaObject(self):
+            return Meta()
+
+        def findChildren(self, kind):
+            return [Undo(), Redo()] if kind is QAction else []
+
+    class QApplication(object):
+        @staticmethod
+        def instance():
+            return QApplication()
+
+        def topLevelWidgets(self):
+            return [MainWindow()]
+
+    core = types.ModuleType("PythonQt.QtCore")
+    core.QPointF = QPointF
+    gui = types.ModuleType("PythonQt.QtGui")
+    gui.QTransform, gui.QApplication, gui.QAction = QTransform, QApplication, QAction
+    root = types.ModuleType("PythonQt")
+    root.QtCore, root.QtGui = core, gui
+    sys.modules.update({"PythonQt": root, "PythonQt.QtCore": core, "PythonQt.QtGui": gui})
+    return saved
+
+
+def uninstall_qt(saved):
+    for name, module in saved.items():
+        if module is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module
 
 
 def square(x0, y0, size):
@@ -275,24 +885,35 @@ def sample_font(broken_path=False):
     return cls("Free Sans", "Regular", glyphs)
 
 
-def install(state):
-    """Put fake fontlab and fontgate modules into sys.modules; returns the fontlab module."""
-    fontlab = types.ModuleType("fontlab")
-    workspace = _Workspace(state)
+def write_font(font_id=7, family="Write Sans", path="fixtures/Write.vfc"):
+    """A two-master font for the write tools: kerning with classes (one named like its glyph, as FontLab
+    names them), feature code, an anchor, a composite, and a glyph drawn in one master only."""
+    def layer(master, shapes, width, anchors=(), ink=None):
+        return flLayer(master, shapes, width=width, anchors=anchors, ink=ink)
 
-    class flWorkspace(object):
-        @staticmethod
-        def instance():
-            return workspace
-
-    fontlab.flWorkspace = flWorkspace
-    fontlab.CountFonts = lambda: len(state.fonts)
-    fontlab.ApplicationPath = lambda: "FontLab 7 (fake)"
-    sys.modules["fontlab"] = fontlab
-    sys.modules["fontgate"] = types.ModuleType("fontgate")
-    return fontlab
-
-
-def uninstall():
-    for name in ("fontlab", "fontgate"):
-        sys.modules.pop(name, None)
+    glyphs = [
+        flGlyph("A", [layer("Regular", [flShape([square(50, 0, 400)])], 500.0, [flPinPoint(QPointF(250, 400), "top")]),
+                      layer("Bold", [flShape([square(40, 0, 420)])], 520.0)], [0x41]),
+        flGlyph("B", [layer("Regular", [flShape([square(60, 0, 380)])], 500.0),
+                      layer("Bold", [flShape([square(50, 0, 400)])], 510.0)], [0x42]),
+        flGlyph("V", [layer("Regular", [flShape([square(20, 0, 460)])], 500.0),
+                      layer("Bold", [flShape([square(10, 0, 480)])], 500.0)], [0x56]),
+        flGlyph("O", [layer("Regular", [flShape([square(40, 0, 420)])], 500.0, ink=QRectF(40.4, 0, 419.2, 420)),
+                      layer("Bold", [flShape([square(30, 0, 440)])], 500.0)], [0x4F]),
+        flGlyph("acute", [layer("Regular", [flShape([square(0, 500, 100)])], 0.0)], [0xB4]),
+        flGlyph("Aacute", [layer("Regular", [flShape([square(50, 0, 400)], component=True, component_glyph="A"),
+                                             flShape([square(0, 500, 100)], transform=QTransform(1, 0, 0, 1, 200, 0),
+                                                     component=True, component_glyph="acute")], 500.0)], [0xC1]),
+        flGlyph("space", [layer("Regular", [], 250.0), layer("Bold", [], 260.0)], [0x20]),
+        flGlyph("Q", [layer("Regular", [flShape([square(40, 0, 420)])], 500.0)], [0x51]),
+    ]
+    regular = fgKerning({"V": (["V"], "KernLeft"), "round": (["O", "Q"], "KernRight")},
+                        [(("A", "glyphMode"), ("B", "glyphMode"), -20), (("V", "groupMode"), ("A", "glyphMode"), -50),
+                         (("A", "glyphMode"), ("round", "groupMode"), -10)])
+    bold = fgKerning({"V": (["V"], "KernLeft"), "round": (["O", "Q"], "KernRight")},
+                     [(("A", "glyphMode"), ("B", "glyphMode"), -25)])
+    features = fgFeatures([("liga", u"feature liga {\n  sub A B by V;\n} liga;\n"),
+                           ("ss01", u"feature ss01 {\n  sub Q by O;\n} ss01;\n")],
+                          u"languagesystem DFLT dflt;\n@caps = [A B];\n")
+    return flPackage(family, "Regular", glyphs, masters=["Regular", "Bold"], font_id=font_id, path=path,
+                     kerning={"Regular": regular, "Bold": bold}, classes=[("caps", ["A", "B"])], features=features)

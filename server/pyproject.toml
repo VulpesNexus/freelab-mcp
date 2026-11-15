@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "freelab-mcp"
-version = "0.1.0"
+version = "1.0.0"
 description = "MCP server for FontLab, through the FreeLab listener that runs inside FontLab"
 requires-python = ">=3.10"
 license = { text = "GPL-3.0-or-later" }

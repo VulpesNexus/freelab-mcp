@@ -16,6 +16,7 @@ import binascii
 import errno
 import hmac
 import json
+import math
 import os
 import re
 import socket
@@ -23,7 +24,7 @@ import sys
 import time
 import traceback
 
-VERSION = "0.1.0"
+VERSION = "1.0.0"
 PROTOCOL = 1
 HOST = "127.0.0.1"
 DEFAULT_PORT = 47761
@@ -58,10 +59,11 @@ _LAST_RESORT = b'{"ok": false, "error": {"code": "unserializable", "message": "T
 class FreeLabError(Exception):
     """An expected failure with a stable code, reported to the client as is."""
 
-    def __init__(self, code, message):
+    def __init__(self, code, message, data=None):
         Exception.__init__(self, message)
         self.code = code
         self.message = message
+        self.data = data  # more for the client, such as the History step a failed write left (error["data"])
 
 
 # ---------------------------------------------------------------------------
@@ -205,8 +207,107 @@ def current_package():
     return package, count
 
 
+def _font_id(package):
+    """FontLab's number for an open font (fgPackage.id), the same through every wrapper of it."""
+    try:
+        return int(package.fgPackage.id)
+    except Exception as exc:
+        raise FreeLabError("unreadable", "Could not read the font's id (%s)." % _exc_text(exc))
+
+
+def open_packages():
+    """Every open font, as flPackage wrappers of the items flWorkspace.packages() lists."""
+    fl = _fontlab()
+    items = _real_list(fl.flWorkspace.instance().packages(), "flWorkspace.packages()")
+    packages = []
+    for item in items:
+        package = fl.flPackage(item)
+        if not _is_null(package, "an open font"):
+            packages.append(package)
+    return packages
+
+
+def _same_path(a, b):
+    def norm(path):
+        return os.path.normcase(os.path.normpath(_text(path).replace(u"/", os.sep).replace(u"\\", os.sep)))
+    return bool(a) and bool(b) and norm(a) == norm(b)
+
+
+def _font_label(package):
+    try:
+        name = _text(package.ffn)
+    except Exception:
+        name = u"?"
+    try:
+        return u"%s (id %d)" % (name, _font_id(package))
+    except FreeLabError:
+        return name
+
+
+def _font_matches(package, wanted, names_only=False):
+    """Whether wanted names the font: its id (an integer, or digits that may also be a name), its
+    PostScript or full name, or its path."""
+    if isinstance(wanted, integer_types):
+        return not names_only and _font_id(package) == wanted
+    if not names_only and ASCII_DIGITS.match(wanted) and _font_id(package) == int(wanted):
+        return True  # (not isdigit: it is true of "²", which int() refuses)
+    for key in ("psn", "ffn"):
+        try:
+            if _text(getattr(package, key)) == wanted:
+                return True
+        except Exception:
+            pass
+    try:
+        return _same_path(package.path, wanted)
+    except Exception:
+        return False
+
+
+ASCII_DIGITS = re.compile(r"^[0-9]+\Z")
+
+
+def target_package(args, required=False):
+    """(package, open font count) of the font args["font"] names: its id (from list_fonts), its path,
+    PostScript name, or full name. Without one, the font in front, unless required: a write never
+    guesses which font it changes."""
+    wanted = args.get("font")
+    if wanted is None:
+        if required:
+            raise FreeLabError("bad_args", "Name the font to change (font): its id from list_fonts, its path, its "
+                                           "PostScript name, or its full name.")
+        return current_package()
+    if isinstance(wanted, bool) or not isinstance(wanted, integer_types + string_types) or \
+            (isinstance(wanted, string_types) and not wanted.strip()):
+        raise FreeLabError("bad_args", "font must be a font id (an integer from list_fonts) or a non-empty path or name.")
+    if isinstance(wanted, string_types):
+        wanted = _text(wanted).strip()
+    packages = open_packages()
+    if not packages:
+        raise FreeLabError("no_font", "No font is open in FontLab.")
+    found = [package for package in packages if _font_matches(package, wanted)]
+    if not found:
+        raise FreeLabError("no_such_font", u"No open font is '%s'. Open fonts: %s." % (
+            wanted, u"; ".join(_font_label(package) for package in packages)))
+    if len(found) > 1:
+        raise FreeLabError("ambiguous_font", u"%d open fonts match '%s': %s. Name one by its id." % (
+            len(found), wanted, u"; ".join(_font_label(package) for package in found)))
+    return found[0], len(packages)
+
+
+def _font_ref(package, reads=None):
+    """The font a reply is about: its id and full name."""
+    reads = reads or _Reads()
+    return {"id": _font_id(package), "name": reads.prop(package, "ffn", "font_name")}
+
+
 def _font_summary(package, reads):
+    try:
+        font_id = _font_id(package)
+    except FreeLabError as exc:
+        font_id = None
+        reads.unreadable["id"] = exc.message
     return {
+        "id": font_id,
         "family": reads.prop(package, "tfn"),
         "style": reads.prop(package, "tsn"),
         "postscript_name": reads.prop(package, "psn"),
@@ -216,32 +317,70 @@ def _font_summary(package, reads):
         "glyph_count": reads.prop(package, "glyphsCount"),
         "master": reads.prop(package, "master"),
         "master_count": reads.prop(package, "mastersCount"),
+        "masters": reads.prop(package, "masters"),
         "version_major": reads.prop(package, "versionMajor"),
         "version_minor": reads.prop(package, "versionMinor"),
         "has_changes": reads.prop(package, "hasChanges"),
     }
 
 
-def _find_glyph(package, args):
-    name = args.get("name")
+def _find_glyph(package, args, name_key="name"):
+    name = args.get(name_key)
     codepoint = args.get("unicode")
     if name is not None and codepoint is not None:
-        raise FreeLabError("bad_args", "Give either name or unicode, not both.")
+        raise FreeLabError("bad_args", "Give either %s or unicode, not both." % name_key)
     if name is not None:
         if not isinstance(name, string_types) or not name:
-            raise FreeLabError("bad_args", "name must be a non-empty string.")
-        glyph = package.findName(name)
-        label = u"name %r" % _text(name)
+            raise FreeLabError("bad_args", "%s must be a non-empty string." % name_key)
+        glyph = glyph_named(package, name)
+        label = u"name '%s'" % _text(name)
     elif codepoint is not None:
         if not isinstance(codepoint, integer_types) or isinstance(codepoint, bool) or not 0 <= codepoint <= 0x10FFFF:
             raise FreeLabError("bad_args", "unicode must be an integer code point.")
-        glyph = package.findUnicode(codepoint)
+        glyph = _glyph_with(package, codepoint)
         label = u"U+%04X" % codepoint
     else:
         raise FreeLabError("bad_args", "Give a glyph name or a unicode code point.")
     if _is_null(glyph, "the glyph"):
-        raise FreeLabError("no_glyph", u"The current font has no glyph with %s." % label)
+        raise FreeLabError("no_glyph", u"%s has no glyph with %s." % (_font_label(package), label))
     return glyph
+
+
+def _named(glyph, name):
+    return not _is_null(glyph, "the glyph") and _text(glyph.name) == _text(name)
+
+
+def glyph_named(package, name):
+    """The font's glyph of that name, or None. FontLab's lookups can lag behind a change (an Undo, a
+    script's edit): a glyph found under another name, or none, is looked up again once the font's maps
+    are rebuilt."""
+    glyph = package.findName(name)
+    if _named(glyph, name):
+        return glyph
+    package.fgPackage.rebuildMaps()
+    glyph = package.findName(name)
+    return glyph if _named(glyph, name) else None
+
+
+def _has_code(glyph, codepoint):
+    if _is_null(glyph, "the glyph"):
+        return False
+    try:
+        return codepoint in [int(u) for u in _real_list(glyph.fgGlyph.unicodes, "fgGlyph.unicodes")]
+    except FreeLabError:
+        raise
+    except Exception:
+        return False
+
+
+def _glyph_with(package, codepoint):
+    """The font's glyph with that code point, or None, checked as glyph_named is."""
+    glyph = package.findUnicode(codepoint)
+    if _has_code(glyph, codepoint):
+        return glyph
+    package.fgPackage.rebuildMaps()
+    glyph = package.findUnicode(codepoint)
+    return glyph if _has_code(glyph, codepoint) else None
 
 
 def _choose_layer(glyph, package, layer_name, reads):
@@ -259,7 +398,9 @@ def _choose_layer(glyph, package, layer_name, reads):
             if _text(layer.name) == _text(wanted):
                 return layer, source
         if source == "requested":
-            raise FreeLabError("no_layer", u"The glyph has no layer named %r." % _text(wanted))
+            raise FreeLabError("no_layer", u"Glyph '%s' has no layer '%s'; its layers: %s. (A font made from a variable "
+                               u"font has a glyph's layers only in the masters where it is drawn.)" % (
+                                   _text(glyph.name), _text(wanted), u", ".join(_text(layer.name) for layer in layers)))
     active = glyph.activeLayer
     if _is_null(active, "the active layer"):
         raise FreeLabError("no_layer", "The glyph has no layer matching the master and no active layer.")
@@ -444,9 +585,29 @@ def _label_text(label):
     return text.strip()
 
 
+@op("fonts")
+def op_fonts(listener, args):
+    """Every open font: its id (what the tools take as font), names, path, masters, and whether it is in front."""
+    fl = _fontlab()
+    current = fl.flWorkspace.instance().currentPackage
+    current_id = None
+    try:
+        if not _is_null(current, "the current font"):
+            current_id = _font_id(current)
+    except FreeLabError:
+        pass
+    reads = _Reads()
+    fonts = []
+    for package in open_packages():
+        entry = _font_summary(package, reads)
+        entry["in_front"] = entry["id"] == current_id
+        fonts.append(entry)
+    return reads.attach({"fonts": fonts})
+
+
 @op("font_info")
 def op_font_info(listener, args):
-    package, count = current_package()
+    package, count = target_package(args)
     reads = _Reads()
     result = _font_summary(package, reads)
     result["fonts_open"] = count
@@ -455,29 +616,77 @@ def op_font_info(listener, args):
 
 @op("glyph_names")
 def op_glyph_names(listener, args):
-    package, count = current_package()
+    package, count = target_package(args)
     offset = _int_arg(args, "offset", 0, 0, 10 ** 9)
     limit = _int_arg(args, "limit", 500, 1, 5000)
     names = _real_list(package.fgPackage.keys(), "fgFont.keys()")
     page = [_text(n) for n in names[offset:offset + limit]]
-    return {"total": len(names), "offset": offset, "names": page, "more": offset + len(page) < len(names)}
+    return {"font": _font_ref(package), "total": len(names), "offset": offset, "names": page,
+            "more": offset + len(page) < len(names)}
 
 
-@op("glyph")
-def op_glyph(listener, args):
-    package, count = current_package()
-    glyph = _find_glyph(package, args)
-    reads = _Reads()
-    layer, layer_source = _choose_layer(glyph, package, args.get("layer"), reads)
-    unicodes = None
+def _unicodes(glyph, reads):
     try:
-        unicodes = [int(u) for u in _real_list(glyph.fgGlyph.unicodes, "fgGlyph.unicodes")]
+        return [int(u) for u in _real_list(glyph.fgGlyph.unicodes, "fgGlyph.unicodes")]
     except FreeLabError:
         raise
     except Exception as exc:
         reads.unreadable["unicodes"] = _exc_text(exc)
+        return None
+
+
+def _ink_box(layer, reads):
+    """The layer's ink box: its outline's extremes, curves measured, as FontLab's sidebearings use it
+    (boundingBox is the box of every node, off-curve points included, widened by 0.001)."""
+    try:
+        return to_jsonable(layer.inkBox())
+    except Exception as exc:
+        reads.unreadable["ink_box"] = _exc_text(exc)
+        return None
+
+
+def _anchors(layer, reads):
+    try:
+        return [{"name": _text(anchor.name), "x": anchor.point.x(), "y": anchor.point.y()}
+                for anchor in _real_list(layer.anchors, "layer.anchors")]
+    except FreeLabError:
+        raise
+    except Exception as exc:
+        reads.unreadable["anchors"] = _exc_text(exc)
+        return None
+
+
+def _component_glyph(shape):
+    """The glyph a component shape draws, or None (an outline of its own, or not readable)."""
+    try:
+        if not shape.isComponent:
+            return None
+        return _text(shape.shapeData.componentGlyph) or None
+    except Exception:
+        return None
+
+
+@op("glyph")
+def op_glyph(listener, args):
+    package, count = target_package(args)
+    glyph = _find_glyph(package, args)
+    reads = _Reads()
+    layer, layer_source = _choose_layer(glyph, package, args.get("layer"), reads)
+    unicodes = _unicodes(glyph, reads)
     bbox = reads.prop(layer, "boundingBox", "bounding_box")
+    ink = _ink_box(layer, reads)
     advance = reads.prop(layer, "advanceWidth", "advance_width")
+    components = []
+    try:
+        for shape in _real_list(layer.shapes, "layer.shapes"):
+            base = _component_glyph(shape)
+            if base is not None:
+                components.append({"glyph": base, "transform": to_jsonable(shape.transform)})
+    except FreeLabError:
+        raise
+    except Exception as exc:
+        reads.unreadable["components"] = _exc_text(exc)
+        components = None
     result = {
         "name": reads.prop(glyph, "name"),
         "unicodes": unicodes,
@@ -486,25 +695,24 @@ def op_glyph(listener, args):
         "layer_source": layer_source,
         "advance_width": advance,
         "bounding_box": bbox,
+        "ink_box": ink,
         "shapes": reads.prop(layer, "shapesCount", "shapes"),
         "nodes": reads.prop(layer, "nodesCount", "nodes"),
+        "components": components,
+        "anchors": _anchors(layer, reads),
         "mark": reads.prop(glyph, "mark"),
         "tags": reads.prop(glyph, "tags"),
         "note": reads.prop(glyph, "note"),
-        "font": reads.prop(package, "tfn", "font"),
+        "font": _font_ref(package, reads),
     }
-    if isinstance(bbox, dict) and isinstance(advance, (int, float)) and bbox.get("width"):
-        result["sidebearings"] = {
-            "left": bbox["x"],
-            "right": advance - (bbox["x"] + bbox["width"]),
-            "method": "layer bounding box; not FontLab's metrics",
-        }
+    if isinstance(ink, dict) and isinstance(advance, (int, float)) and ink.get("width"):
+        result["sidebearings"] = {"left": ink["x"], "right": advance - (ink["x"] + ink["width"])}
     return reads.attach(result)
 
 
 @op("outline")
 def op_outline(listener, args):
-    package, count = current_package()
+    package, count = target_package(args)
     glyph = _find_glyph(package, args)
     reads = _Reads()
     layer, layer_source = _choose_layer(glyph, package, args.get("layer"), reads)
@@ -535,13 +743,16 @@ def op_outline(listener, args):
                 entry["truncated"] = True
                 truncated = True
             contours_out.append(entry)
-        shapes_out.append({
+        entry = {
             "index": s_index,
             "name": reads.prop(shape, "name", "shape_%d_name" % s_index),
             "is_component": reads.prop(shape, "isComponent", "shape_%d_is_component" % s_index),
             "transform": reads.prop(shape, "transform", "shape_%d_transform" % s_index),
             "contours": contours_out,
-        })
+        }
+        if entry["is_component"]:
+            entry["component"] = _component_glyph(shape)
+        shapes_out.append(entry)
     result = {
         "name": reads.prop(glyph, "name"),
         "layer": reads.prop(layer, "name", "layer"),
@@ -550,9 +761,996 @@ def op_outline(listener, args):
         "shapes": shapes_out,
         "node_count": total,
         "truncated": truncated,
-        "font": reads.prop(package, "tfn", "font"),
+        "font": _font_ref(package, reads),
     }
     return reads.attach(result)
+
+
+# ---------------------------------------------------------------------------
+# Kerning and features (reads)
+# ---------------------------------------------------------------------------
+
+KERN_SIDES = {"left": ("KernLeft", "KernBothSide"), "right": ("KernRight", "KernBothSide")}
+MAX_KERN = 10000
+TAG_RE = re.compile(r"^[A-Za-z0-9]{4}\Z")  # (\Z: $ also matches before a final newline)
+
+
+def _master_arg(package, args):
+    """The master args["master"] names (the font's current master when none is given), checked against the font."""
+    masters = [_text(m) for m in _real_list(package.masters, "flPackage.masters")]
+    master = args.get("master")
+    if master is None:
+        return _text(package.master), masters
+    if not isinstance(master, string_types) or _text(master) not in masters:
+        raise FreeLabError("no_master", u"%s has no master '%s'; its masters: %s." % (
+            _font_label(package), master, u", ".join(masters)))
+    return _text(master), masters
+
+
+def _kerning(package, master):
+    kerning = package.kerning(master)
+    if kerning is None:
+        raise FreeLabError("unreadable", u"FontLab gave no kerning for master '%s'." % master)
+    groups = kerning.groups.asDict()
+    if not isinstance(groups, dict):
+        raise FreeLabError("unexpected_type", "The kerning classes are a %s, not a dict; they were not read." % type(groups).__name__)
+    # (keys as text once: Python 2 compares a byte-string key with unicode text only when it is ASCII)
+    return kerning, dict((_text(name), entry) for name, entry in groups.items())
+
+
+def _kern_side(package, groups, value, side):
+    """(the key FontLab takes, the side as shown) for one side of a pair: a glyph name, or @name for a class."""
+    if not isinstance(value, string_types) or not value.strip():
+        raise FreeLabError("bad_args", "%s must be a glyph name, or @ and a kerning class's name." % side)
+    value = _text(value)
+    if value.startswith(u"@"):
+        name = value[1:]
+        if name not in groups:
+            raise FreeLabError("no_class", u"%s has no kerning class '%s' in this master." % (_font_label(package), name))
+        flag = _text(_real_list(groups[name], "a kerning class")[1])
+        if flag not in KERN_SIDES[side]:
+            raise FreeLabError("wrong_side", u"Kerning class '%s' is a %s class: it cannot be the %s side of a pair." % (
+                name, flag, side))
+        return name, value
+    if glyph_named(package, value) is None:
+        raise FreeLabError("no_glyph", u"%s has no glyph '%s'." % (_font_label(package), value))
+    if value in groups:
+        raise FreeLabError("class_name_clash", u"'%s' is the name of a glyph and of a kerning class (FontLab often names a "
+                           u"class after its key glyph), and FontLab's scripting reads and writes '%s' in a pair as the "
+                           u"class: give @%s to kern the class. A pair of the glyph on its own (an exception) cannot be "
+                           u"read or written through scripting while the names are the same." % (value, value, value))
+    return value, value
+
+
+def _kern_value(kerning, left, right):
+    value = kerning.get((left, right))
+    return None if value is None else float(value)
+
+
+def _pair_side(item):
+    return (u"@" if _text(item.mode) == u"groupMode" else u"") + _text(item.id)
+
+
+@op("kerning")
+def op_kerning(listener, args):
+    """One pair's own value, or a page of the master's pairs; with classes, the master's kerning classes."""
+    package, count = target_package(args)
+    master, masters = _master_arg(package, args)
+    kerning, groups = _kerning(package, master)
+    result = {"font": _font_ref(package), "master": master}
+    left, right = args.get("left"), args.get("right")
+    if (left is None) != (right is None):
+        raise FreeLabError("bad_args", "Give both left and right for one pair, or neither for a page of pairs.")
+    if left is not None:
+        left_key, left_shown = _kern_side(package, groups, left, "left")
+        right_key, right_shown = _kern_side(package, groups, right, "right")
+        result.update({"left": left_shown, "right": right_shown, "value": _kern_value(kerning, left_key, right_key)})
+    else:
+        offset = _int_arg(args, "offset", 0, 0, 10 ** 9)
+        limit = _int_arg(args, "limit", 500, 1, 5000)
+        items = _real_list(kerning.items(), "fgKerning.items()")
+        page = []
+        for pair, value in items[offset:offset + limit]:
+            page.append({"left": _pair_side(pair.left), "right": _pair_side(pair.right), "value": float(value)})
+        result.update({"total": len(items), "offset": offset, "pairs": page, "more": offset + len(page) < len(items)})
+    if args.get("classes"):
+        result["classes"] = dict((_text(name), {"side": _text(entry[1]), "glyphs": [_text(n) for n in entry[0]]})
+                                 for name, entry in groups.items())
+    return result
+
+
+@op("features")
+def op_features(listener, args):
+    """The font's feature tags, in FontLab's order; with tag, that feature's code; with prefix, the prefix's."""
+    package, count = target_package(args)
+    features = package.fgPackage.features
+    tags = [_text(t) for t in _real_list(features.keys(), "features.keys()")]
+    result = {"font": _font_ref(package), "tags": tags, "compiled": "not checked: FontLab compiles feature code when the font is exported"}
+    tag = args.get("tag")
+    if tag is not None:
+        if not isinstance(tag, string_types) or not TAG_RE.match(tag):
+            raise FreeLabError("bad_args", "tag must be four letters or digits, such as liga or ss01.")
+        if _text(tag) not in tags:
+            raise FreeLabError("no_feature", u"%s has no feature '%s'." % (_font_label(package), tag))
+        result["tag"] = _text(tag)
+        result["code"] = _text(features.get_feature(tag))
+    if args.get("prefix"):
+        result["prefix"] = _text(features.get_prefix())
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Writes: one undoable History step each
+# ---------------------------------------------------------------------------
+# FontLab's History, live in 7.2 (docs/FONTLAB7-API.md): a step of notifyChangesApplied(title, objects,
+# True) records each object as it is after the change, and Undo puts back each object's state before that
+# step; an object with none stays as written. So the first write to a font records the font first, as a
+# step of its own ("(before)"), and so does a write after an Undo back to the font's first state. The font
+# recorded recursively holds its layers, kerning, and features, not its glyphs' own properties (name,
+# Unicode values): the glyphs a write changes are recorded too. A script's write leaves the font unmarked,
+# so FontLab could close it without asking: every write marks it (setFlag(2), ofChanged). Nothing here
+# saves, exports, or closes a font.
+
+_RECORDED_FONTS = set()  # fonts (by id) whose whole state a step of this listener recorded
+MAX_CODE_BYTES = 1024 * 1024
+GLYPH_NAME_RE = re.compile(r"^[A-Za-z_.][A-Za-z0-9_.\-]{0,62}\Z")
+ANCHOR_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,63}\Z")
+MAX_COMPONENTS = 32
+MAX_COORD = 32767.0
+
+
+def _without_state(obj):
+    """Whether FontLab's History holds no state of obj to go back to (it is at its first one). True
+    when that cannot be read: the font is then recorded once more, which costs one step."""
+    try:
+        return obj.currentHistoryState() == obj.initialHistoryState()
+    except Exception:
+        return True
+
+
+def _number(args, key, low, high, required=True):
+    value = args.get(key)
+    if value is None:
+        if required:
+            raise FreeLabError("bad_args", "%s is required." % key)
+        return None
+    if isinstance(value, bool) or not isinstance(value, integer_types + (float,)) or value != value or \
+            not low <= value <= high:
+        raise FreeLabError("bad_args", "%s must be a number from %g to %g." % (key, low, high))
+    return value
+
+
+def _whole(value):
+    """A value in FontLab's whole units, halves away from zero (FontLab stored kerning of -19.5 as -20)."""
+    whole = math.floor(abs(value) + 0.5)
+    return float(-whole if value < 0 else whole)
+
+
+def _new_glyph_name(package, args, key):
+    name = args.get(key)
+    if not isinstance(name, string_types) or not GLYPH_NAME_RE.match(name):
+        raise FreeLabError("bad_args", "%s must be a glyph name of up to 63 letters, digits, periods, underscores, and "
+                                       "hyphens, not starting with a digit or hyphen." % key)
+    name = _text(name)
+    if glyph_named(package, name) is not None:
+        raise FreeLabError("name_taken", u"%s already has a glyph '%s'." % (_font_label(package), name))
+    return name
+
+
+def _unicodes_arg(args, key="unicodes"):
+    values = args.get(key)
+    if values is None:
+        return None
+    if not isinstance(values, list) or len(values) > 64:
+        raise FreeLabError("bad_args", "%s must be a list of at most 64 code points (integers)." % key)
+    seen = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, integer_types) or not 0 <= value <= 0x10FFFF or \
+                0xD800 <= value <= 0xDFFF:
+            raise FreeLabError("bad_args", "%s holds %r: each must be a code point from 0 to 10FFFF (hex), not a "
+                                           "surrogate." % (key, value))
+        if value in seen:
+            raise FreeLabError("bad_args", "%s lists U+%04X twice." % (key, value))
+        seen.append(int(value))
+    return seen
+
+
+def _unicodes_free(package, unicodes, glyph=None):
+    """Refuses code points another glyph of the font has. The font's lookup is rebuilt first: FontLab does
+    not update it when a script changes a glyph's Unicode values (live, 2026-11-16)."""
+    package.fgPackage.rebuildMaps()
+    for value in unicodes:
+        other = package.findUnicode(value)
+        if _is_null(other, "the glyph"):
+            continue
+        if glyph is not None and _text(other.name) == _text(glyph.name):
+            continue
+        raise FreeLabError("unicode_taken", u"U+%04X is glyph '%s''s in %s: a code point belongs to one glyph." % (
+            value, _text(other.name), _font_label(package)))
+
+
+def _check_deadline(listener):
+    if listener.deadline is not None and time.time() > listener.deadline:
+        raise FreeLabError("expired", "The client gave up while FontLab checked this change; nothing was changed.")
+
+
+def _layer_arg(glyph, package, args):
+    """The glyph's layer args["layer"] names (default: the font's current master), never created."""
+    wanted = args.get("layer")
+    if wanted is not None and (not isinstance(wanted, string_types) or not wanted):
+        raise FreeLabError("bad_args", "layer must be a layer name, such as a master's.")
+    name = _text(wanted) if wanted is not None else _text(package.master)
+    for layer in _real_list(glyph.layers, "glyph.layers"):
+        if _text(layer.name) == name:
+            return layer
+    raise FreeLabError("no_layer", u"Glyph '%s' has no layer '%s'; its layers: %s. (A font made from a variable font "
+                       u"has a glyph's layers only in the masters where it is drawn.)" % (
+                           _text(glyph.name), name, u", ".join(_layer_names(glyph))))
+
+
+def write_target(args):
+    """target_package for a write or undo: font is required, and font_name, when given, must name the same
+    font (its path, PostScript name, or full name), so an id FontLab gave a font opened since is caught."""
+    package, count = target_package(args, required=True)
+    confirm = args.get("font_name")
+    if confirm is not None:
+        if not isinstance(confirm, string_types) or not confirm.strip():
+            raise FreeLabError("bad_args", "font_name must be the font's path, PostScript name, or full name.")
+        if not _font_matches(package, _text(confirm).strip(), names_only=True):
+            raise FreeLabError("font_mismatch", u"%s is not '%s': nothing was changed." % (_font_label(package), confirm))
+    return package
+
+
+class _NotKept(Exception):
+    """A write's read-back showed FontLab did not keep the change as asked."""
+
+
+class _Write(object):
+    """One write: the font recorded first when its History could not take the write back, the change,
+    then one History step, the font marked modified, and what happened. A change that fails is put back
+    and read back; when that fails too, the change is recorded and marked all the same (fail)."""
+
+    def __init__(self, listener, package, title, glyphs=()):
+        self.fl = _fontlab()
+        self.listener = listener
+        self.package = package
+        self.title = u"FreeLab MCP: " + title
+        self.glyphs = list(glyphs)
+        self.font_id = _font_id(package)
+
+    def begin(self):
+        """Records what Undo needs before anything changes; raises (nothing changed) when FontLab cannot."""
+        _check_deadline(self.listener)
+        objects = []
+        if self.font_id not in _RECORDED_FONTS or _without_state(self.package):
+            objects.append(self.package)
+        objects.extend(glyph for glyph in self.glyphs if _without_state(glyph))
+        if objects:
+            try:
+                self.fl.flItems.notifyChangesApplied(u"%s (before)" % self.title, objects, True)
+            except Exception as exc:
+                raise FreeLabError("history_failed", u"Nothing was changed: FontLab's History could not record the "
+                                   u"font before the change (%s), so Undo could not have taken it back." % _exc_text(exc))
+            if objects[0] is self.package:
+                _RECORDED_FONTS.add(self.font_id)
+
+    def run(self, change, restore, glyphs=(), added=False):
+        """change() makes the change and reads it back (raising _NotKept when FontLab did not keep it);
+        its result is returned. On any failure restore() puts the font back and says whether a read-back
+        shows it so; the error says what became of the change (fail)."""
+        try:
+            return change()
+        except FreeLabError:
+            raise
+        except _NotKept as exc:
+            message = _text(exc)
+        except Exception as exc:
+            message = u"FontLab raised %s during the change" % _exc_text(exc)
+        try:
+            restored = bool(restore())
+        except Exception:
+            restored = False
+        raise self.fail(message, restored, glyphs() if callable(glyphs) else glyphs, added)
+
+    def fail(self, message, restored, glyphs=(), added=False):
+        """The error for a change FontLab did not keep. Put back: nothing changed. Not put back: the change
+        stays, so it is recorded as a step and the font marked, and the error carries that History status."""
+        if restored:
+            return FreeLabError("not_kept", u"%s. It was put back, and a read-back shows the font as it was." % message)
+        status = self.finish(glyphs, added)
+        return FreeLabError("not_kept", u"%s. It could not be put back: what FontLab made of the change is recorded as a "
+                            u"step of its History (Undo takes it back) and the font is marked modified; check it in "
+                            u"FontLab." % message, {"history": status})
+
+    def finish(self, glyphs=(), added=False):
+        """The step recorded, the font marked modified; {recorded, marked_modified, history_state, title, ...}."""
+        glyphs = self.glyphs + [g for g in glyphs if g is not None and g not in self.glyphs]
+        for glyph in glyphs:
+            try:
+                glyph.update()
+            except Exception:
+                pass  # (a redraw)
+        status = {"recorded": True, "marked_modified": True}
+        problems = []
+        try:
+            self.fl.flItems.notifyChangesApplied(self.title, [self.package] + glyphs if glyphs else self.package, True)
+            _RECORDED_FONTS.add(self.font_id)
+        except Exception as exc:
+            status["recorded"] = False
+            _RECORDED_FONTS.discard(self.font_id)
+            problems.append(u"FontLab's History did not record the change (%s): Undo cannot take it back; to drop "
+                            u"it, close the font without saving." % _exc_text(exc))
+        if added:
+            try:
+                self.fl.flItems.notifyPackageContentUpdated(self.package.fgPackage.id)
+            except Exception:
+                pass  # (a redraw: the Font window's list of glyphs)
+        try:
+            self.package.setFlag(2, True)  # ofChanged: FontLab asks to save it before closing it
+        except Exception as exc:
+            status["marked_modified"] = False
+            problems.append(u"FontLab did not mark the font modified (%s): it may close it without asking to save." %
+                            _exc_text(exc))
+        try:
+            status["history_state"] = to_jsonable(self.package.currentHistoryState())
+        except Exception:
+            status["history_state"] = None
+        if problems:
+            status["warning"] = u" ".join(problems)
+        status["title"] = self.title
+        return status
+
+
+def _write_reply(package, write_status, **fields):
+    reply = {"font": _font_ref(package), "changed": True}
+    reply.update(fields)
+    reply["history"] = write_status
+    return reply
+
+
+def _unchanged(package, **fields):
+    reply = {"font": _font_ref(package), "changed": False}
+    reply.update(fields)
+    return reply
+
+
+@op("set_kerning")
+def op_set_kerning(listener, args):
+    package = write_target(args)
+    master, masters = _master_arg(package, args)
+    kerning, groups = _kerning(package, master)
+    left, left_shown = _kern_side(package, groups, args.get("left"), "left")
+    right, right_shown = _kern_side(package, groups, args.get("right"), "right")
+    value = _number(args, "value", -MAX_KERN, MAX_KERN)
+    before = _kern_value(kerning, left, right)
+    pair = {"master": master, "left": left_shown, "right": right_shown}
+    if before is not None and before == _whole(value):  # (FontLab keeps whole units: nothing would change)
+        return _unchanged(package, value=before, **pair)
+    write = _Write(listener, package, u"kerning %s %s" % (left_shown, right_shown))
+    write.begin()
+
+    def change():
+        kerning[(left, right)] = value
+        after = _kern_value(kerning, left, right)
+        if after is None or abs(after - float(value)) > 0.5 + 1e-6:  # (-19.5 read back -20.0, live)
+            raise _NotKept(u"FontLab did not keep the pair (it reads %s)" % after)
+        return after
+
+    def restore():
+        if before is None:
+            kerning.remove((left, right))
+        else:
+            kerning[(left, right)] = before
+        return _kern_value(kerning, left, right) == before
+
+    after = write.run(change, restore)
+    reply = _write_reply(package, write.finish(), before=before, value=after, **pair)
+    if after != float(value):
+        reply["rounded"] = u"FontLab keeps kerning in whole units: %g was stored as %g." % (value, after)
+    return reply
+
+
+@op("remove_kerning")
+def op_remove_kerning(listener, args):
+    package = write_target(args)
+    master, masters = _master_arg(package, args)
+    kerning, groups = _kerning(package, master)
+    left, left_shown = _kern_side(package, groups, args.get("left"), "left")
+    right, right_shown = _kern_side(package, groups, args.get("right"), "right")
+    before = _kern_value(kerning, left, right)
+    if before is None:
+        raise FreeLabError("no_pair", u"%s has no kerning pair %s %s of its own in master '%s'." % (
+            _font_label(package), left_shown, right_shown, master))
+    write = _Write(listener, package, u"remove kerning %s %s" % (left_shown, right_shown))
+    write.begin()
+
+    def change():
+        kerning.remove((left, right))
+        if _kern_value(kerning, left, right) is not None:
+            raise _NotKept(u"FontLab still has the pair after removing it")
+
+    def restore():
+        if _kern_value(kerning, left, right) is None:
+            kerning[(left, right)] = before
+        return _kern_value(kerning, left, right) == before
+
+    write.run(change, restore)
+    return _write_reply(package, write.finish(), master=master, left=left_shown, right=right_shown, before=before, value=None)
+
+
+def _metrics(layer):
+    """(advance width, left sidebearing, right sidebearing or None) of a layer, from its ink box."""
+    width = float(layer.advanceWidth)
+    if not layer.shapesCount:
+        return width, None, None
+    ink = layer.inkBox()
+    if ink.width() <= 0 and ink.height() <= 0:
+        return width, None, None
+    return width, float(ink.x()), width - float(ink.x() + ink.width())
+
+
+def _same_metrics(a, b, tolerance=0.01):
+    return all((x is None and y is None) or (x is not None and y is not None and abs(x - y) <= tolerance)
+               for x, y in zip(a, b))
+
+
+@op("set_metrics")
+def op_set_metrics(listener, args):
+    """A layer's advance width and sidebearings. A left sidebearing moves the outline (its components and
+    anchors with it) by whole units and keeps the right one unless a width or right sidebearing is given."""
+    package = write_target(args)
+    glyph = _find_glyph(package, args, name_key="glyph")
+    layer = _layer_arg(glyph, package, args)
+    width_new = _number(args, "advance_width", 0, 65535, required=False)
+    lsb_new = _number(args, "left_sidebearing", -MAX_COORD, MAX_COORD, required=False)
+    rsb_new = _number(args, "right_sidebearing", -MAX_COORD, MAX_COORD, required=False)
+    given = [v for v in (width_new, lsb_new, rsb_new) if v is not None]
+    if not given:
+        raise FreeLabError("bad_args", "Give advance_width, left_sidebearing, or right_sidebearing.")
+    if len(given) == 3:
+        raise FreeLabError("bad_args", "Give at most two of advance_width, left_sidebearing, and right_sidebearing: "
+                                       "the third follows from them.")
+    width, lsb, rsb = _metrics(layer)
+    if lsb is None and (lsb_new is not None or rsb_new is not None):
+        raise FreeLabError("no_outline", u"Glyph '%s' has no outline in layer '%s', so it has no sidebearings; only its "
+                           u"advance width can be set." % (_text(glyph.name), _text(layer.name)))
+    ink_right = None if lsb is None else width - rsb  # (the ink's right edge)
+    # The outline moves by whole units, so its nodes stay on FontLab's grid; a sidebearing the ink box makes
+    # fractional comes out within half a unit of the one asked, and the reply says so (rounded).
+    if lsb_new is not None:
+        shift = _whole(float(lsb_new) - lsb)
+    elif width_new is not None and rsb_new is not None:
+        shift = _whole((float(width_new) - float(rsb_new)) - ink_right)
+    else:
+        shift = 0.0
+    if width_new is not None:
+        target_width = float(width_new)
+    elif rsb_new is not None:
+        target_width = (ink_right + shift) + float(rsb_new)
+    else:
+        target_width = width + shift  # the right sidebearing kept
+    if target_width < 0:
+        raise FreeLabError("bad_args", "That would make the advance width %g, below 0." % target_width)
+    target = {"advance_width": target_width}
+    if lsb is not None:
+        target["left_sidebearing"] = lsb + shift
+        target["right_sidebearing"] = target_width - (ink_right + shift)
+    before = {"advance_width": width, "left_sidebearing": lsb, "right_sidebearing": rsb}
+    for key, expression in (("left_sidebearing", "metricsLeft"), ("right_sidebearing", "metricsRight"),
+                            ("advance_width", "metricsWidth")):
+        try:
+            formula = _text(getattr(layer, expression) or u"")
+        except Exception:
+            formula = u""
+        if formula and target.get(key) is not None and abs(target[key] - (before[key] or 0.0)) > 1e-6:
+            raise FreeLabError("metrics_expression", u"Layer '%s' of '%s' sets its %s by the expression '%s', which FontLab "
+                               u"would apply again: nothing was changed. Change or clear the expression in FontLab." % (
+                                   _text(layer.name), _text(glyph.name), key.replace("_", " "), formula))
+    # (a shape whose outline data another glyph shares stays put there: moving B's layer left H's outline where it
+    # was, live 2026-11-16, though both shapes pointed to the same flShapeData)
+    if abs(shift) < 1e-9 and abs(target_width - width) < 1e-9:
+        return _unchanged(package, glyph=_text(glyph.name), layer=_text(layer.name), **before)
+    from PythonQt.QtGui import QTransform  # only inside FontLab
+    write = _Write(listener, package, u"metrics of %s" % _text(glyph.name), [glyph])
+    write.begin()
+
+    def change():
+        if shift:
+            layer.applyTransform(QTransform().translate(shift, 0))
+        layer.advanceWidth = target_width
+        after = _metrics(layer)
+        # FontLab keeps whole advance widths (618.2 read back 618.0, live)
+        if abs(after[0] - target_width) > 0.5 + 1e-6 or (after[1] is not None and (
+                abs(after[1] - target["left_sidebearing"]) > 0.5 + 1e-6 or
+                abs(after[2] - target["right_sidebearing"]) > 1.0 + 1e-6)):
+            raise _NotKept(u"FontLab did not keep the metrics (read back: width %s, left %s, right %s)" % after)
+        return after
+
+    def restore():  # measured, not assumed: the move may not have happened
+        now = _metrics(layer)
+        if lsb is not None and now[1] is not None and abs(now[1] - lsb) > 1e-9:
+            layer.applyTransform(QTransform().translate(lsb - now[1], 0))
+        layer.advanceWidth = width
+        return _same_metrics(_metrics(layer), (width, lsb, rsb))
+
+    after_width, after_lsb, after_rsb = write.run(change, restore)
+    after = {"advance_width": after_width, "left_sidebearing": after_lsb, "right_sidebearing": after_rsb}
+    # what was asked, and what was to stay: the other sidebearing when only one value was given
+    expected = {"advance_width": width_new, "left_sidebearing": lsb_new, "right_sidebearing": rsb_new}
+    if len(given) == 1 and lsb is not None:
+        if width_new is not None or rsb_new is not None:
+            expected["left_sidebearing"] = lsb
+        else:
+            expected["right_sidebearing"] = rsb
+    rounded = [key for key, value in expected.items() if value is not None and after[key] is not None and
+               abs(after[key] - value) > 1e-6]
+    reply = _write_reply(package, write.finish(), glyph=_text(glyph.name), layer=_text(layer.name), before=before,
+                         after=after, moved_by=shift)
+    if rounded:
+        reply["rounded"] = u"FontLab keeps whole advance widths, and outlines move by whole units: %s came out as shown " \
+                           u"in after." % u", ".join(key.replace("_", " ") for key in sorted(rounded))
+    return reply
+
+
+def _references(package, name):
+    """Where a glyph name is used outside components: kerning pairs and classes in every master, other
+    classes, and feature code (as a whole word). FontLab's rename does not follow these (live: the
+    pairs were lost on Undo), so a rename is refused while there are any."""
+    found = []
+    masters = [_text(m) for m in _real_list(package.masters, "flPackage.masters")]
+    for master in masters:
+        kerning, groups = _kerning(package, master)
+        pairs = 0
+        for pair in _real_list(kerning.keys(), "fgKerning.keys()"):
+            for item in (pair.left, pair.right):
+                if _text(item.mode) == u"glyphMode" and _text(item.id) == name:
+                    pairs += 1
+                    break
+        if pairs:
+            found.append(u"%d kerning pair%s in master %s" % (pairs, "" if pairs == 1 else "s", master))
+        classes = sorted(c for c, entry in groups.items() if name in [_text(n) for n in entry[0]])
+        if classes:
+            found.append(u"kerning class%s %s in master %s" % ("" if len(classes) == 1 else "es", u", ".join(classes), master))
+    others = sorted(set(_text(entry[1]) for entry in _real_list(package.getAllGroups(), "getAllGroups()")
+                        if not entry[0] and name in [_text(n) for n in entry[4]]))
+    if others:
+        found.append(u"class%s %s" % ("" if len(others) == 1 else "es", u", ".join(others)))
+    features = package.fgPackage.features
+    word = re.compile(u"(?<![A-Za-z0-9_.@\\-])%s(?![A-Za-z0-9_.\\-])" % re.escape(name))  # (@name is a class)
+    tags = [t for t in _real_list(features.keys(), "features.keys()") if word.search(_text(features.get_feature(t)))]
+    if word.search(_text(features.get_prefix())):
+        tags.insert(0, u"prefix")
+    if tags:
+        found.append(u"feature code (%s)" % u", ".join(_text(t) for t in tags))
+    return found
+
+
+@op("rename_glyph")
+def op_rename_glyph(listener, args):
+    package = write_target(args)
+    glyph = _find_glyph(package, args, name_key="glyph")
+    old = _text(glyph.name)
+    if args.get("new_name") == old:
+        return _unchanged(package, glyph=old)
+    new = _new_glyph_name(package, args, "new_name")
+    used = _references(package, old)
+    if used:
+        raise FreeLabError("glyph_in_use", u"Glyph '%s' is used by %s: FontLab's rename would leave those pointing to the "
+                           u"old name, so nothing was renamed." % (old, u"; ".join(used)))
+    write = _Write(listener, package, u"rename %s to %s" % (old, new), [glyph])
+    write.begin()
+
+    def renamed(name, gone):
+        package.fgPackage.rebuildMaps()
+        return glyph_named(package, name) is not None and glyph_named(package, gone) is None
+
+    def change():
+        if not package.renameGlyph(glyph.fgGlyph, new, True):
+            raise _NotKept(u"FontLab refused to rename '%s'" % old)
+        if not renamed(new, old):
+            raise _NotKept(u"FontLab's glyph list does not show '%s' renamed to '%s'" % (old, new))
+
+    def restore():
+        if _text(glyph.name) != old:
+            package.renameGlyph(glyph.fgGlyph, old, True)
+        return renamed(old, new)
+
+    write.run(change, restore)
+    return _write_reply(package, write.finish(), glyph=new, before=old,
+                        note="Components that use the glyph follow the new name (FontLab updates them).")
+
+
+@op("set_unicodes")
+def op_set_unicodes(listener, args):
+    package = write_target(args)
+    glyph = _find_glyph(package, args, name_key="glyph")
+    unicodes = _unicodes_arg(args)
+    if unicodes is None:
+        raise FreeLabError("bad_args", "unicodes is required: a list of code points (an empty list clears them).")
+    reads = _Reads()
+    before = _unicodes(glyph, reads)
+    if before is None:
+        raise FreeLabError("unreadable", "The glyph's Unicode values could not be read; nothing was changed.")
+    if before == unicodes:
+        return _unchanged(package, glyph=_text(glyph.name), unicodes=before)
+    _unicodes_free(package, unicodes, glyph)
+    write = _Write(listener, package, u"Unicode values of %s" % _text(glyph.name), [glyph])
+    write.begin()
+
+    def change():
+        glyph.fgGlyph.unicodes = unicodes
+        package.fgPackage.rebuildMaps()
+        after = _unicodes(glyph, _Reads())
+        if after != unicodes:
+            raise _NotKept(u"FontLab did not keep the Unicode values (read back %s)" % (after,))
+        return after
+
+    def restore():
+        glyph.fgGlyph.unicodes = before
+        package.fgPackage.rebuildMaps()
+        return _unicodes(glyph, _Reads()) == before
+
+    after = write.run(change, restore)
+    return _write_reply(package, write.finish(), glyph=_text(glyph.name), before=before, unicodes=after)
+
+
+def _components_arg(package, args, new_name):
+    parts = args.get("components")
+    if not isinstance(parts, list) or not 1 <= len(parts) <= MAX_COMPONENTS:
+        raise FreeLabError("bad_args", "components must be a list of 1 to %d {glyph, x, y} objects." % MAX_COMPONENTS)
+    out = []
+    for index, part in enumerate(parts):
+        if not isinstance(part, dict) or set(part) - set(["glyph", "x", "y"]):
+            raise FreeLabError("bad_args", "components[%d] must be an object with glyph, and x and y (offsets, 0 when "
+                                           "left out), and nothing else." % index)
+        name = part.get("glyph")
+        if not isinstance(name, string_types) or not name:
+            raise FreeLabError("bad_args", "components[%d].glyph must be a glyph name." % index)
+        name = _text(name)
+        if name == new_name:
+            raise FreeLabError("bad_args", "A glyph cannot be made of itself.")
+        base = glyph_named(package, name)
+        if base is None:
+            raise FreeLabError("no_glyph", u"%s has no glyph '%s' (components[%d])." % (_font_label(package), name, index))
+        x = _number(part, "x", -MAX_COORD, MAX_COORD, required=False) or 0
+        y = _number(part, "y", -MAX_COORD, MAX_COORD, required=False) or 0
+        out.append((name, base, float(x), float(y)))
+    return out
+
+
+@op("add_component_glyph")
+def op_add_component_glyph(listener, args):
+    """A new glyph made of components of the font's glyphs, in every master where each of them has a layer."""
+    fl = _fontlab()
+    package = write_target(args)
+    name = _new_glyph_name(package, args, "name")
+    parts = _components_arg(package, args, name)
+    unicodes = _unicodes_arg(args) or []
+    width_given = _number(args, "advance_width", 0, 65535, required=False)
+    masters = [_text(m) for m in _real_list(package.masters, "flPackage.masters")]
+    plans, skipped = [], []
+    for master in masters:
+        layers = [base.getLayerByName(master, False) for _n, base, _x, _y in parts]
+        if any(_is_null(layer, "a layer") for layer in layers):
+            skipped.append(master)
+            continue
+        width = float(width_given) if width_given is not None else float(layers[0].advanceWidth)
+        plans.append((master, width))
+    if not plans:
+        raise FreeLabError("no_master", u"No master has a layer in every component's glyph (%s); nothing was added." %
+                           u", ".join(n for n, _b, _x, _y in parts))
+    if unicodes:
+        _unicodes_free(package, unicodes)
+    from PythonQt.QtGui import QTransform  # only inside FontLab
+    write = _Write(listener, package, u"add %s" % name)
+    write.begin()
+
+    def change():
+        new = fl.flGlyph()
+        new.name = name
+        package.addGlyph(new)  # FontLab adds a copy without layers: they are made on the font's glyph
+        glyph = glyph_named(package, name)
+        if glyph is None:
+            raise _NotKept(u"FontLab did not add '%s'" % name)
+        built = []
+        for master, width in plans:
+            components = []
+            for base_name, _base, x, y in parts:
+                component = fl.GlyphComponent(base_name)
+                component.transform = QTransform().translate(x, y)
+                components.append(component)
+            layer = glyph.getLayerByName(master, True)
+            layer.setGlyphComponents(components, width, package, False)
+            if layer.shapesCount != len(parts):
+                raise _NotKept(u"FontLab kept %d of the %d components in master %s" % (layer.shapesCount, len(parts), master))
+            built.append({"master": master, "advance_width": float(layer.advanceWidth)})
+        if unicodes:  # last: given before the layers are made, FontLab kept none of them (live, 2026-11-11)
+            glyph.fgGlyph.unicodes = unicodes
+            package.fgPackage.rebuildMaps()
+        return glyph, built
+
+    def restore():
+        glyph = glyph_named(package, name)
+        if glyph is not None:
+            package.deleteGlyph(glyph)
+            package.fgPackage.rebuildMaps()
+        return glyph_named(package, name) is None
+
+    glyph, built = write.run(change, restore, glyphs=lambda: [glyph_named(package, name)], added=True)
+    return _write_reply(package, write.finish([glyph], added=True), glyph=name, unicodes=unicodes,
+                        components=[{"glyph": n, "x": x, "y": y} for n, _b, x, y in parts], masters=built,
+                        skipped_masters=skipped)
+
+
+def _anchor_at(layer, name):
+    found = layer.findAnchor(name)
+    return None if found is None else (found.point.x(), found.point.y())
+
+
+@op("set_anchor")
+def op_set_anchor(listener, args):
+    package = write_target(args)
+    glyph = _find_glyph(package, args, name_key="glyph")
+    layer = _layer_arg(glyph, package, args)
+    name = args.get("name")
+    if not isinstance(name, string_types) or not ANCHOR_NAME_RE.match(name):
+        raise FreeLabError("bad_args", "name must be an anchor name of 1 to 63 letters, digits, periods, underscores, "
+                                       "and hyphens, such as top or _top.")
+    name = _text(name)
+    x = float(_number(args, "x", -MAX_COORD, MAX_COORD))
+    y = float(_number(args, "y", -MAX_COORD, MAX_COORD))
+    from PythonQt.QtCore import QPointF  # only inside FontLab
+    was = _anchor_at(layer, name)
+    before = None if was is None else {"x": was[0], "y": was[1]}
+    if was == (x, y):
+        return _unchanged(package, glyph=_text(glyph.name), layer=_text(layer.name), anchor=name, x=x, y=y)
+    write = _Write(listener, package, u"anchor %s of %s" % (name, _text(glyph.name)), [glyph])
+    write.begin()
+
+    def change():
+        existing = layer.findAnchor(name)
+        if existing is None:
+            pin = _fontlab().flPinPoint(QPointF(x, y))
+            pin.name = name
+            layer.addAnchor(pin)
+        else:
+            existing.point = QPointF(x, y)
+        if _anchor_at(layer, name) != (x, y):
+            raise _NotKept(u"FontLab did not keep anchor '%s' at (%g, %g)" % (name, x, y))
+
+    def restore():
+        found = layer.findAnchor(name)
+        if was is None and found is not None:
+            layer.removeAnchor(found)
+        elif was is not None and found is not None:
+            found.point = QPointF(was[0], was[1])
+        return _anchor_at(layer, name) == was
+
+    write.run(change, restore)
+    return _write_reply(package, write.finish(), glyph=_text(glyph.name), layer=_text(layer.name), anchor=name,
+                        before=before, x=x, y=y)
+
+
+@op("remove_anchor")
+def op_remove_anchor(listener, args):
+    package = write_target(args)
+    glyph = _find_glyph(package, args, name_key="glyph")
+    layer = _layer_arg(glyph, package, args)
+    name = args.get("name")
+    if not isinstance(name, string_types) or not name:
+        raise FreeLabError("bad_args", "name must be the anchor's name.")
+    name = _text(name)
+    was = _anchor_at(layer, name)
+    if was is None:
+        raise FreeLabError("no_anchor", u"Layer '%s' of '%s' has no anchor '%s'." % (_text(layer.name), _text(glyph.name), name))
+    from PythonQt.QtCore import QPointF  # only inside FontLab
+    write = _Write(listener, package, u"remove anchor %s of %s" % (name, _text(glyph.name)), [glyph])
+    write.begin()
+
+    def change():
+        layer.removeAnchor(layer.findAnchor(name))
+        if layer.findAnchor(name) is not None:
+            raise _NotKept(u"FontLab still has anchor '%s' after removing it" % name)
+
+    def restore():
+        if layer.findAnchor(name) is None:  # a new pin: the removed one may be gone
+            pin = _fontlab().flPinPoint(QPointF(was[0], was[1]))
+            pin.name = name
+            layer.addAnchor(pin)
+        return _anchor_at(layer, name) == was
+
+    write.run(change, restore)
+    return _write_reply(package, write.finish(), glyph=_text(glyph.name), layer=_text(layer.name), anchor=name,
+                        before={"x": was[0], "y": was[1]})
+
+
+def _feature_block(tag, code):
+    """None when code is exactly one top-level block, feature tag { ... } tag; (with comments and blank lines
+    around it); else why not. Braces are matched outside comments, and nothing else may stand outside the
+    block: another feature, a lookup, a languagesystem line, or FontLab's #> and #< markers would ride
+    along into the font's feature code."""
+    n, i = len(code), 0
+
+    def skip_space_and_comments(i, markers_allowed):
+        while i < n:
+            if code[i].isspace():
+                i += 1
+            elif code[i] == u"#":
+                end = code.find(u"\n", i)
+                end = n if end < 0 else end
+                if not markers_allowed and re.match(u"#\\s*/?\\s*[<>]", code[i:end]):
+                    return -1
+                i = end
+            else:
+                break
+        return i
+
+    i = skip_space_and_comments(i, False)
+    if i < 0:
+        return u"FontLab's #> and #< markers belong inside a block, not around it"
+    head = re.compile(u"feature\\s+%s\\s*\\{" % tag).match(code, i)
+    if head is None:
+        return u"it must start with feature %s {" % tag
+    i, depth = head.end(), 1
+    while i < n and depth:
+        c = code[i]
+        if c == u"#":
+            end = code.find(u"\n", i)
+            i = n if end < 0 else end
+            continue
+        if c == u"{":
+            depth += 1
+        elif c == u"}":
+            depth -= 1
+        i += 1
+    if depth:
+        return u"its braces do not close"
+    tail = re.compile(u"\\s*%s\\s*;" % tag).match(code, i)
+    if tail is None:
+        return u"its closing brace must be followed by %s;" % tag
+    i = skip_space_and_comments(tail.end(), False)
+    if i < 0:
+        return u"FontLab's #> and #< markers belong inside a block, not around it"
+    if i < n:
+        return u"there is more code after the block (one feature per call)"
+    return None
+
+
+@op("set_feature")
+def op_set_feature(listener, args):
+    """A feature's code, as FontLab keeps it: the whole block, feature tag { ... } tag;. Not compiled."""
+    package = write_target(args)
+    tag = args.get("tag")
+    if not isinstance(tag, string_types) or not TAG_RE.match(tag):
+        raise FreeLabError("bad_args", "tag must be four letters or digits, such as liga or ss01.")
+    tag = _text(tag)
+    code = args.get("code")
+    if not isinstance(code, string_types) or len(_bytes(code)) > MAX_CODE_BYTES:
+        raise FreeLabError("bad_args", "code must be text of at most 1 MB.")
+    code = _text(code)
+    problem = _feature_block(tag, code)
+    if problem:
+        raise FreeLabError("bad_args", u"code must be one whole feature block, as FontLab keeps it: feature %s { ... } %s; "
+                           u"(comments around it allowed), and %s." % (tag, tag, problem))
+    features = package.fgPackage.features
+    tags = [_text(t) for t in _real_list(features.keys(), "features.keys()")]
+    before = _text(features.get_feature(tag)) if tag in tags else None
+    if before is not None and _same_code(before, code):
+        return _unchanged(package, tag=tag, created=False)
+    write = _Write(listener, package, u"feature %s" % tag)
+    write.begin()
+
+    def change():
+        features.set_feature(tag, code)
+        stored = _text(features.get_feature(tag))
+        if not _same_code(stored, code):
+            raise _NotKept(u"FontLab did not keep the code of %s as given" % tag)
+        return stored
+
+    def restore():
+        if before is None:
+            features.remove(tag)
+            return tag not in [_text(t) for t in _real_list(features.keys(), "features.keys()")]
+        features.set_feature(tag, before)
+        return _text(features.get_feature(tag)) == before
+
+    stored = write.run(change, restore)
+    return _write_reply(package, write.finish(), tag=tag, created=before is None, before=before, code=stored,
+                        compiled="not checked: FontLab compiles feature code when the font is exported")
+
+
+def _same_code(stored, given):
+    """The same feature code as FontLab keeps it: line breaks as \\n (given as \\r\\n, they may come back
+    either way), and a line break at the end (given without one, FontLab adds it: live)."""
+    def norm(text):
+        text = text.replace(u"\r\n", u"\n").replace(u"\r", u"\n")
+        return text if text.endswith(u"\n") else text + u"\n"
+    return norm(stored) == norm(given)
+
+
+def _main_window_action(name):
+    from PythonQt.QtGui import QApplication, QAction  # only inside FontLab
+    for widget in QApplication.instance().topLevelWidgets():
+        if widget.metaObject().className() == "MainWindow":
+            for action in widget.findChildren(QAction):
+                if _text(_prop(action, "objectName")) == name:
+                    return action
+    return None
+
+
+@op("undo")
+def op_undo(listener, args):
+    """FontLab's Edit > Undo on the font in front, which must be the font named. With expected_state and
+    expected_title (a write's history.history_state and history.title), only while the font's History
+    is still at that state and the step Undo would take back is that write's."""
+    package = write_target(args)
+    fl = _fontlab()
+    current = fl.flWorkspace.instance().currentPackage
+    if _is_null(current, "the current font") or _font_id(current) != _font_id(package):
+        raise FreeLabError("not_in_front", u"FontLab's Undo acts on the font in front, and that is not %s: bring it to "
+                           u"the front in FontLab first (click its tab)." % _font_label(package))
+    expected = args.get("expected_state")
+    if expected is not None and (isinstance(expected, bool) or not isinstance(expected, integer_types)):
+        raise FreeLabError("bad_args", "expected_state must be an integer: a history_state a write reported.")
+    expected_title = args.get("expected_title")
+    if expected_title is not None and (not isinstance(expected_title, string_types) or not expected_title.strip()):
+        raise FreeLabError("bad_args", "expected_title must be the history.title a write reported.")
+    state = package.currentHistoryState()
+    if expected is not None and state != expected:
+        raise FreeLabError("history_moved", u"The font's History is at state %s, not %s: something else changed it "
+                           u"since; nothing was undone." % (state, expected))
+    _check_deadline(listener)
+    undo, redo = _main_window_action("actionUndo"), _main_window_action("actionRedo")
+    if undo is None or redo is None:
+        raise FreeLabError("not_found", "FontLab's Edit > Undo or Redo was not found; nothing was undone.")
+    if not _prop(undo, "enabled"):
+        raise FreeLabError("nothing_to_undo", "FontLab's Edit > Undo is unavailable: there is nothing to undo.")
+    top = _step_title(undo, u"Undo")
+    if expected_title is not None and top.lower() != _text(expected_title).strip().lower():
+        # (a step that records only glyphs, such as a write's leftover "(before)", leaves the state as it was)
+        raise FreeLabError("history_moved", u"The step Undo would take back is '%s', not '%s': nothing was undone." % (
+            top, expected_title))
+    undone = []
+    while True:
+        title = _step_title(undo, u"Undo")
+        redo_before = _step_title(redo, u"Redo") if _prop(redo, "enabled") else None
+        state_before = package.currentHistoryState()
+        undo.trigger()
+        redo_after = _step_title(redo, u"Redo") if _prop(redo, "enabled") else None
+        # each step Undo takes back becomes the one Redo puts back; when Redo named a step of the same title
+        # already, the font's state has to move too (two such steps in a row that record glyphs only are
+        # the one case this cannot tell apart)
+        if redo_after != title or (redo_before == title and package.currentHistoryState() == state_before):
+            if undone:
+                break
+            raise FreeLabError("not_kept", u"FontLab's Undo of '%s' did not take: nothing was undone." % title)
+        undone.append(title)
+        # A write's "(before)" step only recorded the font before it and changed nothing: it goes with the
+        # write, so that each write is one Undo. One left alone (a write refused after it) goes on its own.
+        following = _step_title(undo, u"Undo") if _prop(undo, "enabled") else u""
+        if _before_step(title) or following.lower() != (title + u" (before)").lower():
+            break  # (only the write's own: an earlier one left alone stays a step of its own)
+    reply = {"font": _font_ref(package), "undone": undone, "history_state_before": to_jsonable(state),
+             "history_state": to_jsonable(package.currentHistoryState()),
+             "next_undo": _step_title(undo, u"Undo") if _prop(undo, "enabled") else None}
+    if _before_step(undone[0]):
+        reply["note"] = (u"That step only recorded the font before a FreeLab MCP write that did not happen; it "
+                         u"changed nothing. Undo again to take back the step before it.")
+    return reply
+
+
+def _step_title(action, verb):
+    """The History step an Undo or Redo action names ("&Undo FreeLab MCP: kerning A V" -> its title)."""
+    text = _MNEMONIC.sub(r"\1", _text(_prop(action, "text") or u"")).strip()
+    if text.lower().startswith(verb.lower()):
+        text = text[len(verb):].strip()
+    return text
+
+
+def _before_step(title):
+    """Whether a step is a FreeLab MCP write's "(before)" step (FontLab shows titles in title case)."""
+    lowered = title.lower()
+    return lowered.startswith(u"freelab mcp:") and lowered.endswith(u"(before)")
 
 
 class _Capture(object):
@@ -1027,7 +2225,7 @@ class Listener(object):
             name = request.get("op")
             handler = OPS.get(name)
             if handler is None:
-                raise FreeLabError("unknown_op", u"Unknown operation %r." % (_text(name),))
+                raise FreeLabError("unknown_op", u"Unknown operation '%s'." % (_text(name),))
             args = request.get("args")
             if args is None:
                 args = {}
@@ -1038,7 +2236,10 @@ class Listener(object):
             result = handler(self, args)
             return {"id": request_id, "ok": True, "result": to_jsonable(result)}
         except FreeLabError as exc:
-            return {"id": request_id, "ok": False, "error": {"code": exc.code, "message": _text(exc.message)}}
+            error = {"code": exc.code, "message": _text(exc.message)}
+            if exc.data is not None:
+                error["data"] = to_jsonable(exc.data)
+            return {"id": request_id, "ok": False, "error": error}
         except Exception:
             return {"id": request_id, "ok": False, "error": {"code": "exception", "message": _format_exc()}}
 

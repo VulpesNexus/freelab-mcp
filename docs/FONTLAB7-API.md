@@ -2,34 +2,82 @@
 
 Every FontLab member the listener touches, where it comes from, and how far it is proven. The source is FontLab's own FontLab 7 reference, archived at [fontlabcom/fontlab-python-docs](https://github.com/fontlabcom/fontlab-python-docs) under *docs/archive/fontlab7/* (*fontlab.html*, *fontgate.html*), and the module-level names FontLab 7 imports in its own *startupScript.py*.
 
-Proof levels: **documented** (in the FontLab 7 reference), **stub-tested** (the listener uses it and the spy fakes accept only it), **live** (run in FontLab 7.2 and checked against what FontLab shows). Only the listener loop is live so far; the font reads still need a test font.
+Proof levels: **documented** (in the FontLab 7 reference), **stub-tested** (the listener uses it and the spy fakes accept only it), **live** (run in FontLab 7.2 and checked against what FontLab shows). Every member below is stub-tested; the level column says how far beyond that it goes.
+
+The reads were proven live on 2026-11-16 on six corpus fonts, each opened from its file and never saved: Varela Round (TrueType, 824 glyphs, composites, anchors), UnicodiaDaarage (CFF, 616 glyphs), Rubik (a variable TrueType: masters Light, Bold, and Black, 1,174 glyphs), Tsukimi Rounded (Japanese, 530 glyphs), Noto Sans Hebrew (right-to-left, a variable font with four masters, 470 glyphs), and Amiri (Arabic, 6,710 glyphs). Every glyph of each, 9,824 in all, was read through `glyph` and `outline` with no error and nothing unreadable; for the static fonts, every advance width and every glyph's code points matched the font file as fontTools reads it (where FontLab kept the file's glyph name: all of them but one in Tsukimi Rounded and 5,091 unnamed glyphs in Amiri, which FontLab names `_1205` and so on), and all 15,683 component shapes named their glyph. The writes were proven live on Amiri (one master) and Rubik (three masters, writes in a master other than the current one), each one read back and then undone through `undo`, with the font read back again.
 
 | Object | Member | Kind | Used by | Level |
 |---|---|---|---|---|
-| `fontlab` module | `CountFonts()` | function | `status`, every font op | documented (startup script), stub-tested |
-| `fontlab` module | `ApplicationPath()` | function | `ping` | documented (startup script), stub-tested |
-| `fontlab.flWorkspace` | `instance()` | static method | every font op | documented, stub-tested |
-| `flWorkspace` | `currentPackage` | property, `flPackage` | every font op | documented, stub-tested |
-| `flWorkspace` | `hasChanges` | property, bool | `unsaved`, `quit` | documented, stub-tested, **live** (2026-11-07): a bool |
-| `flWorkspace` | `packages()` | method, list of `flObject`, one per open font | `unsaved`, `quit` | documented, stub-tested, **live** (2026-11-07): a real Python list of `flObject` |
-| `flObject` (a package) | `hasChanges` | property, bool | `unsaved`, `quit` | stub-tested, **live** (2026-11-07): stayed `False` after an edit to the font, as did `isChanged`, the workspace's `hasChanges`, and every window's `windowModified` |
-| `flObject` (a package) | `hasHistoryStates` | property, bool | `unsaved`, `quit` | documented, stub-tested, **live** (2026-11-07): `True` after that edit, and FontLab asked whether to save the font on closing: `quit` goes ahead and leaves that question on screen for the user (it may stay `True` after saving, and the question then simply does not appear) |
-| `flPackage` | `tfn`, `tsn`, `psn`, `ffn`, `path`, `upm`, `glyphsCount`, `master`, `mastersCount`, `versionMajor`, `versionMinor`, `hasChanges`, `isNull` | properties | `font_info`, `status` | documented, stub-tested |
-| `flPackage` | `findName(name)` | method, `flGlyph` | `glyph`, `outline` | documented, stub-tested |
-| `flPackage` | `findUnicode(codepoint)` | method, `flGlyph` | `glyph`, `outline` | documented, stub-tested |
-| `flPackage` | `fgPackage` | property, `fgFont` | `glyph_names` | documented, stub-tested |
-| `fgFont` | `keys()` | method, list of names | `glyph_names` | documented, stub-tested |
-| `flGlyph` | `name`, `layers` (list), `activeLayer`, `fgGlyph`, `mark`, `tags`, `note`, `isNull` | properties | `glyph`, `outline` | documented, stub-tested |
-| `fgGlyph` | `unicodes` | property, list of int | `glyph` | documented, stub-tested |
-| `flLayer` | `name`, `shapes` (list), `advanceWidth`, `boundingBox` (`QRectF`), `shapesCount`, `isNull` | properties | `glyph`, `outline` | documented, stub-tested |
-| `flLayer` | `nodesCount()` | method, int | `glyph` | documented, stub-tested |
-| `flShape` | `name`, `isComponent`, `transform` (`QTransform`), `contours` (list) | properties | `outline` | documented, stub-tested |
-| `flContour` | `closed` | property | `outline` | documented, stub-tested |
-| `flContour` | `nodes()` | method, list of `flNode` | `outline` | documented, stub-tested |
-| `flNode` | `x`, `y`, `type`, `smooth` | properties | `outline` | documented, stub-tested |
+| `fontlab` module | `CountFonts()` | function | `status`, `font_info` and the reads without `font` | documented (startup script), **live** |
+| `fontlab` module | `ApplicationPath()` | function | `ping` | documented (startup script), **live** |
+| `fontlab.flWorkspace` | `instance()` | static method | every font op | documented, **live** |
+| `flWorkspace` | `currentPackage` | property, `flPackage` | the reads without `font`, `fonts`, `undo` | documented, **live**: with no font open, an object whose `isNull` is `True`, never `None` |
+| `flWorkspace` | `hasChanges` | property, bool | `unsaved`, `quit` | documented, **live** (2026-11-07): a bool |
+| `flWorkspace` | `packages()` | method, list of `flObject`, one per open font | `unsaved`, `quit`, `fonts`, every op given `font` | documented, **live** (2026-11-07): a real Python list of `flObject` |
+| `fontlab` module | `flPackage(flObject)` | constructor | `fonts`, every op given `font` | **live**: wraps an open font (never call it without an argument: that makes a new font) |
+| `flObject` (a package) | `hasChanges` | property, bool | `unsaved`, `quit` | **live** (2026-11-07): stayed `False` after an edit to the font, as did `isChanged`, the workspace's `hasChanges`, and every window's `windowModified` |
+| `flObject` (a package) | `hasHistoryStates` | property, bool | `unsaved`, `quit` | documented, **live** (2026-11-07): `True` after that edit, and FontLab asked whether to save the font on closing: `quit` goes ahead and leaves that question on screen for the user (it may stay `True` after saving, and the question then simply does not appear) |
+| `flPackage` | `tfn`, `tsn`, `psn`, `ffn`, `path`, `upm`, `glyphsCount`, `master`, `mastersCount`, `versionMajor`, `versionMinor`, `hasChanges`, `isNull` | properties | `font_info`, `status`, `fonts` | documented, **live**: `path` mixes separators (*…\corpus/VarelaRound-Regular.ttf*); `hasChanges` is `True` once a write has called `setFlag(2, True)` |
+| `flPackage` | `masters` | property, list of master names | `font_info`, kerning, writes | **live**: a list (not a method); Rubik lists Light, Bold, Black, though a glyph may have layers in only some of them |
+| `flPackage` | `findName(name)` | method, `flGlyph` or `None` | `glyph`, `outline`, every write | documented, **live** |
+| `flPackage` | `findUnicode(codepoint)` | method, `flGlyph` or `None` | `glyph`, `outline`, `set_unicodes`, `add_component_glyph` | documented, **live**: stale after a script changes a glyph's code points, until `fgPackage.rebuildMaps()` |
+| `flPackage` | `fgPackage` | property, `fgFont` | `glyph_names`, `fonts`, writes | documented, **live** |
+| `fgFont` | `keys()` | method, list of names | `glyph_names` | documented, **live** |
+| `fgFont` | `id` | property, int | `fonts` (a font's id), every write | **live**: FontLab's number for an open font, the same through every wrapper (16386, 17728, … here) |
+| `fgFont` | `rebuildMaps()` | method | `set_unicodes`, `rename_glyph`, `add_component_glyph` | documented, **live**: makes `findUnicode` see code points a script set |
+| `fgFont` | `features`: `keys()`, `get_feature(tag)`, `set_feature(tag, code)`, `get_prefix()`, `remove(tag)` | `fgOTLayout` | `features`, `set_feature`, `rename_glyph` | documented, **live**: `get_feature` returns the whole block (`feature ss05 { … } ss05;`); `set_feature` stores the text as given, with a line break added at the end when it has none; a new tag goes last; `remove` takes a feature out (used only to take back a write FontLab did not keep) |
+| `flPackage` | `kerning(master)` | method, `fgKerning` | `kerning`, `set_kerning`, `remove_kerning`, `rename_glyph` | **live** (2026-11-08 and here) |
+| `fgKerning` | `keys()`, `items()` | methods, real lists of `fgKerningObjectPair` (and values) | `kerning`, `rename_glyph` | **live**: each side has `id` and `mode` (`glyphMode` or `groupMode`) |
+| `fgKerning` | `get((left, right))`, `kerning[(left, right)] = value`, `remove((left, right))` | methods | `kerning`, `set_kerning`, `remove_kerning` | **live**: a name that is also a class's is taken as the class (see below); values are kept in whole units (−19.5 read back −20) |
+| `fgKerning` | `groups.asDict()` | method, dict of name → (glyph names, side) | `kerning`, writes | **live**: sides `KernLeft`, `KernRight`, `KernBothSide` |
+| `flPackage` | `getAllGroups()` | method, list of `(kern class, name, id, mark, glyph names)` | `rename_glyph` | **live** (2026-11-08) |
+| `flPackage` | `renameGlyph(fgGlyph, name, True)` | method, bool | `rename_glyph` | documented, **live**: see below |
+| `flPackage` | `addGlyph(flGlyph)` | method | `add_component_glyph` | documented, **live**: adds a copy without layers |
+| `flPackage` | `deleteGlyph(flGlyph)` | method | `add_component_glyph` (taking out a glyph FontLab did not build) | documented, **live** in FreeLab (2026-11-10); the listener's use is stub-tested only |
+| `flPackage` | `setFlag(2, True)` | method | every write | **live**: marks the font modified (`hasChanges` `True`) |
+| `flPackage`, `flGlyph` | `currentHistoryState()`, `initialHistoryState()` | methods, int | every write, `undo` | **live**: a state is a number that grows with each step (an Undo goes back to the earlier number; a step after an Undo gets a new one) |
+| `fontlab` module | `flGlyph()`, then `name` | constructor, settable property | `add_component_glyph` | **live** |
+| `flGlyph` | `name`, `layers` (list), `activeLayer`, `fgGlyph`, `mark`, `tags`, `note`, `isNull` | properties | `glyph`, `outline` | documented, **live** |
+| `flGlyph` | `getLayerByName(name, create)` | method, `flLayer` or `None` | `add_component_glyph` | documented, **live** |
+| `flGlyph` | `update()` | method | every write that changes a glyph | documented, **live** (a redraw) |
+| `fgGlyph` | `unicodes` | property, list of int, settable | `glyph`, `set_unicodes`, `add_component_glyph` | documented, **live**: code points above U+FFFF read and set as integers in the narrow build |
+| `flLayer` | `name`, `shapes` (list), `boundingBox` (`QRectF`), `shapesCount`, `isNull` | properties | `glyph`, `outline` | documented, **live**: `boundingBox` is the box of every node, off-curve points included, widened by 0.001 on each side |
+| `flLayer` | `inkBox()` | method, `QRectF` | `glyph`, `set_metrics` | documented, **live**: the outline's extremes, curves measured; FontLab's own `getSB` agreed with it on every font tried (Amiri `A`: right sidebearing −6.2, where `boundingBox` gave −7) |
+| `flLayer` | `advanceWidth` | property, settable | `glyph`, `set_metrics`, `add_component_glyph` | documented, **live**: FontLab keeps whole numbers (618.2 read back 618.0) |
+| `flLayer` | `nodesCount()` | method, int | `glyph` | documented, **live**: equal to `outline`'s node count on every glyph swept |
+| `flLayer` | `applyTransform(QTransform)` | method | `set_metrics` | **live**: a translation moves outline nodes, component offsets, and anchors |
+| `flLayer` | `metricsLeft`, `metricsRight`, `metricsWidth` | properties, text | `set_metrics` | **live** as reads (empty on every font tried); the refusal of a layer with an expression is stub-tested only |
+| `flLayer` | `anchors`, `findAnchor(name)`, `addAnchor(flPinPoint)`, `removeAnchor(flPinPoint)` | list, methods | `glyph`, `set_anchor`, `remove_anchor` | documented, **live**: `findAnchor` returns `None` for a name the layer lacks |
+| `fontlab` module | `flPinPoint(QPointF)`, then `name`, `point` | constructor, settable properties | `set_anchor` | **live** (2026-11-10 and here) |
+| `flLayer` | `setGlyphComponents([GlyphComponent], width, package, False)` | method | `add_component_glyph` | documented, **live** |
+| `fontlab` module | `GlyphComponent(name)`, then `transform` | constructor, settable property | `add_component_glyph` | **live** |
+| `flShape` | `name`, `isComponent`, `transform` (`QTransform`), `contours` (list) | properties | `outline` | documented, **live**: a component's contours are its glyph's, in that glyph's coordinates; its transform places them |
+| `flShape` | `shapeData.componentGlyph` | property, text | `glyph`, `outline` | **live**: the glyph a component draws, for imported composites and for components made by `setGlyphComponents` alike |
+| `flContour` | `closed` | property | `outline` | documented, **live** |
+| `flContour` | `nodes()` | method, list of `flNode` | `outline` | documented, **live** |
+| `flNode` | `x`, `y`, `type`, `smooth` | properties | `outline` | documented, **live**: types `on`, `off`, and `curve` |
+| `fontlab.flItems` | `notifyChangesApplied(title, objects, True)` | static method | every write | **live** (2026-11-10, 2026-11-14, and here) |
+| `fontlab.flItems` | `notifyPackageContentUpdated(fgPackage.id)` | static method | `add_component_glyph` | **live** (2026-11-10) |
 | `PythonQt.QtCore` | `QTimer`: `setInterval`, `setSingleShot`, `connect("timeout()", …)` (falling back to `timeout.connect(…)` if that raises or returns `False`), `start`, `stop` | Qt | the listener loop, `quit` | **live** (2026-11-06): `connect("timeout()", ...)` works |
-| `PythonQt.QtGui` | `QApplication.instance()`, `topLevelWidgets()`, `metaObject().className()`, `close()` | Qt | `quit` | stub-tested; **live** (2026-11-07): the main window's class is `MainWindow` |
+| `PythonQt.QtCore`, `PythonQt.QtGui` | `QPointF(x, y)`, `QTransform().translate(dx, dy)` | Qt | `set_anchor`, `set_metrics`, `add_component_glyph` | **live** |
+| `PythonQt.QtGui` | `QApplication.instance()`, `topLevelWidgets()`, `metaObject().className()`, `close()` | Qt | `quit`, `undo` | **live** (2026-11-07): the main window's class is `MainWindow` |
+| `PythonQt.QtGui` | the main window's `findChildren(QAction)`: `objectName` `actionUndo` and `actionRedo`, their `enabled`, `text`, and `trigger()` | Qt | `undo` | **live** (2026-11-11 and here): `text` names the step, title-cased (*&Undo Freelab Mcp: Metrics of a (before)* for the title *FreeLab MCP: metrics of A (before)*); a step Undo takes back becomes the one Redo names |
 | `PythonQt.QtGui` | `QApplication.activeModalWidget()`, its labels' and buttons' `text` | Qt | `dialog` | **live** (2026-11-07): closing with an edited font shows `DlgClosePackage`, *FontLab Warning*, *Save changes to "…" before closing?*, with *Don't Save*, *Cancel*, and *OK* |
+
+## Writes, found live (2026-11-16)
+
+FontLab 7.2.0, the six corpus fonts above, never saved.
+
+- **Undo acts on the font in front.** `actionUndo` triggered while Amiri was in front undid Amiri's last step, though the step just recorded was Rubik's. FontLab 7 offers scripts no way to bring a font to the front (`flWorkspace` has no setter for it, and `flItems` no request), so `undo` refuses a font that is not in front instead of undoing another one.
+- **History steps cost about 0.3 to 1.8 s each and Undo 0.8 to 3.8 s** with the clipboard free (`OpenClipboard` succeeded); the 17 s of 2026-11-14 came from a locked clipboard.
+- **`renameGlyph(fgGlyph, name, True)` follows components only.** It renamed Amiri's `_1392` and the component of `uni0628` that drew it, and Undo put both back. It left kerning pairs, kerning classes, other classes, and feature code naming the old name. Worse, undoing a rename of a glyph with kerning pairs of its own lost those pairs: Amiri's `V` (40 pairs) and `fraction` (1 pair) came back without them. `rename_glyph` therefore refuses a glyph that kerning, a class, or feature code uses.
+- **A kerning write takes a glyph's name as the class of that name.** FontLab names an imported kerning class after its key glyph (Amiri, Varela Round, Rubik: class `A` holds `A`, `Agrave`, …), so `kerning[("A", "Y")] = v` would write the class pair. `get` and assignment refuse every other key form tried (2026-11-08), so a pair of such a glyph on its own (an exception) cannot be written or read through scripting; the tools refuse it and say to give `@A` for the class.
+- **A new glyph gets its layers after `addGlyph`**: `addGlyph(flGlyph())` adds a copy without layers, and layers made on the object before it was added were lost in one run out of two; layers made on the font's glyph (`findName` after `rebuildMaps()`) were kept every time. Its code points are set last (FreeLab, 2026-11-11: set first, FontLab kept none of the layers).
+- **`setGlyphComponents` builds in a master only where each component's glyph has a layer.** Rubik's `acutecomb` has layers in Light and Black only; a glyph of `A` and `acutecomb` was built there and not in Bold.
+- **Kerning, anchors, metrics, code points, names, features, and added glyphs all went back on Undo**, each read back before and after.
+- **Objects a script makes**: FontLab adds a copy of a new `flGlyph()` (another pointer than the one made), but keeps the very `flPinPoint` a script made as the layer's anchor (the same pointer). That anchor outlived the script's wrapper: it was moved in a later request, and the font closed without trouble after `gc.collect()` (2026-11-16, Tinos, twice with the anchor left and twice undone).
+- **`flShapeData.referenceCount` is no count of glyphs sharing a shape**: it read 57 on a shape no other glyph used. A shape added to another layer as is shares its `flShapeData` (one pointer), yet moving that layer with `applyTransform` left the other glyph's outline where it was (Tinos `H` and `B`).
+- **A write may leave two steps**: the font (or a glyph with no state yet) recorded before it, "(before)", and the write's own. A "(before)" step that records only glyphs does not move the font's `currentHistoryState()`, so an Undo of it looked like no Undo at all (Codex's run, 2026-11-16). `undo` reads the step titles from the *Undo* and *Redo* actions instead, and takes a write's own "(before)" step back with it, so that each write is one `undo`.
 
 ## Found live in FontLab 7.2 (2026-11-06)
 
@@ -78,6 +126,10 @@ Proof level **live**: FontLab 7.2.0, IBM Plex Sans JP from the corpus (a TrueTyp
 - **FontLab 7 exports no vertical metrics** (2026-11-14, IBM Plex Sans KR, `flWorkspace.exportFont(package, ExportControl)` with `profileName` *OpenType TT* or *OpenType PS*, `destinationMode` 3, into a temp folder; each export ends on a *Font Exported* message that waits for its button): no vhea, vmtx, or VORG table, with every layer's `advanceHeight` and the vhea values in the font info set; with a `table vhea { VertTypoAscender 500; … } vhea;` block in the feature prefix, the features compiled and vhea was still left out; with a `table vmtx { VertOriginY uniAC00 880; VertAdvanceY uniAC00 1000; … } vmtx;` block, the compiler stopped (*[F] VertOriginY redefined for glyph uniAC00*) and the font was exported without GSUB and GPOS. `fgOpt_OTExport` lists no option for vertical tables.
 - **FontLab 7's Python ships fontTools 3.43.2** (*Resources\python\2.7\site-packages* of the install), importable from a script: it read the font FontLab exported (IBM Plex Sans JP as *OpenType PS*, 9,507 glyphs), added vhea, vmtx, and VORG, saved a copy, and read it back, in 13 seconds inside FontLab (2026-11-14, FreeLab's CJK Vertical).
 - **`QRectF` of `flLayer.boundingBox` is upward**: `top()` is the ink's bottom and `bottom()` its top (`uni300C`: `top()` 110, `bottom()` 835); `y()` and `height()` read as the bottom and the height upward.
+
+## The crash of 2026-11-16 (dump 52920), not reproduced
+
+FontLab crashed while a script closed the last of eight test fonts written to that session (an access violation in *FontLab 7.exe* while it built the close question, walking the font's glyph list). Each of these ran on a fresh FontLab with one test font, closed through *Window > Close* triggered from a real module and answered *Don't Save*, and none crashed, twice each: a component glyph added (Tinos, Rubik); added and undone (Tinos, Rubik); added and then deleted with `deleteGlyph`; a kerning write undone; an anchor added, left or undone (after `gc.collect()`); the session's writes to Rubik rebuilt as far as they could be (a hand-made History step, every glyph read, the whole write suite with its undos, writes put back by writing the values before, a glyph added and left); and two fonts, with writes to the one behind and Codex's sequence on the one in front (a component of `.notdef`, `.notdef` renamed, both undone). FontLab copies a glyph a script adds, so the script's own `flGlyph` dying with its request leaves FontLab's list alone. The cause is open.
 
 ## Corrections to the earlier FontLab MCP
 

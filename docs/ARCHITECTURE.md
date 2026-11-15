@@ -37,20 +37,47 @@ Request, one line of JSON:
 
 Reply, one line: `{"id": 7, "ok": true, "result": …}`, or `{"id": 7, "ok": false, "error": {"code": "no_glyph", "message": "…"}}`. The `id` is echoed only once the token is accepted. `deadline` is optional: seconds since the epoch after which the client has given up, so a request FontLab only reaches later is refused (`expired`) instead of run unseen. The server sets it on every call. A protocol change bumps the number in both halves; the server refuses a listener that speaks another one.
 
-Listener error codes: `bad_json`, `bad_request`, `bad_token`, `bad_protocol`, `expired`, `unknown_op`, `bad_args`, `too_large`, `not_in_fontlab`, `no_font`, `no_current_font`, `no_glyph`, `no_layer`, `unexpected_type`, `unreadable`, `unserializable`, `unsaved_changes`, and `exception`, which carries the traceback. The client adds `not_running`, `bad_state`, `timeout`, `connection`, `empty_reply`, `bad_reply`, and `too_large` (a request over the listener's 4 MB, refused before it is sent). The server's tools add `bad_args`, `listener_not_running` (FontLab runs without its listener), `not_found` (no FontLab program), `no_listener` (FontLab started, its listener did not answer), `save_prompt` (FontLab asks whether to save a font, and waits for the user), `dialog_open` (it asks something else), and `still_running` (FontLab asked to close, still open).
+Listener error codes: `bad_json`, `bad_request`, `bad_token`, `bad_protocol`, `expired`, `unknown_op`, `bad_args`, `too_large`, `not_in_fontlab`, `no_font`, `no_current_font`, `no_such_font`, `ambiguous_font`, `font_mismatch`, `no_glyph`, `no_layer`, `no_master`, `no_class`, `wrong_side`, `class_name_clash`, `no_pair`, `no_outline`, `metrics_expression`, `name_taken`, `glyph_in_use`, `unicode_taken`, `no_anchor`, `no_feature`, `history_failed`, `not_kept`, `not_in_front`, `history_moved`, `nothing_to_undo`, `not_found`, `unexpected_type`, `unreadable`, `unserializable`, `unsaved_changes`, `quit_in_progress`, and `exception`, which carries the traceback. The client adds `not_running`, `bad_state`, `timeout`, `connection`, `empty_reply`, `bad_reply`, and `too_large` (a request over the listener's 4 MB, refused before it is sent). The server's tools add `bad_args`, `listener_not_running` (FontLab runs without its listener), `not_found` (no FontLab program), `no_listener` (FontLab started, its listener did not answer), `save_prompt` (FontLab asks whether to save a font, and waits for the user), `dialog_open` (it asks something else), and `still_running` (FontLab asked to close, still open).
 
 | Operation | Does |
 |---|---|
 | `ping` | versions, Python, whether FontLab's module is present |
 | `status` | open font count, and the font in front |
-| `font_info` | the font in front, or `no_font` |
+| `fonts` | every open font: its id, names, path, masters, and whether it is in front |
+| `font_info` | a font (`font`, else the one in front), or `no_font` |
 | `glyph_names` | glyph names, paged |
-| `glyph` | one glyph by name or code point: Unicode values, layers, width, bounding box, counts |
-| `outline` | shapes, contours, and nodes on one layer, capped by `max_nodes` |
+| `glyph` | one glyph by name or code point: Unicode values, layers, width, ink box, sidebearings, node box, counts, components, anchors |
+| `outline` | shapes (a component names its glyph), contours, and nodes on one layer, capped by `max_nodes` |
+| `kerning` | one pair's own value, or a page of a master's pairs; with `classes`, the kerning classes |
+| `features` | feature tags; one feature's code; the prefix |
+| `set_kerning`, `remove_kerning` | one pair's own entry in one master |
+| `set_metrics` | a layer's advance width and sidebearings |
+| `rename_glyph`, `set_unicodes` | a glyph's name, its code points |
+| `add_component_glyph` | a new glyph of components, in every master where their glyphs are drawn |
+| `set_anchor`, `remove_anchor` | one anchor of one layer |
+| `set_feature` | one feature's code |
+| `undo` | *Edit > Undo* on the named font, which must be in front |
 | `run_python` | runs code in FontLab, returns printed output, `result`, and any traceback |
 | `unsaved` | whether the workspace or any open font has changes FontLab reports, and how many fonts were edited since they were opened (`edited`: FontLab 7.2 reports an edit only through its undo history) |
 | `dialog` | the window FontLab is waiting on, if any: its class, title, texts, and buttons; it only reads |
 | `quit` | refused with `unsaved_changes` when FontLab reports changes (or `unreadable` when it cannot tell); otherwise closes FontLab's main window a moment after replying, as its close button would. FontLab then asks about each edited font itself (*Save changes to … before closing?*); `quit_fontlab` reads that question through `dialog`, leaves it on screen, and returns it as `save_prompt` |
+
+## Fonts by name
+
+Every font op takes `font`: an id from `fonts` (FontLab's `fgPackage.id`, an integer, or the same digits as text, which may also be a font's name), a path (compared with separators and case normalized), a PostScript name, or a full name. No match is `no_such_font`, with the open fonts listed; two matches are `ambiguous_font`, with their ids. The reads fall back to the font in front without `font`; the writes and `undo` refuse (`bad_args`): a change never lands on a font the caller did not name. They also take `font_name` (a path or name) to confirm an id, since FontLab may give an id to a font opened after another was closed (`font_mismatch`). On the MCP side an id is a strict integer: `true` is no font.
+
+## Writes
+
+Each write op works in the same order, and stops at the first refusal with nothing changed:
+
+1. **Check everything.** The font, glyph, layer, master, and every argument are validated, and the change is planned: a pair's sides are resolved against the master's kerning classes, metrics computed from the layer's ink box, a rename checked against kerning, classes, and feature code, a component glyph planned master by master. A write that would change nothing returns `changed: false` and records nothing.
+2. **Record the font first when Undo needs it.** A step of FontLab's *History* records each object as it is after the change, and Undo puts back each object's state before that step; an object with no state yet stays as written ([FONTLAB7-API.md](FONTLAB7-API.md#history-notifications-and-layers-found-live-2026-11-14)). So the first write to a font in a listener session, and a write after an Undo back to the font's first state, record the font (and the glyphs the write changes, when they have no state) as a step of its own, titled "… (before)". When FontLab cannot record it, nothing is changed (`history_failed`). The client's deadline is checked here too (`expired`).
+3. **Change, then read back.** The read-back allows what FontLab does on its own: whole advance widths and kerning values, and a line break at the end of feature code. What FontLab did not keep, or a change that raised, is put back and read back again: then the write is refused (`not_kept`) and the font is as it was. When it cannot be put back, the change is recorded as the write's History step and the font marked modified all the same, and the refusal carries that step under `data.history`: a change is never left outside the History, unmarked.
+4. **One step, marked modified.** `notifyChangesApplied(title, [font, glyphs…], True)` records the change as one step titled "FreeLab MCP: …", and `setFlag(2, True)` marks the font modified, since a script's change alone leaves FontLab free to close it without asking. The reply holds the values before and after, and `history`: `recorded`, `marked_modified`, the font's `history_state`, and a `warning` when either failed (the change is made then, and the warning says what that means).
+
+`undo` refuses unless the named font is in front (`not_in_front`: FontLab's *Edit > Undo* acts on the font in front, and scripts cannot bring one forward). With a write's `history_state` as `expected_state` and its `title` as `expected_title`, it refuses (`history_moved`) unless the font's History is still at that state and the step the *Undo* action names is that write's: a step that records only glyphs (a write's leftover "(before)", or a user's edit) leaves the font's state as it was, so the state alone cannot tell. It triggers FontLab's own *Edit > Undo*, checks through the *Redo* action that the step it named was taken back (and, when *Redo* named a step of that title already, that the font's state moved), and takes the write's own "(before)" step back with it, so each write is one `undo`; it reports the steps undone, the one *Undo* would take back next, and the History state before and after.
+
+The server gives writes 120 seconds (`WRITE_TIMEOUT_S`) and reads 10: a History step waits on the Windows clipboard when another program holds it open (17 s a step, seen live).
 
 ## Error model
 

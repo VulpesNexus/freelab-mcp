@@ -22,8 +22,12 @@ import fakes  # noqa: E402
 import freelab_listener as fl  # noqa: E402
 from freelab_mcp import client, server  # noqa: E402
 
-EXPECTED_TOOLS = {"fontlab_status", "get_current_font", "list_glyphs", "get_glyph", "get_glyph_outline", "run_python",
-                  "launch_fontlab", "quit_fontlab", "restart_fontlab"}
+EXPECTED_TOOLS = {"fontlab_status", "list_fonts", "get_current_font", "list_glyphs", "get_glyph", "get_glyph_outline",
+                  "get_kerning", "get_features", "set_kerning_pair", "remove_kerning_pair", "set_glyph_metrics",
+                  "rename_glyph", "set_glyph_unicodes", "add_component_glyph", "set_anchor", "remove_anchor",
+                  "set_feature_code", "undo", "run_python", "launch_fontlab", "quit_fontlab", "restart_fontlab"}
+WRITE_TOOLS = {"set_kerning_pair", "remove_kerning_pair", "set_glyph_metrics", "rename_glyph", "set_glyph_unicodes",
+               "add_component_glyph", "set_anchor", "remove_anchor", "set_feature_code", "undo"}
 
 
 class ServerCase(unittest.TestCase):
@@ -120,7 +124,7 @@ class ToolTests(ServerCase):
         status = asyncio.run(server.fontlab_status())
         self.assertEqual(status["fonts_open"], 0)
         self.assertEqual(status["listener"]["listener"], fl.VERSION)
-        self.assertEqual(status["server"], "0.1.0")
+        self.assertEqual(status["server"], "1.0.0")
 
     def test_font_and_glyph_tools(self):
         self.open_sample()
@@ -191,6 +195,129 @@ class ToolTests(ServerCase):
             client.call("ping", timeout=0.5)
         self.assertEqual(ctx.exception.code, "timeout")
         self.assertLess(time.time() - start, 3)
+
+
+class WriteToolTests(ServerCase):
+    """The write tools through the real server, client, and listener, on the fakes."""
+
+    def setUp(self):
+        super().setUp()
+        self.start_listener()
+        self.font = fakes.write_font()
+        self.state.fonts = [fakes.sample_font(), self.font]
+        self.state.current = self.state.fonts[0]
+        self.qt = fakes.install_qt(self.state)
+
+    def tearDown(self):
+        fakes.uninstall_qt(self.qt)
+        super().tearDown()
+
+    def test_every_write_tool_requires_its_font(self):
+        tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
+        for name in WRITE_TOOLS:
+            self.assertIn("font", tools[name].inputSchema.get("required", []), name)
+        for name in EXPECTED_TOOLS - WRITE_TOOLS:
+            self.assertNotIn("font", tools[name].inputSchema.get("required", []), name)
+
+    def test_writes_wait_longer_than_reads(self):
+        seen = []
+        saved = server.call
+
+        def spy(op, args=None, timeout=None):
+            seen.append((op, timeout))
+            return saved(op, args, timeout=timeout)
+        server.call = spy
+        try:
+            asyncio.run(server.set_kerning_pair(7, "B", "A", -12))
+            asyncio.run(server.get_kerning(7, left="B", right="A"))
+        finally:
+            server.call = saved
+        self.assertEqual(seen, [("set_kerning", server.WRITE_TIMEOUT_S), ("kerning", client.DEFAULT_TIMEOUT_S)])
+
+    def test_a_write_and_its_undo(self):
+        reply = asyncio.run(server.set_kerning_pair("WriteSans-Regular", "B", "A", -12))
+        self.assertEqual((reply["font"]["id"], reply["value"], reply["history"]["recorded"]), (7, -12.0, True))
+        self.assertEqual(asyncio.run(server.get_kerning(7, left="B", right="A"))["value"], -12.0)
+        with self.assertRaisesRegex(RuntimeError, r"\[not_in_front\]"):
+            asyncio.run(server.undo(7))
+        self.state.current = self.font
+        undone = asyncio.run(server.undo(7, expected_state=reply["history"]["history_state"]))
+        self.assertTrue(undone["undone"])
+
+    def test_left_out_arguments_are_not_sent(self):
+        reply = asyncio.run(server.set_glyph_metrics(7, glyph="A", advance_width=550))
+        self.assertEqual(reply["layer"], "Regular")
+        with self.assertRaisesRegex(RuntimeError, r"\[bad_args\] Give exactly one of glyph or unicode"):
+            asyncio.run(server.set_glyph_metrics(7, advance_width=550))
+
+    def test_the_other_writes_through_the_server(self):
+        self.assertTrue(asyncio.run(server.set_anchor(7, "B", "top", 250, 700))["changed"])
+        self.assertTrue(asyncio.run(server.remove_anchor(7, "B", "top"))["changed"])
+        self.assertTrue(asyncio.run(server.set_glyph_unicodes(7, [0xE000], glyph="acute"))["changed"])
+        self.assertTrue(asyncio.run(server.rename_glyph(7, "acute", "acutecomb"))["changed"])
+        added = asyncio.run(server.add_component_glyph(7, "Bdot", [{"glyph": "B"}, {"glyph": "acutecomb", "x": 100}]))
+        self.assertEqual(added["skipped_masters"], ["Bold"])
+        self.assertTrue(asyncio.run(server.set_feature_code(7, "ss05", "feature ss05 { sub A by B; } ss05;"))["created"])
+        self.assertTrue(asyncio.run(server.remove_kerning_pair(7, "A", "B", master="Bold"))["changed"])
+        self.assertEqual(asyncio.run(server.get_features(7, tag="ss05"))["tag"], "ss05")
+        self.assertEqual(len(asyncio.run(server.list_fonts())["fonts"]), 2)
+
+    def call_tool(self, name, args):
+        result = asyncio.run(server.mcp.call_tool(name, args))
+        blocks = result[0] if isinstance(result, tuple) else result
+        return " ".join(getattr(block, "text", "") for block in blocks)
+
+    def test_a_glyph_named_like_json_reaches_the_listener_as_text(self):
+        """Codex, 2026-11-16: FastMCP parsed "null" given for a str | None argument as JSON, so a glyph
+        named null was looked up as no glyph at all."""
+        glyphs = self.font._f_glyphs
+        glyphs.append(fakes.flGlyph("null", [fakes.flLayer("Regular")]))
+        glyphs.append(fakes.flGlyph("true", [fakes.flLayer("Regular")]))
+        self.assertIn('"name": "null"', self.call_tool("get_glyph", {"font": 7, "name": "null"}))
+        self.assertIn('"name": "true"', self.call_tool("get_glyph_outline", {"font": 7, "name": "true"}))
+        self.assertIn('"glyph": "null"', self.call_tool("set_glyph_metrics", {"font": 7, "glyph": "null", "advance_width": 10}))
+
+    def test_numbers_are_strict(self):
+        """Codex, 2026-11-16: true given as advance_width became a width of 1."""
+        for name, args in (("set_glyph_metrics", {"font": 7, "glyph": "A", "advance_width": True}),
+                           ("set_kerning_pair", {"font": 7, "left": "B", "right": "A", "value": True}),
+                           ("set_anchor", {"font": 7, "glyph": "A", "name": "top", "x": "5", "y": 1}),
+                           ("set_glyph_unicodes", {"font": 7, "glyph": "acute", "unicodes": [True]})):
+            with self.assertRaises(Exception, msg=name):
+                self.call_tool(name, args)
+        self.assertEqual(self.state.steps, [], "nothing written")
+        self.assertIn('"advance_width": 520.0', self.call_tool("set_glyph_metrics", {"font": 7, "glyph": "A", "advance_width": 520}))
+
+    def test_a_font_id_is_strict_and_a_name_confirms_it(self):
+        """Review of 2026-11-16: font true became the id 1; a font id given alone may name a font opened since."""
+        with self.assertRaises(Exception):
+            self.call_tool("set_kerning_pair", {"font": True, "left": "B", "right": "A", "value": -5})
+        with self.assertRaisesRegex(Exception, r"font_mismatch"):
+            self.call_tool("set_kerning_pair", {"font": 7, "font_name": "Free Sans Regular", "left": "B", "right": "A",
+                                                "value": -5})
+        self.assertEqual(self.state.steps, [])
+        self.assertIn('"changed": true', self.call_tool("set_kerning_pair", {"font": 7, "font_name": "WriteSans-Regular",
+                                                                             "left": "B", "right": "A", "value": -5}))
+
+    def test_undo_takes_the_writes_title(self):
+        reply = asyncio.run(server.set_kerning_pair(7, "B", "A", -12))
+        self.state.current = self.font
+        with self.assertRaisesRegex(RuntimeError, r"\[history_moved\]"):
+            asyncio.run(server.undo(7, expected_state=reply["history"]["history_state"], expected_title="FreeLab MCP: other"))
+        undone = asyncio.run(server.undo(7, expected_state=reply["history"]["history_state"],
+                                         expected_title=reply["history"]["title"]))
+        self.assertEqual(undone["undone"][0].lower(), reply["history"]["title"].lower())
+
+    def test_a_write_that_could_not_be_put_back_carries_its_step(self):
+        self.font.kerning("Regular")._f_skew = 3.0
+        with self.assertRaisesRegex(RuntimeError, r'\[not_kept\].*"recorded": true'):
+            asyncio.run(server.set_kerning_pair(7, "A", "B", -9))
+
+    def test_tool_errors_carry_the_listeners_code(self):
+        with self.assertRaisesRegex(RuntimeError, r"\[class_name_clash\]"):
+            asyncio.run(server.set_kerning_pair(7, "V", "A", -5))
+        with self.assertRaisesRegex(RuntimeError, r"\[no_such_font\]"):
+            asyncio.run(server.set_kerning_pair("Nope", "B", "A", -5))
 
 
 class ClientLimitTests(unittest.TestCase):
