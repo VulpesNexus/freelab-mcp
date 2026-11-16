@@ -1037,20 +1037,28 @@ class _Write(object):
     def run(self, change, restore, glyphs=(), added=False):
         """change() makes the change and reads it back (raising _NotKept when FontLab did not keep it);
         its result is returned. On any failure restore() puts the font back and says whether a read-back
-        shows it so; the error says what became of the change (fail)."""
+        shows it so; the error says what became of the change (fail). A FreeLabError raised inside change()
+        (a read-back that could not be read) comes after the change may have been made: it is put back and
+        recorded like any other failure, never let out bare (Codex, 2026-11-16)."""
         try:
             return change()
-        except FreeLabError:
-            raise
         except _NotKept as exc:
             message = _text(exc)
+        except FreeLabError as exc:
+            message = u"%s (%s)" % (_text(exc.message).rstrip(u"."), exc.code)
         except Exception as exc:
             message = u"FontLab raised %s during the change" % _exc_text(exc)
         try:
             restored = bool(restore())
         except Exception:
             restored = False
-        raise self.fail(message, restored, glyphs() if callable(glyphs) else glyphs, added)
+        if restored:
+            raise self.fail(message, True)
+        try:  # (the glyphs left: a read that fails here must not keep the change from being recorded)
+            left = list(glyphs() if callable(glyphs) else glyphs)
+        except Exception:
+            left = []
+        raise self.fail(message, False, left, added)
 
     def fail(self, message, restored, glyphs=(), added=False):
         """The error for a change FontLab did not keep. Put back: nothing changed. Not put back: the change
@@ -1452,7 +1460,7 @@ def op_add_component_glyph(listener, args):
         glyph = glyph_named(package, name)
         if glyph is None:
             raise _NotKept(u"FontLab did not add '%s'" % name)
-        built = []
+        built, placed = [], []
         for master, width in plans:
             components = []
             for base_name, _base, x, y in parts:
@@ -1463,11 +1471,28 @@ def op_add_component_glyph(listener, args):
             layer.setGlyphComponents(components, width, package, False)
             if layer.shapesCount != len(parts):
                 raise _NotKept(u"FontLab kept %d of the %d components in master %s" % (layer.shapesCount, len(parts), master))
+            shapes = _real_list(layer.shapes, "layer.shapes")
+            kept = [_component_glyph(shape) for shape in shapes]
+            if kept != [n for n, _b, _x, _y in parts]:
+                raise _NotKept(u"FontLab kept the components %s in master %s, not those asked" % (kept, master))
+            for shape, (base_name, _b, x, y) in zip(shapes, parts):  # (each offset as asked: Codex, 2026-11-16)
+                t = shape.transform
+                at = (float(t.dx()), float(t.dy()))
+                if abs(at[0] - x) > 0.5 or abs(at[1] - y) > 0.5 or (t.m11(), t.m12(), t.m21(), t.m22()) != (1, 0, 0, 1):
+                    raise _NotKept(u"FontLab placed component %s at (%g, %g) in master %s, not at (%g, %g)" % (
+                        base_name, at[0], at[1], master, x, y))
+                if not built:  # (the offsets reported are those FontLab stored, which it may round: live)
+                    placed.append({"glyph": base_name, "x": at[0], "y": at[1]})
+            if abs(float(layer.advanceWidth) - width) > 0.5:
+                raise _NotKept(u"FontLab gave master %s the width %g, not %g" % (master, float(layer.advanceWidth), width))
             built.append({"master": master, "advance_width": float(layer.advanceWidth)})
         if unicodes:  # last: given before the layers are made, FontLab kept none of them (live, 2026-11-11)
             glyph.fgGlyph.unicodes = unicodes
             package.fgPackage.rebuildMaps()
-        return glyph, built
+        kept = _unicodes(glyph, _Reads())
+        if kept != unicodes:  # (read back as set_unicodes does: Codex, 2026-11-16)
+            raise _NotKept(u"FontLab did not keep the Unicode values of '%s' (read back %s)" % (name, kept))
+        return glyph, built, placed
 
     def restore():
         glyph = glyph_named(package, name)
@@ -1476,10 +1501,14 @@ def op_add_component_glyph(listener, args):
             package.fgPackage.rebuildMaps()
         return glyph_named(package, name) is None
 
-    glyph, built = write.run(change, restore, glyphs=lambda: [glyph_named(package, name)], added=True)
+    glyph, built, placed = write.run(change, restore, glyphs=lambda: [glyph_named(package, name)], added=True)
+    extra = {}
+    moved = [p["glyph"] for p, (_n, _b, x, y) in zip(placed, parts) if (p["x"], p["y"]) != (x, y)]
+    if moved:
+        extra["rounded"] = u"FontLab rounded the offset of %s to whole units (as the font rounds coordinates)." % (
+            u", ".join(moved))
     return _write_reply(package, write.finish([glyph], added=True), glyph=name, unicodes=unicodes,
-                        components=[{"glyph": n, "x": x, "y": y} for n, _b, x, y in parts], masters=built,
-                        skipped_masters=skipped)
+                        components=placed, masters=built, skipped_masters=skipped, **extra)
 
 
 def _anchor_at(layer, name):
@@ -1566,7 +1595,7 @@ def op_remove_anchor(listener, args):
 
 def _feature_block(tag, code):
     """None when code is exactly one top-level block, feature tag { ... } tag; (with comments and blank lines
-    around it); else why not. Braces are matched outside comments, and nothing else may stand outside the
+    around it); else why not. Braces are matched outside comments and strings, and nothing else may stand outside the
     block: another feature, a lookup, a languagesystem line, or FontLab's #> and #< markers would ride
     along into the font's feature code."""
     n, i = len(code), 0
@@ -1597,6 +1626,12 @@ def _feature_block(tag, code):
         if c == u"#":
             end = code.find(u"\n", i)
             i = n if end < 0 else end
+            continue
+        if c == u'"':  # a string (a name's text): its braces and # are text (Codex, 2026-11-16); the
+            end = code.find(u'"', i + 1)  # feature syntax has no escaped quote (\0022 stands for one)
+            if end < 0:
+                return u"a string in it does not close"
+            i = end + 1
             continue
         if c == u"{":
             depth += 1

@@ -264,7 +264,8 @@ async def add_component_glyph(
 
     It is built in every master where each component's glyph has a layer (the others are listed as
     skipped). Its advance width is advance_width, else the first component's in each master. A name or
-    code point the font already has is refused.
+    code point the font already has is refused. The reply's components are the offsets FontLab stored,
+    read back: a font that rounds coordinates rounds them to whole units (said in "rounded").
     """
     return await _write("add_component_glyph", _named(font_name, {"name": name, "components": components, "unicodes": unicodes,
                                                       "advance_width": advance_width}, font))

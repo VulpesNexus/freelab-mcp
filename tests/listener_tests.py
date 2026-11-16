@@ -1549,6 +1549,148 @@ class ReviewTests(FontCase):
         self.assertIn("left sidebearing", reply["rounded"])
 
 
+class CodexRoundTwoTests(FontCase):
+    """Codex's review of 2026-11-16 (second round), one test per MCP finding."""
+
+    def setUp(self):
+        FontCase.setUp(self)
+        self.state.current = self.font
+
+    def unreadable_once_renamed(self, every_time):
+        """glyph_named failing as a null check that cannot be read does, from the moment the rename shows (the
+        first read-back), once or from then on."""
+        real, state = fl.glyph_named, {"armed": False, "raised": 0}
+
+        def flaky(package, name):
+            if not state["armed"] and package.findName("acutecomb") is not None:
+                state["armed"] = True
+            if state["armed"] and (every_time or not state["raised"]):
+                state["raised"] += 1
+                raise fl.FreeLabError("unreadable", "Could not tell whether the glyph is null (boom).")
+            return real(package, name)
+
+        fl.glyph_named = flaky
+        return real
+
+    def test_a_read_back_that_cannot_be_read_is_put_back(self):
+        """A FreeLabError raised by a read-back after the rename skipped the restore and the History step."""
+        real = self.unreadable_once_renamed(False)
+        try:
+            error = self.fails("rename_glyph", {"font": 7, "glyph": "acute", "new_name": "acutecomb"}, code="not_kept")
+        finally:
+            fl.glyph_named = real
+        self.assertIn("unreadable", error["message"])
+        self.assertIn("put back", error["message"])
+        self.assertIsNotNone(self.font.findName("acute"), "the old name is back")
+        self.assertIsNone(self.font.findName("acutecomb"))
+
+    def test_a_read_back_error_left_in_the_font_is_recorded(self):
+        real = self.unreadable_once_renamed(True)
+        try:
+            error = self.fails("rename_glyph", {"font": 7, "glyph": "acute", "new_name": "acutecomb"}, code="not_kept")
+        finally:
+            fl.glyph_named = real
+        self.assertIn("could not be put back", error["message"])
+        self.assertTrue(error["data"]["history"]["recorded"], "a step for what is left, and the font marked")
+
+    def test_dropped_code_points_of_an_added_glyph_are_not_reported_kept(self):
+        prop = fakes.fgGlyph.unicodes
+        fakes.fgGlyph.unicodes = property(prop.fget, lambda self, values: prop.fset(self, list(values)[:-1]))
+        try:
+            error = self.fails("add_component_glyph", {"font": 7, "name": "X", "components": [{"glyph": "A"}],
+                                                       "unicodes": [0xE100, 0xE101]}, code="not_kept")
+        finally:
+            fakes.fgGlyph.unicodes = prop
+        self.assertIn("Unicode values", error["message"])
+        self.assertIn("put back", error["message"])
+        self.assertIsNone(self.font.findName("X"), "the glyph is taken out again")
+
+    def test_components_fontlab_swapped_are_not_reported_kept(self):
+        real = fl._component_glyph
+        fl._component_glyph = lambda shape: u"B"
+        try:
+            error = self.fails("add_component_glyph", {"font": 7, "name": "X", "components": [{"glyph": "A"}]},
+                               code="not_kept")
+        finally:
+            fl._component_glyph = real
+        self.assertIn("not those asked", error["message"])
+        self.assertIsNone(self.font.findName("X"))
+
+    def test_an_added_glyph_that_cannot_be_read_is_still_recorded(self):
+        """Round 2: with every read of the new glyph failing, collecting the glyphs left let the error out before
+        the History step and the modified mark."""
+        real = fl.glyph_named
+
+        def unreadable_once_added(package, name):
+            if package.findName("X") is not None:
+                raise fl.FreeLabError("unreadable", "Could not tell whether the glyph is null (boom).")
+            return real(package, name)
+
+        fl.glyph_named = unreadable_once_added
+        try:
+            error = self.fails("add_component_glyph", {"font": 7, "name": "X", "components": [{"glyph": "A"}]},
+                               code="not_kept")
+        finally:
+            fl.glyph_named = real
+        self.assertIn("could not be put back", error["message"])
+        self.assertTrue(error["data"]["history"]["recorded"])
+        self.assertEqual(self.font._f_flags[-1], (2, True), "the font marked modified")
+        self.assertEqual(self.state.content_updates, [7], "the Font window told of the glyph left")
+
+    def test_a_component_offset_fontlab_dropped_is_not_reported_kept(self):
+        """Round 2: names, widths, and code points were read back, offsets not."""
+        real = fakes.flLayer.setGlyphComponents
+
+        def dropping_offsets(layer, components, width, package, colorize):
+            done = real(layer, components, width, package, colorize)
+            if layer._f_shapes:
+                object.__setattr__(layer._f_shapes[-1], "transform", fakes.QTransform())
+            return done
+
+        fakes.flLayer.setGlyphComponents = dropping_offsets
+        try:
+            error = self.fails("add_component_glyph", {"font": 7, "name": "X",
+                                                       "components": [{"glyph": "A"}, {"glyph": "B", "x": 500}]},
+                               code="not_kept")
+        finally:
+            fakes.flLayer.setGlyphComponents = real
+        self.assertIn("not at (500, 0)", error["message"])
+        self.assertIsNone(self.font.findName("X"), "taken out again")
+        reply = self.write("add_component_glyph", {"name": "Y", "components": [{"glyph": "A"}, {"glyph": "B", "x": 500.25}]})
+        self.assertEqual(reply["components"][1]["x"], 500.25, "a fraction FontLab keeps is no mismatch")
+        self.assertNotIn("rounded", reply)
+
+    def test_offsets_fontlab_rounded_are_reported_as_stored(self):
+        """Live, 2026-11-16: Varela Round stored I asked at (500.25, 10.5) at (500, 11); the reply echoed the request."""
+        real = fakes.flLayer.setGlyphComponents
+
+        def rounding(layer, components, width, package, colorize):
+            done = real(layer, components, width, package, colorize)
+            for shape in layer._f_shapes:
+                t = shape.transform
+                object.__setattr__(shape, "transform", fakes.QTransform(dx=float(round(t.dx())), dy=float(round(t.dy()))))
+            return done
+
+        fakes.flLayer.setGlyphComponents = rounding
+        try:
+            reply = self.write("add_component_glyph", {"name": "Z", "components": [{"glyph": "A"},
+                                                                                   {"glyph": "B", "x": 500.25, "y": 10.6}]})
+        finally:
+            fakes.flLayer.setGlyphComponents = real
+        self.assertEqual(reply["components"], [{"glyph": "A", "x": 0.0, "y": 0.0}, {"glyph": "B", "x": 500.0, "y": 11.0}])
+        self.assertIn("B", reply["rounded"])
+
+    def test_quoted_braces_do_not_hide_another_feature(self):
+        payload = (u'feature ss01 {\n  featureNames { name "{"; };\n} ss01;\nfeature kern { pos A V -200; } kern;\n'
+                   u'feature ss01 {\n  featureNames { name "}"; };\n} ss01;\n')
+        self.refused("set_feature", {"tag": "ss01", "code": payload}, "bad_args")
+        one = u'feature ss01 {\n  featureNames { name "Swash {alt} # one"; };\n  sub A by B;\n} ss01;\n'
+        self.assertTrue(self.write("set_feature", {"tag": "ss01", "code": one})["changed"],
+                        "a brace or # in a name's text is text")
+        self.refused("set_feature", {"tag": "ss01", "code": u'feature ss01 { featureNames { name "open; }; } ss01;'},
+                     "bad_args")
+
+
 class RetiredTimerTests(unittest.TestCase):
     def test_stop_keeps_its_timer_referenced(self):
         """stop() may run inside the timer's own tick; dropping the QTimer then would let PythonQt delete it
