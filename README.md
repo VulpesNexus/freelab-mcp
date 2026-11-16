@@ -4,7 +4,7 @@ An MCP server that lets an AI app such as Claude Code read the fonts open in Fon
 
 **Status: 1.0.0.** Every read and write tool was proven live in FontLab 7.2 on test fonts (TrueType and CFF, multiple masters, Japanese, Arabic, and Hebrew): [docs/FONTLAB7-API.md](docs/FONTLAB7-API.md) tracks each FontLab call and how far it is proven.
 
-FreeLab, the separate `freelab` repository, holds tools that run inside FontLab, starting with a dark mode. Neither needs the other; installed together, they share FontLab's *Scripts > FreeLab* menu.
+FreeLab Script Suite, the separate `freelab-script-suite` repository, holds tools that run inside FontLab, starting with a dark mode. Neither needs the other; installed together, they share FontLab's *Scripts > FreeLab* menu.
 
 ## What is here
 

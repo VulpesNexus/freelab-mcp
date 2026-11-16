@@ -11,4 +11,4 @@
 - **Kerning resolved by FontLab** (`getPlainPairsDict`): the value a glyph pair actually gets through its classes.
 - **Exception pairs of a glyph named like its class**, if FontLab's scripting turns out to have a way to address one (renaming the class for the moment is one, but touches the class).
 
-Tools that run inside FontLab on their own, such as dark mode and the kerning and feature-code helpers, belong to FreeLab, the separate `freelab` repository, and are on its roadmap.
+Tools that run inside FontLab on their own, such as dark mode and the kerning and feature-code helpers, belong to FreeLab Script Suite, the separate `freelab-script-suite` repository, and are on its roadmap.
