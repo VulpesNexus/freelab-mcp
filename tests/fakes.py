@@ -652,6 +652,50 @@ class FontLabState(object):
         self.undo_moves = True  # False: Undo does nothing (a step FontLab refused to take back)
         self.history = []  # FontLab's History: (title, objects) steps, last on top
         self.redo = []
+        # FontLab's windows (install_qt): window tabs, the Output panel, the Features panel, File > Close Font
+        self.tabs = None  # (text, font) of each window tab; None: one tab per open font, named by its full name
+        self.output = u""  # the Output panel's text
+        self.compiler = lambda font: u""  # what a compile prints for the font in front
+        self.compiled = []  # the fonts compiled, in order
+        self.features_panel = True  # False: the Features panel was never made (no Compile button)
+        self.timers = []  # (delay in ms, callback) of every QTimer.singleShot, for the test to fire
+        self.loads = []  # paths requestLoadingFont was given
+        self.asks_to_save = set()  # ids of fonts whose closing FontLab asks about
+        self.prompt = None  # the font FontLab's Save question is about, while it is shown
+        self.answers = []  # the Save question's buttons clicked
+        self.windows = []  # titles of other visible top-level windows
+        self.grabs = []  # the windows grabbed
+        self.hold_open = False  # True: requestLoadingFont stops on a question (Coordinates Rounding) instead
+        self.question = None  # the title of a question FontLab shows (not the Save one)
+
+    def fire_timers(self, up_to_ms=None):
+        """Run the QTimer.singleShot callbacks due by up_to_ms (all, when None), in the order they are due."""
+        due = sorted([t for t in self.timers if up_to_ms is None or t[0] <= up_to_ms], key=lambda t: t[0])
+        for timer in due:
+            self.timers.remove(timer)
+        for _delay, callback in due:
+            callback()
+
+    def window_tabs(self):
+        if self.tabs is not None:
+            return self.tabs
+        return [(u"Sketchboard", None)] + [(u" %s " % font.ffn, font) for font in self.fonts]
+
+    def close_current(self):
+        """File > Close Font: closes the font in front, or shows FontLab's Save question about it."""
+        font = self.current
+        if font is None:
+            return
+        if font.fgPackage.id in self.asks_to_save:
+            self.prompt = font
+            return
+        self.drop(font)
+
+    def drop(self, font):
+        self.fonts.remove(font)
+        if self.tabs is not None:
+            self.tabs = [tab for tab in self.tabs if tab[1] is not font]
+        self.current = self.fonts[0] if self.fonts else None
 
     def undo(self):
         """Edit > Undo: the top step's objects go back to their states before it, and Redo names it."""
@@ -765,6 +809,17 @@ def install(state):
         def notifyPackageContentUpdated(font_id):
             state.content_updates.append(font_id)
 
+        @staticmethod
+        def requestLoadingFont(path):
+            """File > Open: the font opens at once (FontLab gives it the file's path) and comes to the front."""
+            state.loads.append(path)
+            if state.hold_open:
+                state.question = u"Coordinates Rounding"
+                return
+            font = sample_font(path=path, font_id=100 + len(state.loads))
+            state.fonts.append(font)
+            state.current = font
+
     def wrap(item):
         font = object.__getattribute__(item, "_f_font")
         if font is None:
@@ -825,16 +880,184 @@ def install_qt(state):
         def text(self):
             return state.redo_text()
 
-    class Meta(object):
-        def className(self):
-            return "MainWindow"
+    class CloseFonts(QAction):
+        objectName = "actionClose_Fonts"
 
-    class MainWindow(object):
+        def trigger(self):
+            state.close_current()
+
+    class Meta(object):
+        def __init__(self, name):
+            self.name = name
+
+        def className(self):
+            return self.name
+
+    class Widget(object):
+        """A Qt widget: its class name, objectName, and the kinds of Qt class it inherits."""
+        kinds = ()
+        class_name = "QWidget"
+        objectName = ""
+        windowTitle = u""
+
         def metaObject(self):
-            return Meta()
+            return Meta(self.class_name)
+
+        def inherits(self, name):
+            return name in self.kinds
+
+        def isVisible(self):
+            return True
 
         def findChildren(self, kind):
-            return [Undo(), Redo()] if kind is QAction else []
+            return []
+
+        def children(self):
+            return []
+
+        def isWidgetType(self):
+            return True
+
+        def grab(self):
+            state.grabs.append(self.windowTitle)
+            return QPixmap(2000, 1000)
+
+    class QTabWidget(Widget):
+        pass
+
+    class Container(Widget):
+        objectName = "YDropTargetContainer"
+
+    class WindowTabs(QTabWidget):
+        """The window tabs (YTabWidget in a YDropTargetContainer): choosing one brings its font to the front."""
+        class_name = "YTabWidget"
+
+        def parentWidget(self):
+            return Container()
+
+        @property
+        def count(self):
+            return len(state.window_tabs())
+
+        @property
+        def currentIndex(self):
+            for index, (_text, font) in enumerate(state.window_tabs()):
+                if font is state.current:
+                    return index
+            return 0
+
+        def tabText(self, index):
+            return state.window_tabs()[index][0]
+
+        def setCurrentIndex(self, index):
+            state.current = state.window_tabs()[index][1]
+
+    class PanelTabs(QTabWidget):
+        """A panel's tab widget (Features, Source): not a window tab, never chosen."""
+        class_name = "YTabWidget"
+        count = 2
+
+        def parentWidget(self):
+            return Widget()
+
+        def tabText(self, index):
+            return [u"Features", u"Source"][index]
+
+        def setCurrentIndex(self, index):
+            raise AssertionError("a panel's tab was chosen")
+
+    class QAbstractButton(Widget):
+        kinds = ("QAbstractButton",)
+
+    class QLabel(Widget):
+        kinds = ("QLabel",)
+        textFormat = 2
+
+        def __init__(self, text):
+            self.text = text
+
+    class QTextEdit(Widget):
+        objectName = "textOutput"
+
+        def __init__(self, shown):
+            self.shown = shown
+
+        def isVisible(self):
+            return self.shown
+
+        def toPlainText(self):
+            return state.output if self.shown else u""
+
+    class CompileButton(QAbstractButton):
+        """The Features panel's Compile button: FontLab clears the Output panel, then compiles in the click."""
+        objectName = "buttonCompile"
+        toolTip = u"Compile features (\u2303\u21a9 / Ctrl+Enter)"
+        enabled = True
+
+        def click(self):
+            state.compiled.append(state.current)
+            state.output = state.compiler(state.current)
+
+    class OtherCompileButton(QAbstractButton):
+        objectName = "buttonCompile"
+        toolTip = u"Compile code (\u2303+\u21b5)"
+
+        def click(self):
+            raise AssertionError("the Scripting panel's button was clicked")
+
+    class Answer(QAbstractButton):
+        def __init__(self, text):
+            self.text = text
+
+        def click(self):
+            state.answers.append(self.text)
+            font, state.prompt = state.prompt, None
+            if self.text == u"&Don\u2019t Save":
+                state.drop(font)
+
+    class SavePrompt(Widget):
+        class_name = "DlgClosePackage"
+        windowTitle = u"FontLab Warning"
+
+        def findChildren(self, kind):
+            if kind is QLabel:
+                return [QLabel(u'<b>Save changes to  "%s" before closing?</b>' % state.prompt.ffn),
+                        QLabel(u"If you don't save, your changes will be lost.")]
+            if kind is QAbstractButton:
+                return [Answer(u"&Save"), Answer(u"&Don\u2019t Save"), Answer(u"Cancel")]
+            return []
+
+        def children(self):
+            return self.findChildren(QLabel) + self.findChildren(QAbstractButton)
+
+    class Question(Widget):
+        class_name = "QDialog"
+
+        @property
+        def windowTitle(self):
+            return state.question
+
+        def children(self):
+            return [QLabel(u"Round the coordinates to whole units?"), Answer(u"OK")]
+
+    class Window(Widget):
+        def __init__(self, title):
+            self.windowTitle = title
+
+    class MainWindow(Widget):
+        class_name = "MainWindow"
+        windowTitle = u"FontLab 7"
+
+        def findChildren(self, kind):
+            if kind is QAction:
+                return [Undo(), Redo(), CloseFonts()]
+            if kind is QTabWidget:
+                return [PanelTabs(), WindowTabs()]
+            if kind is QAbstractButton:
+                return [OtherCompileButton()] + ([CompileButton()] if state.features_panel else [])
+            if kind is QTextEdit:
+                return [QTextEdit(False), QTextEdit(True)]
+            return []
 
     class QApplication(object):
         @staticmethod
@@ -842,12 +1065,60 @@ def install_qt(state):
             return QApplication()
 
         def topLevelWidgets(self):
-            return [MainWindow()]
+            return [MainWindow()] + [Window(title) for title in state.windows] + \
+                ([SavePrompt()] if state.prompt is not None else []) + ([Question()] if state.question else [])
+
+        def activeModalWidget(self):
+            if state.prompt is not None:
+                return SavePrompt()
+            return Question() if state.question else None
+
+    class QTimer(object):
+        @staticmethod
+        def singleShot(delay_ms, callback):
+            state.timers.append((delay_ms, callback))
+
+    class QByteArray(object):
+        def __init__(self):
+            self.bytes = b""
+
+        def data(self):
+            return self.bytes
+
+    class QBuffer(object):
+        def __init__(self, array):
+            self.array = array
+
+        def open(self, mode):
+            assert mode == QIODevice.WriteOnly
+            return True
+
+    class QIODevice(object):
+        WriteOnly = 2
+
+    class QPixmap(object):
+        def __init__(self, width, height):
+            self.size = (width, height)
+
+        def width(self):
+            return self.size[0]
+
+        def height(self):
+            return self.size[1]
+
+        def scaledToWidth(self, width, mode):
+            return QPixmap(width, self.size[1] * width // self.size[0])
+
+        def save(self, buffer, kind):
+            buffer.array.bytes = b"\x89PNG\r\n\x1a\n" + ("%dx%d" % self.size).encode("ascii")
+            return kind == "PNG"
 
     core = types.ModuleType("PythonQt.QtCore")
     core.QPointF = QPointF
+    core.QTimer, core.QByteArray, core.QBuffer, core.QIODevice = QTimer, QByteArray, QBuffer, QIODevice
     gui = types.ModuleType("PythonQt.QtGui")
     gui.QTransform, gui.QApplication, gui.QAction = QTransform, QApplication, QAction
+    gui.QTabWidget, gui.QAbstractButton, gui.QLabel, gui.QTextEdit = QTabWidget, QAbstractButton, QLabel, QTextEdit
     root = types.ModuleType("PythonQt")
     root.QtCore, root.QtGui = core, gui
     sys.modules.update({"PythonQt": root, "PythonQt.QtCore": core, "PythonQt.QtGui": gui})
@@ -866,7 +1137,7 @@ def square(x0, y0, size):
     return flContour([flNode(x0, y0), flNode(x0 + size, y0), flNode(x0 + size, y0 + size), flNode(x0, y0 + size)])
 
 
-def sample_font(broken_path=False):
+def sample_font(broken_path=False, path="fixtures/Test.vfc", font_id=1):
     a_layer = flLayer("Regular", [flShape([square(50, 0, 400)], name="A body")], width=500.0, bbox=QRectF(50, 0, 400, 400))
     a_mask = flLayer("Regular mask")
     curve = flContour([
@@ -882,7 +1153,7 @@ def sample_font(broken_path=False):
         flGlyph("B", [b_layer], [0x42]),
     ]
     cls = _BrokenPath if broken_path else flPackage
-    return cls("Free Sans", "Regular", glyphs)
+    return cls("Free Sans", "Regular", glyphs, path=path, font_id=font_id)
 
 
 def write_font(font_id=7, family="Write Sans", path="fixtures/Write.vfc"):

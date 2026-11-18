@@ -1691,6 +1691,183 @@ class CodexRoundTwoTests(FontCase):
                      "bad_args")
 
 
+class WindowTests(FontCase):
+    """Opening, closing, bringing to the front, compiling, the Output panel, and pictures, against fake
+    FontLab windows: one window tab per font (Sketchboard first), the panels' own tab widgets beside them."""
+
+    def font_file(self, name="Open.ttf"):
+        path = os.path.join(self.tmp, name)
+        with open(path, "wb") as handle:
+            handle.write(b"font")
+        return path
+
+    def ids(self):
+        return [font.fgPackage.id for font in self.state.fonts]
+
+    # -- bringing a font to the front
+    def test_front_chooses_the_fonts_window_tab(self):
+        self.assertEqual(self.ok("front", {"font": 7}), {"font": {"id": 7, "name": "Write Sans Regular"},
+                                                         "brought_forward": True})
+        self.assertIs(self.state.current, self.font)
+        self.assertEqual(self.ok("front", {"font": 7})["brought_forward"], False, "already in front: nothing chosen")
+
+    def test_front_tries_other_tabs_when_none_is_named_after_the_font(self):
+        self.state.tabs = [(u"Sketchboard", None), (u"Glyph A", self.sample), (u"Glyph B", self.font)]
+        self.assertTrue(self.ok("front", {"font": 7})["brought_forward"])
+        self.assertIs(self.state.current, self.font)
+
+    def test_front_without_a_window_of_the_font(self):
+        self.state.tabs = [(u"Sketchboard", None), (u" Free Sans Regular ", self.sample)]
+        self.assertIn("No window of Write Sans Regular", self.fails("front", {"font": 7}, code="not_found")["message"])
+        self.assertIs(self.state.current, self.sample, "each tab tried was put back")
+
+    def test_front_needs_the_font_named(self):
+        self.fails("front", {}, code="bad_args")
+        self.fails("front", {"font": 7, "font_name": "Free Sans Regular"}, code="font_mismatch")
+        self.assertIs(self.state.current, self.sample)
+
+    # -- opening
+    def test_open_font_opens_after_the_reply(self):
+        path = self.font_file()
+        reply = self.ok("open_font", {"path": path})
+        self.assertEqual(reply, {"queued": True, "path": path, "fonts_before": [1, 7]})
+        self.assertEqual(self.state.loads, [], "not inside the request: FontLab may ask something on the way")
+        self.state.fire_timers()
+        self.assertEqual(self.state.loads, [path])
+        self.assertEqual(self.ids(), [1, 7, 101])
+        self.assertEqual(self.listener.opened_paths, [path])
+
+    def test_open_font_names_a_font_already_open(self):
+        path = self.font_file()
+        object.__setattr__(self.font, "path", path.replace(os.sep, "/"))  # (FontLab mixes separators: live)
+        self.assertEqual(self.ok("open_font", {"path": path}), {"already_open": True,
+                                                                "font": {"id": 7, "name": "Write Sans Regular"}})
+        self.assertEqual((self.state.timers, self.listener.opened_paths), ([], []))
+
+    def test_open_font_refuses_a_path_it_cannot_open(self):
+        self.fails("open_font", {"path": "Open.ttf"}, code="bad_args")
+        self.fails("open_font", {"path": ""}, code="bad_args")
+        self.fails("open_font", {"path": os.path.join(self.tmp, "missing.ttf")}, code="not_found")
+        self.assertEqual(self.state.timers, [])
+
+    # -- closing
+    def test_close_font_closes_an_unchanged_font_after_the_reply(self):
+        reply = self.ok("close_font", {"font": 7})
+        self.assertEqual(reply, {"closing": True, "font": {"id": 7, "name": "Write Sans Regular"}, "edited": False,
+                                 "discard_changes": False})
+        self.assertIs(self.state.current, self.font, "brought to the front: File > Close Font closes the font in front")
+        self.assertEqual(self.ids(), [1, 7])
+        self.state.fire_timers()
+        self.assertEqual(self.ids(), [1])
+
+    def test_close_font_refuses_a_font_with_changes(self):
+        self.font._f_states.append(3)  # its History past its first state
+        self.assertIn("save it in FontLab first", self.fails("close_font", {"font": 7}, code="unsaved_changes")["message"])
+        object.__setattr__(self.sample, "hasChanges", True)
+        self.fails("close_font", {"font": 1}, code="unsaved_changes")
+        self.assertEqual((self.state.timers, self.ids()), ([], [1, 7]))
+
+    def test_close_font_discards_changes_only_in_a_font_opened_here(self):
+        error = self.fails("close_font", {"font": 7, "discard_changes": True}, code="not_opened_here")
+        self.assertIn("never throws away changes to a font it did not open", error["message"])
+        self.fails("close_font", {"font": 7, "discard_changes": "yes"}, code="bad_args")
+        self.assertEqual((self.state.timers, self.ids()), ([], [1, 7]))
+
+    def test_close_font_answers_dont_save_for_a_font_opened_here(self):
+        path = self.font_file()
+        self.ok("open_font", {"path": path})
+        self.state.fire_timers()
+        opened = self.state.fonts[-1]
+        opened._f_states.append(4)
+        self.state.asks_to_save.add(101)
+        self.state.current = self.sample
+        self.assertIn("close it with discard_changes", self.fails("close_font", {"font": 101}, code="unsaved_changes")["message"])
+        self.assertTrue(self.ok("close_font", {"font": 101, "discard_changes": True})["edited"])
+        self.state.fire_timers(fl.CLOSE_DELAY_MS)
+        self.assertIs(self.state.prompt, opened, "FontLab asked")
+        self.state.fire_timers()
+        self.assertEqual((self.state.answers, self.ids()), ([u"&Don\u2019t Save"], [1, 7]))
+
+    def test_the_save_question_is_left_without_discard_changes(self):
+        self.state.asks_to_save.add(7)  # (FontLab asked about a font no flag said was changed: live, at a quit)
+        self.ok("close_font", {"font": 7})
+        self.state.fire_timers()
+        self.assertIs(self.state.prompt, self.font)
+        self.assertEqual(self.state.answers, [])
+
+    def test_dont_save_only_answers_a_question_naming_the_font(self):
+        self.state.current = self.state.prompt = self.font
+        self.assertFalse(fl._answer_dont_save(7, [u"Write Sans"]), "a name the question's starts with is not it")
+        self.assertFalse(fl._answer_dont_save(1, [u"Write Sans Regular"]), "the font in front must be the one named")
+        self.assertTrue(fl._answer_dont_save(7, [u"Write Sans Regular"]))
+        self.assertEqual(self.ids(), [1])
+
+    def test_close_font_leaves_a_font_another_one_replaced_in_front(self):
+        self.ok("close_font", {"font": 7})
+        self.state.current = self.sample
+        self.state.fire_timers()
+        self.assertEqual(self.ids(), [1, 7])
+
+    # -- compiling
+    def test_compile_features_reports_what_the_compiler_said(self):
+        self.state.output = u"FreeLab listener 1.1.0 on 127.0.0.1:47761\n"
+        self.state.compiler = lambda font: u"" if font is self.sample else (
+            u'[W] lookup unused\n[F] glyph class not defined (text was "@nope")\n[F] Fatal error in font "Write.vfc"\n')
+        reply = self.ok("compile_features", {"font": 7})
+        self.assertEqual(self.state.compiled, [self.font], "brought to the front, then compiled")
+        self.assertEqual((reply["compiled"], reply["brought_forward"]), (False, True))
+        self.assertEqual(reply["errors"], [u'[F] glyph class not defined (text was "@nope")',
+                                           u'[F] Fatal error in font "Write.vfc"'])
+        self.assertEqual(reply["warnings"], [u"[W] lookup unused"])
+        self.assertEqual(reply["output_length"], len(reply["output"]))
+        clean = self.ok("compile_features", {"font": 1})
+        self.assertEqual((clean["compiled"], clean["errors"], clean["output"]), (True, [], u""))
+
+    def test_compile_features_needs_the_features_panel(self):
+        self.state.features_panel = False
+        self.assertIn("Window > Panels > Features", self.fails("compile_features", {"font": 7}, code="not_found")["message"])
+        self.assertEqual((self.state.compiled, self.state.current), ([], self.sample))
+
+    # -- the Output panel
+    def test_output_reads_from_an_offset(self):
+        self.state.output = u"abcdef"
+        self.assertEqual(self.ok("output"), {"text": u"abcdef", "start": 0, "length": 6, "cleared": False,
+                                             "truncated": False, "visible": True})
+        self.assertEqual(self.ok("output", {"offset": 4})["text"], u"ef")
+        cleared = self.ok("output", {"offset": 9})
+        self.assertEqual((cleared["text"], cleared["cleared"]), (u"abcdef", True))
+        cut = self.ok("output", {"max_chars": 2})
+        self.assertEqual((cut["text"], cut["start"], cut["truncated"]), (u"ef", 4, True))
+        self.fails("output", {"max_chars": 0}, code="bad_args")
+
+    # -- pictures
+    def test_screenshot_of_the_main_window(self):
+        import base64
+        reply = self.ok("screenshot")
+        self.assertEqual((reply["window"], reply["class"], reply["width"], reply["height"]), (u"FontLab 7", "MainWindow", 2000, 1000))
+        self.assertEqual(base64.b64decode(reply["png_base64"]), b"\x89PNG\r\n\x1a\n2000x1000")
+        small = self.ok("screenshot", {"max_width": 500})
+        self.assertEqual((small["width"], small["height"]), (500, 250))
+        self.assertEqual(self.ok("screenshot", {"max_width": 4000})["width"], 2000, "never scaled up")
+
+    def test_screenshot_of_a_window_by_title(self):
+        self.state.windows = [u"FreeLab Proof", u"FreeLab Proof Settings", u"Welcome to FontLab 7!"]
+        self.assertEqual(self.ok("screenshot", {"window": "FreeLab Proof"})["window"], u"FreeLab Proof", "exact first")
+        self.assertEqual(self.ok("screenshot", {"window": "welcome"})["window"], u"Welcome to FontLab 7!")
+        self.assertIn("Give the whole title", self.fails("screenshot", {"window": "Proof"}, code="ambiguous_window")["message"])
+        error = self.fails("screenshot", {"window": "Metrics"}, code="not_found")
+        self.assertIn(u"FontLab 7; FreeLab Proof", error["message"])
+
+    def test_an_error_after_the_reply_is_recorded(self):
+        def broken():
+            raise RuntimeError("gone")
+        self.listener.later(10, broken, "test")
+        self.assertEqual(len(self.listener.pending), 1, "held until it runs")
+        self.state.fire_timers()
+        self.assertEqual((self.listener.pending, self.listener.errors), ([], [u"RuntimeError: gone"]))
+        del self.listener.errors[:]
+
+
 class RetiredTimerTests(unittest.TestCase):
     def test_stop_keeps_its_timer_referenced(self):
         """stop() may run inside the timer's own tick; dropping the QTimer then would let PythonQt delete it

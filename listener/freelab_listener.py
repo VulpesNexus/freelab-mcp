@@ -24,7 +24,7 @@ import sys
 import time
 import traceback
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 PROTOCOL = 1
 HOST = "127.0.0.1"
 DEFAULT_PORT = 47761
@@ -865,7 +865,7 @@ def op_features(listener, args):
     package, count = target_package(args)
     features = package.fgPackage.features
     tags = [_text(t) for t in _real_list(features.keys(), "features.keys()")]
-    result = {"font": _font_ref(package), "tags": tags, "compiled": "not checked: FontLab compiles feature code when the font is exported"}
+    result = {"font": _font_ref(package), "tags": tags, "compiled": "not checked: compile_features compiles it"}
     tag = args.get("tag")
     if tag is not None:
         if not isinstance(tag, string_types) or not TAG_RE.match(tag):
@@ -1691,7 +1691,7 @@ def op_set_feature(listener, args):
 
     stored = write.run(change, restore)
     return _write_reply(package, write.finish(), tag=tag, created=before is None, before=before, code=stored,
-                        compiled="not checked: FontLab compiles feature code when the font is exported")
+                        compiled="not checked: compile_features compiles it")
 
 
 def _same_code(stored, given):
@@ -1786,6 +1786,328 @@ def _before_step(title):
     """Whether a step is a FreeLab MCP write's "(before)" step (FontLab shows titles in title case)."""
     lowered = title.lower()
     return lowered.startswith(u"freelab mcp:") and lowered.endswith(u"(before)")
+
+
+# ---------------------------------------------------------------------------
+# Fonts and windows: open, close, bring to the front, compile, the Output panel, pictures
+# ---------------------------------------------------------------------------
+# Each of these was a probe helper first, run live for weeks against test fonts (docs/FONTLAB7-API.md).
+# Opening and closing a font run from a timer, after the reply: FontLab's call returns only once any
+# question it asks on the way (Coordinates Rounding, Save changes) is answered, and a request must not
+# wait on a dialog. The server watches for the result.
+
+OPEN_DELAY_MS = 50
+CLOSE_DELAY_MS = 100
+DONT_SAVE_MS = (600, 1500, 3000, 6000, 10000)  # when close_font with discard_changes looks for FontLab's Save question
+COMPILE_TOOLTIP = u"Compile features ("  # the Features panel's button (FontLab 7.2 has no call to compile)
+OUTPUT_VIEW = "textOutput"  # the Output panel's text box (FontLab has two of that name, one hidden and empty)
+MAX_OUTPUT_CHARS = 4 * 1024 * 1024
+DEFAULT_OUTPUT_CHARS = 100000
+SAVE_PROMPT = "DlgClosePackage"  # FontLab 7.2's "Save changes to ... before closing?"
+
+
+def _qt():
+    try:
+        from PythonQt import QtCore, QtGui  # only inside FontLab
+    except ImportError:
+        raise FreeLabError("not_in_fontlab", "Qt is not available: this is not running inside FontLab.")
+    return QtCore, QtGui
+
+
+def _main_window(QtGui):
+    for widget in QtGui.QApplication.instance().topLevelWidgets():
+        if widget.metaObject().className() == "MainWindow":
+            return widget
+    raise FreeLabError("not_found", "FontLab's main window was not found.")
+
+
+def _current_id():
+    """The id of the font in front, or None."""
+    current = _fontlab().flWorkspace.instance().currentPackage
+    try:
+        return None if _is_null(current, "the current font") else _font_id(current)
+    except FreeLabError:
+        return None
+
+
+def _font_tabs(QtGui):
+    """(tab widget, index, text) of each window tab FontLab shows fonts in (Font, Glyph, Metrics...): the
+    tabs of a YTabWidget in a YDropTargetContainer; the panels' tab widgets sit elsewhere."""
+    found = []
+    for top in QtGui.QApplication.instance().topLevelWidgets():
+        if not top.isVisible():
+            continue
+        for tabs in top.findChildren(QtGui.QTabWidget):
+            if tabs.metaObject().className() != "YTabWidget":
+                continue
+            parent = tabs.parentWidget()
+            if parent is None or _text(_prop(parent, "objectName")) != "YDropTargetContainer":
+                continue
+            for index in range(int(_prop(tabs, "count"))):
+                found.append((tabs, index, _text(tabs.tabText(index)).strip()))
+    return found
+
+
+def bring_to_front(package):
+    """Make the font FontLab's current one by choosing its window tab, as a click on the tab does; whether
+    that changed anything. The tab named after the font is tried first, then each other tab; a tab that
+    does not make it current is left as it was."""
+    target = _font_id(package)
+    if _current_id() == target:
+        return False
+    QtGui = _qt()[1]
+    try:
+        name = _text(package.ffn).strip()
+    except Exception:
+        name = None
+    tabs = _font_tabs(QtGui)
+    for tab_widget, index, text in [t for t in tabs if t[2] == name] + [t for t in tabs if t[2] != name]:
+        previous = int(_prop(tab_widget, "currentIndex"))
+        if previous == index:
+            continue
+        tab_widget.setCurrentIndex(index)
+        if _current_id() == target:
+            return True
+        tab_widget.setCurrentIndex(previous)
+    raise FreeLabError("not_found", u"No window of %s was found to bring to the front: open one in FontLab (Window > "
+                       u"New Font Tab)." % _font_label(package))
+
+
+@op("front")
+def op_front(listener, args):
+    """Bring the font named to the front (FontLab's current font: what Undo and the Features panel act on)."""
+    package = write_target(args)
+    moved = bring_to_front(package)
+    return {"font": _font_ref(package), "brought_forward": moved}
+
+
+@op("open_font")
+def op_open_font(listener, args):
+    """Open a font file as File > Open does, a moment after the reply. A font already open from that path
+    is named instead. The reply lists the fonts open before, so the server can tell the new one."""
+    path = args.get("path")
+    if not isinstance(path, string_types) or not path.strip():
+        raise FreeLabError("bad_args", "path must be the font file's full path.")
+    path = _text(path).strip()
+    if not os.path.isabs(path):
+        raise FreeLabError("bad_args", u"path must be a full path, not '%s'." % path)
+    if not os.path.exists(path):
+        raise FreeLabError("not_found", u"There is no file at %s." % path)
+    fl = _fontlab()
+    before = []
+    for package in open_packages():
+        try:
+            same = _same_path(package.path, path)
+        except Exception:
+            same = False
+        if same:
+            return {"already_open": True, "font": _font_ref(package)}
+        before.append(_font_id(package))
+    _check_deadline(listener)
+    listener.later(OPEN_DELAY_MS, lambda: fl.flItems.requestLoadingFont(path), "open_font")
+    listener.opened_paths.append(path)  # (close_font discards changes only in a font opened here)
+    return {"queued": True, "path": path, "fonts_before": before}
+
+
+def _edited(package):
+    """Whether the font changed since it was opened, as far as FontLab says: its History is past its first
+    state, or it is marked changed. A read that fails counts as changed. (hasHistoryStates is no sign: it
+    was True for a font just opened, live.)"""
+    try:
+        return package.currentHistoryState() != package.initialHistoryState() or bool(package.hasChanges)
+    except Exception:
+        return True
+
+
+def _opened_here(listener, package):
+    try:
+        path = package.path
+    except Exception:
+        return False
+    return any(_same_path(path, opened) for opened in listener.opened_paths)
+
+
+@op("close_font")
+def op_close_font(listener, args):
+    """Close a font as File > Close Font does, a moment after the reply. A font with changes is refused,
+    unless discard_changes is given for a font open_font opened in this session: FontLab's Save question
+    for that font is then answered Don't Save."""
+    package = write_target(args)
+    discard = args.get("discard_changes", False)
+    if not isinstance(discard, bool):
+        raise FreeLabError("bad_args", "discard_changes must be true or false.")
+    label = _font_label(package)
+    opened_here = _opened_here(listener, package)
+    edited = _edited(package)
+    if discard and not opened_here:
+        raise FreeLabError("not_opened_here", u"%s was not opened with open_font in this session: FreeLab MCP never throws "
+                           u"away changes to a font it did not open. Save it or close it in FontLab." % label)
+    if edited and not discard:
+        raise FreeLabError("unsaved_changes", u"%s has changes that are not saved: save it in FontLab first%s. Nothing was "
+                           u"closed." % (label, u", or close it with discard_changes" if opened_here else u""))
+    if _main_window_action("actionClose_Fonts") is None:
+        raise FreeLabError("not_found", "FontLab's File > Close Font was not found; nothing was closed.")
+    _check_deadline(listener)
+    bring_to_front(package)
+    target = _font_id(package)
+    names = [n for n in (_text(getattr(package, key, u"") or u"").strip() for key in ("ffn", "psn")) if n]
+    try:
+        path = _text(package.path)
+        names.append(os.path.basename(path.replace(u"/", os.sep)))
+    except Exception:
+        path = None
+
+    def close():
+        if _current_id() != target:
+            return  # something else came to the front meanwhile: left open (the server says so)
+        _main_window_action("actionClose_Fonts").trigger()  # returns once FontLab's question, if any, is answered
+        if path and not any(_font_id(p) == target for p in open_packages()):
+            listener.opened_paths[:] = [p for p in listener.opened_paths if not _same_path(p, path)]
+
+    if discard:
+        for delay in DONT_SAVE_MS:
+            listener.later(delay, lambda: _answer_dont_save(target, names), "close_font")
+    listener.later(CLOSE_DELAY_MS, close, "close_font")
+    return {"closing": True, "font": _font_ref(package), "edited": edited, "discard_changes": discard}
+
+
+def _answer_dont_save(target, names):
+    """Don't Save, on FontLab's Save question about this font only: the font is the one in front and the
+    question names it in quotes (live: Save changes to  "Varela Round Regular" before closing?), so a font
+    whose name merely starts the same is not taken for it. Whether it was answered."""
+    QtGui = _qt()[1]
+    if _current_id() != target:
+        return False
+    for widget in QtGui.QApplication.instance().topLevelWidgets():
+        if not widget.isVisible() or widget.metaObject().className() != SAVE_PROMPT:
+            continue
+        text = u" ".join(_label_text(label) for label in widget.findChildren(QtGui.QLabel))
+        if not any(u'"%s"' % name in text for name in names):
+            continue
+        for button in widget.findChildren(QtGui.QAbstractButton):
+            words = _MNEMONIC.sub(r"\1", _text(_prop(button, "text") or u"")).replace(u"\u2019", u"'").strip().lower()
+            if words == u"don't save":
+                button.click()
+                return True
+    return False
+
+
+def _output_view(main, QtGui):
+    """FontLab's Output panel's text box: the one shown, else one that holds text, else either (FontLab has
+    two of that name, the first hidden and empty), or None."""
+    views = [w for w in main.findChildren(QtGui.QTextEdit) if _text(_prop(w, "objectName")) == OUTPUT_VIEW]
+    for wanted in (lambda w: w.isVisible(), lambda w: bool(_text(w.toPlainText()))):
+        for view in views:
+            if wanted(view):
+                return view
+    return views[0] if views else None
+
+
+@op("output")
+def op_output(listener, args):
+    """FontLab's Output panel's text from offset on (the length an earlier read gave); cleared says the
+    panel holds less than offset (FontLab clears it, at each compile for one), and the text is then all of it."""
+    offset = _int_arg(args, "offset", 0, 0, 10 ** 9)
+    limit = _int_arg(args, "max_chars", DEFAULT_OUTPUT_CHARS, 1, MAX_OUTPUT_CHARS)
+    QtGui = _qt()[1]
+    view = _output_view(_main_window(QtGui), QtGui)
+    if view is None:
+        raise FreeLabError("not_found", "FontLab's Output panel was not found: open it (Window > Panels > Output).")
+    text = _text(view.toPlainText())
+    cleared = offset > len(text)
+    start = 0 if cleared else offset
+    truncated = len(text) - start > limit
+    if truncated:
+        start = len(text) - limit
+    return {"text": text[start:], "start": start, "length": len(text), "cleared": cleared, "truncated": truncated,
+            "visible": bool(view.isVisible())}
+
+
+COMPILE_ERROR = re.compile(r"^\[(F|E)\]")
+COMPILE_WARNING = re.compile(r"^\[W\]")
+
+
+def compile_report(text):
+    """What FontLab's compiler printed, sorted: [F] and [E] lines are errors, [W] lines warnings."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    errors = [line for line in lines if COMPILE_ERROR.match(line)]
+    warnings = [line for line in lines if COMPILE_WARNING.match(line)]
+    return {"compiled": not errors, "errors": errors, "warnings": warnings}
+
+
+@op("compile_features")
+def op_compile_features(listener, args):
+    """Compile a font's feature code as the Features panel's Compile button does, the font brought to the
+    front first (the panel compiles the font in front). The compile runs within the click (live: it
+    returned with the compiler's messages in place); FontLab clears the Output panel first, and prints
+    nothing for code that compiles."""
+    package = write_target(args)
+    QtGui = _qt()[1]
+    main = _main_window(QtGui)
+    buttons = [b for b in main.findChildren(QtGui.QAbstractButton) if _text(_prop(b, "objectName")) == "buttonCompile"
+               and _text(_prop(b, "toolTip") or u"").startswith(COMPILE_TOOLTIP)]
+    if not buttons:
+        raise FreeLabError("not_found", "FontLab's Features panel was not found: open it once (Window > Panels > "
+                           "Features), then compile again. Nothing was compiled.")
+    if not _prop(buttons[0], "enabled"):
+        raise FreeLabError("unavailable", "The Features panel's Compile button is disabled; nothing was compiled.")
+    view = _output_view(main, QtGui)
+    if view is None:
+        raise FreeLabError("not_found", "FontLab's Output panel, where its compiler writes, was not found: open it "
+                           "(Window > Panels > Output). Nothing was compiled.")
+    _check_deadline(listener)
+    moved = bring_to_front(package)
+    if _current_id() != _font_id(package):
+        raise FreeLabError("not_in_front", u"%s could not be brought to the front; nothing was compiled." % _font_label(package))
+    started = time.time()
+    buttons[0].click()
+    text = _text(view.toPlainText())
+    reply = {"font": _font_ref(package), "brought_forward": moved, "seconds": round(time.time() - started, 3),
+             "output": text, "output_length": len(text)}
+    reply.update(compile_report(text))
+    return reply
+
+
+MAX_SCREENSHOT_WIDTH = 16384
+
+
+@op("screenshot")
+def op_screenshot(listener, args):
+    """A PNG of one of FontLab's windows, drawn by Qt as it is now (another program over it is not in it):
+    the main window, or the window whose title is given (exactly, else as the only one that contains it).
+    max_width scales a wider picture down."""
+    wanted = args.get("window") or u""
+    if not isinstance(wanted, string_types):
+        raise FreeLabError("bad_args", "window must be a window title.")
+    max_width = _int_arg(args, "max_width", 0, 0, MAX_SCREENSHOT_WIDTH)
+    QtCore, QtGui = _qt()
+    windows = [w for w in QtGui.QApplication.instance().topLevelWidgets() if w.isVisible()]
+    titles = [_text(_prop(w, "windowTitle") or u"") for w in windows]
+    wanted = _text(wanted).strip()
+    if not wanted:
+        found = [_main_window(QtGui)]
+    else:
+        found = [w for w, t in zip(windows, titles) if t == wanted] or \
+                [w for w, t in zip(windows, titles) if wanted.lower() in t.lower()]
+    if not found:
+        raise FreeLabError("not_found", u"No FontLab window is titled '%s'. Its windows: %s." % (
+            wanted, u"; ".join(t for t in titles if t) or u"none shown"))
+    if len(found) > 1:
+        raise FreeLabError("ambiguous_window", u"%d FontLab windows match '%s': %s. Give the whole title." % (
+            len(found), wanted, u"; ".join(_text(_prop(w, "windowTitle")) for w in found)))
+    window = found[0]
+    picture = window.grab()
+    if max_width and picture.width() > max_width:
+        picture = picture.scaledToWidth(max_width, 1)  # Qt::SmoothTransformation
+    data = QtCore.QByteArray()
+    buffer = QtCore.QBuffer(data)
+    buffer.open(QtCore.QIODevice.WriteOnly)
+    if not picture.save(buffer, "PNG"):
+        raise FreeLabError("failed", "Qt could not make a PNG of the window.")
+    png = bytes(data.data())
+    return {"window": _text(_prop(window, "windowTitle") or u""), "class": window.metaObject().className(),
+            "width": picture.width(), "height": picture.height(),
+            "png_base64": binascii.b2a_base64(png).decode("ascii").strip()}
 
 
 class _Capture(object):
@@ -1937,6 +2259,25 @@ class Listener(object):
         self.quit_requested = False
         self.closing = False  # inside the main window's close(), which may wait on FontLab's save question
         self.deadline = None  # the request being handled: its deadline (seconds since the epoch), or None
+        self.pending = []  # callbacks waiting on a timer (later): held, since PythonQt drops a slot nothing holds
+        self.opened_paths = []  # paths open_font opened (close_font may discard changes only in those)
+
+    # -- work after the reply ------------------------------------------------
+    def later(self, delay_ms, func, key):
+        """Run func from a single-shot timer, after this request's reply; an error it raises is recorded
+        under key (a Qt timer callback must not raise)."""
+        from PythonQt.QtCore import QTimer  # only inside FontLab
+
+        def run():
+            try:
+                func()
+            except BaseException as exc:
+                self._record(key, exc)
+            finally:
+                if run in self.pending:
+                    self.pending.remove(run)
+        self.pending.append(run)
+        QTimer.singleShot(delay_ms, run)
 
     # -- quitting FontLab ----------------------------------------------------
     def request_quit(self, delay_ms=QUIT_DELAY_MS):

@@ -25,9 +25,11 @@ from freelab_mcp import client, server  # noqa: E402
 EXPECTED_TOOLS = {"fontlab_status", "list_fonts", "get_current_font", "list_glyphs", "get_glyph", "get_glyph_outline",
                   "get_kerning", "get_features", "set_kerning_pair", "remove_kerning_pair", "set_glyph_metrics",
                   "rename_glyph", "set_glyph_unicodes", "add_component_glyph", "set_anchor", "remove_anchor",
-                  "set_feature_code", "undo", "run_python", "launch_fontlab", "quit_fontlab", "restart_fontlab"}
+                  "set_feature_code", "undo", "run_python", "launch_fontlab", "quit_fontlab", "restart_fontlab",
+                  "open_font", "close_font", "bring_font_to_front", "compile_features", "read_output", "screenshot"}
 WRITE_TOOLS = {"set_kerning_pair", "remove_kerning_pair", "set_glyph_metrics", "rename_glyph", "set_glyph_unicodes",
-               "add_component_glyph", "set_anchor", "remove_anchor", "set_feature_code", "undo"}
+               "add_component_glyph", "set_anchor", "remove_anchor", "set_feature_code", "undo",
+               "close_font", "bring_font_to_front", "compile_features"}  # (the tools that name their font)
 
 
 class ServerCase(unittest.TestCase):
@@ -50,6 +52,7 @@ class ServerCase(unittest.TestCase):
     def _loop(self):
         while not self.stop_event.is_set():
             self.listener.tick()
+            self.state.fire_timers()  # (FontLab's QTimer.singleShot callbacks, on the listener's thread)
             time.sleep(0.005)
 
     def tearDown(self):
@@ -124,7 +127,7 @@ class ToolTests(ServerCase):
         status = asyncio.run(server.fontlab_status())
         self.assertEqual(status["fonts_open"], 0)
         self.assertEqual(status["listener"]["listener"], fl.VERSION)
-        self.assertEqual(status["server"], "1.0.0")
+        self.assertEqual(status["server"], "1.1.0")
 
     def test_font_and_glyph_tools(self):
         self.open_sample()
@@ -318,6 +321,85 @@ class WriteToolTests(ServerCase):
             asyncio.run(server.set_kerning_pair(7, "V", "A", -5))
         with self.assertRaisesRegex(RuntimeError, r"\[no_such_font\]"):
             asyncio.run(server.set_kerning_pair("Nope", "B", "A", -5))
+
+
+class WindowToolTests(ServerCase):
+    """Opening, closing, bringing to the front, compiling, the Output panel, and pictures, through the real
+    server, client, and listener, on the fakes; FontLab's timers fire on the listener's thread."""
+
+    def setUp(self):
+        super().setUp()
+        self.font = fakes.write_font()
+        self.state.fonts = [fakes.sample_font(), self.font]
+        self.state.current = self.state.fonts[0]
+        self.qt = fakes.install_qt(self.state)
+        self._poll = server.POLL_S
+        server.POLL_S = 0.01
+        self.start_listener()
+        self.path = os.path.join(self.tmp, "Open.ttf")
+        Path(self.path).write_bytes(b"font")
+
+    def tearDown(self):
+        server.POLL_S = self._poll
+        super().tearDown()
+        fakes.uninstall_qt(self.qt)
+
+    def ids(self):
+        return [entry["id"] for entry in asyncio.run(server.list_fonts())["fonts"]]
+
+    def test_open_then_close_a_font(self):
+        opened = asyncio.run(server.open_font(self.path))
+        self.assertEqual((opened["opened"], opened["font"]["id"], opened["font"]["path"]), (True, 101, self.path))
+        again = asyncio.run(server.open_font(self.path))
+        self.assertEqual((again["opened"], again["already_open"], again["font"]["id"]), (False, True, 101))
+        self.assertEqual(asyncio.run(server.close_font(101)), {"closed": True, "font": {"id": 101, "name": "Free Sans Regular"},
+                                                               "changes_discarded": False})
+        self.assertEqual(self.ids(), [1, 7])
+
+    def test_open_stops_at_fontlabs_question(self):
+        self.state.hold_open = True
+        with self.assertRaisesRegex(RuntimeError, r"\[dialog_open\] FontLab is asking: Round the coordinates"):
+            asyncio.run(server.open_font(self.path, wait_s=5))
+        with self.assertRaisesRegex(RuntimeError, r"\[bad_args\] wait_s"):
+            asyncio.run(server.open_font(self.path, wait_s=0))
+
+    def test_close_leaves_fontlabs_save_question_for_the_user(self):
+        self.state.asks_to_save.add(7)
+        with self.assertRaisesRegex(RuntimeError, r'\[save_prompt\] FontLab is asking: Save changes to  "Write Sans Regular"'):
+            asyncio.run(server.close_font(7, wait_s=5))
+        self.assertEqual(self.state.answers, [])
+
+    def test_close_discards_changes_in_a_font_it_opened(self):
+        asyncio.run(server.open_font(self.path))
+        self.state.fonts[-1]._f_states.append(4)
+        self.state.asks_to_save.add(101)
+        with self.assertRaisesRegex(RuntimeError, r"\[unsaved_changes\]"):
+            asyncio.run(server.close_font(101))
+        with self.assertRaisesRegex(RuntimeError, r"\[not_opened_here\]"):
+            asyncio.run(server.close_font(7, discard_changes=True))
+        closed = asyncio.run(server.close_font(101, discard_changes=True, font_name="FreeSans-Regular"))
+        self.assertEqual((closed["closed"], closed["changes_discarded"]), (True, True))
+        self.assertEqual(self.ids(), [1, 7])
+
+    def test_front_and_compile(self):
+        self.assertTrue(asyncio.run(server.bring_font_to_front(7))["brought_forward"])
+        self.state.current = self.state.fonts[0]
+        self.state.compiler = lambda font: u"[F] glyph class not defined (text was \"@nope\")\n" if font is self.font else u""
+        reply = asyncio.run(server.compile_features(7))
+        self.assertEqual((reply["compiled"], reply["errors"], reply["brought_forward"]),
+                         (False, ['[F] glyph class not defined (text was "@nope")'], True))
+        self.assertTrue(asyncio.run(server.compile_features(1))["compiled"])
+        self.assertEqual(asyncio.run(server.read_output())["length"], 0, "FontLab cleared the panel at the compile")
+
+    def test_screenshot_is_an_image(self):
+        picture, about = asyncio.run(server.screenshot())
+        self.assertEqual(picture.data, b"\x89PNG\r\n\x1a\n1600x800")
+        self.assertEqual((about["window"], about["width"]), ("FontLab 7", 1600))
+        result = asyncio.run(server.mcp.call_tool("screenshot", {"max_width": 0}))
+        blocks = result[0] if isinstance(result, tuple) else result
+        self.assertEqual([block.type for block in blocks], ["image", "text"])
+        self.assertEqual(blocks[0].mimeType, "image/png")
+        self.assertIn('"width": 2000', blocks[1].text)
 
 
 class ClientLimitTests(unittest.TestCase):

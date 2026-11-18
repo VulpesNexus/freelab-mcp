@@ -8,13 +8,15 @@ server keeps answering pings and cancellations while FontLab works.
 
 from __future__ import annotations
 
+import base64
 import functools
 import json
+import os
 import time
 from typing import Annotated, Any
 
 import anyio
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 from pydantic import Strict
 
 from . import __version__, launcher
@@ -36,7 +38,10 @@ mcp = FastMCP(
         "PostScript name, or full name), or on the font in front when none is named. Write tools need font: "
         "they never guess which font to change, and font_name (its path or name) confirms an id. Each write is one step of FontLab's History (Edit > Undo, or "
         "the undo tool, takes it back), marks the font modified, and returns what changed; nothing is ever "
-        "saved, exported, or closed. Make a write only when the user asked for that change. Reads that FontLab "
+        "saved or exported. Make a write only when the user asked for that change, and open or close a font "
+        "only when asked; close_font throws changes away only with discard_changes, in a font open_font opened. "
+        "compile_features reports what FontLab's compiler says of a font's feature code; screenshot shows a "
+        "FontLab window; read_output reads its Output panel. Reads that FontLab "
         "could not answer are listed under 'unreadable' and must not be reported as empty or zero. Outline "
         "coordinates are shape-local: each shape's transform is reported, not applied. run_python executes "
         "code inside FontLab with full access to the open fonts; prefer the dedicated tools."
@@ -308,6 +313,160 @@ async def undo(font: FontRef, expected_state: Int | None = None, expected_title:
     """
     return await _write("undo", _font({"expected_state": expected_state, "expected_title": expected_title,
                                        "font_name": font_name}, font))
+
+
+# -- Fonts and windows: open, close, bring to the front, compile, the Output panel, pictures ----------------
+
+POLL_S = 0.5  # how often open_font and close_font look whether FontLab has done it
+COMPILE_REREAD_S = 0.5  # compile_features reads the Output panel once more after this, in case FontLab still wrote
+
+
+def _wait_arg(wait_s: float) -> None:
+    if not 0 < wait_s <= MAX_TIMEOUT_S:
+        raise RuntimeError(f"[bad_args] wait_s must be above 0 and at most {MAX_TIMEOUT_S:g}.")
+
+
+def _same_path(a: Any, b: Any) -> bool:
+    def norm(path: str) -> str:
+        return os.path.normcase(os.path.normpath(path.replace("/", os.sep).replace("\\", os.sep)))
+    return isinstance(a, str) and isinstance(b, str) and bool(a) and bool(b) and norm(a) == norm(b)
+
+
+def _question(dialog: dict[str, Any]) -> str:
+    words = " ".join(dialog.get("text") or []) or dialog.get("title") or dialog.get("class")
+    return f"{words} (buttons: {', '.join(dialog.get('buttons') or [])})"
+
+
+def _dialog_key(dialog: dict[str, Any] | None) -> tuple[Any, Any] | None:
+    return None if dialog is None else (dialog.get("class"), dialog.get("title"))
+
+
+async def _open_fonts() -> list[dict[str, Any]] | None:
+    """The open fonts, or None while FontLab is too busy to answer (loading a font, for one)."""
+    try:
+        return (await _call("fonts", timeout=10.0))["fonts"]
+    except RuntimeError as exc:
+        if str(exc).startswith("[timeout]"):
+            return None
+        raise
+
+
+@mcp.tool()
+async def open_font(path: str, wait_s: float = 120.0) -> dict[str, Any]:
+    """Open a font file in FontLab, as File > Open Fonts does (only when the user asked to open it).
+
+    path is the file's full path (.vfc, .vfj, .ufo, .otf, .ttf, ... : whatever FontLab opens). A font already
+    open from that path is named instead (already_open). The tool waits up to wait_s for the font to appear
+    and returns it as list_fonts describes it, with the id the other tools take. When FontLab asks something
+    on the way (Coordinates Rounding, for a font with fractional coordinates), the question is left on
+    screen for the user and the tool stops ([dialog_open]); the font opens once it is answered.
+    """
+    _wait_arg(wait_s)
+    shown_before = _dialog_key(await _open_dialog())  # (FontLab's welcome window, for one, is not a question about this)
+    reply = await _call("open_font", {"path": path})
+    if reply.get("already_open"):
+        return {"opened": False, "already_open": True, "font": reply["font"]}
+    before = set(reply.get("fonts_before") or [])
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        await anyio.sleep(POLL_S)
+        fonts = await _open_fonts()
+        if fonts is None:
+            continue
+        new = [font for font in fonts if font.get("id") not in before]
+        same = [font for font in new if _same_path(font.get("path"), reply["path"])]
+        if same:
+            return {"opened": True, "font": same[0]}
+        if len(new) == 1:
+            return {"opened": True, "font": new[0], "note": "FontLab gives the font another path than the file opened."}
+        dialog = await _open_dialog()
+        if dialog is not None and _dialog_key(dialog) != shown_before:
+            raise RuntimeError(f"[dialog_open] FontLab is asking: {_question(dialog)}. It was left on screen for the "
+                               "user to answer; the font opens once it is answered.")
+    raise RuntimeError(f"[not_opened] FontLab did not open {path} within {wait_s:g} s; it may still be loading it "
+                       "(list_fonts shows it once it is open).")
+
+
+@mcp.tool()
+async def close_font(font: FontRef, discard_changes: bool = False, font_name: str = "",
+                     wait_s: float = 30.0) -> dict[str, Any]:
+    """Close a font in FontLab, as File > Close Font does (only when the user asked to close it).
+
+    A font with unsaved changes is refused. discard_changes=True closes one anyway, throwing its changes
+    away, and only a font open_font opened in this FontLab session: FontLab's Save question about that font
+    is answered Don't Save. FreeLab MCP never throws away changes to a font it did not open. When FontLab
+    asks to save a font closed without discard_changes, the question is left on screen for the user and the
+    tool stops ([save_prompt]).
+    """
+    _wait_arg(wait_s)
+    reply = await _write("close_font", _named(font_name, {"discard_changes": discard_changes}, font))
+    target = reply["font"]["id"]
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        await anyio.sleep(POLL_S)
+        fonts = await _open_fonts()
+        if fonts is None:
+            continue
+        if not any(entry.get("id") == target for entry in fonts):
+            return {"closed": True, "font": reply["font"], "changes_discarded": bool(discard_changes and reply.get("edited"))}
+        dialog = await _open_dialog()
+        if dialog is not None and dialog.get("class") == SAVE_PROMPT_CLASS and not discard_changes:
+            raise RuntimeError(f"[save_prompt] FontLab is asking: {_question(dialog)}. It was left on screen for the user "
+                               "to answer; the font stays open until then.")
+    raise RuntimeError(f"[still_open] {reply['font'].get('name')} is still open after {wait_s:g} s: FontLab may be asking "
+                       "something on screen, or another font came to the front first.")
+
+
+@mcp.tool()
+async def bring_font_to_front(font: FontRef, font_name: str = "") -> dict[str, Any]:
+    """Make a font FontLab's font in front, as a click on its window tab does: undo and compile_features act
+    on the font in front, as do FontLab's own menus."""
+    return await _write("front", _named(font_name, {}, font))
+
+
+def _compile_lines(text: str) -> dict[str, Any]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    errors = [line for line in lines if line.startswith(("[F]", "[E]"))]
+    return {"compiled": not errors, "errors": errors, "warnings": [line for line in lines if line.startswith("[W]")]}
+
+
+@mcp.tool()
+async def compile_features(font: FontRef, font_name: str = "") -> dict[str, Any]:
+    """Compile a font's OpenType feature code as the Features panel's Compile button does, and return what
+    FontLab's compiler said: compiled (no errors), errors ([F] and [E] lines), warnings ([W] lines), and
+    the whole output. The font is brought to the front first (the panel compiles the font in front).
+    FontLab's Features panel must have been opened once in this session (Window > Panels > Features).
+    FontLab clears its Output panel when it compiles."""
+    reply = await _write("compile_features", _named(font_name, {}, font))
+    await anyio.sleep(COMPILE_REREAD_S)
+    try:
+        again = await _call("output", {"offset": 0}, timeout=10.0)
+    except RuntimeError:
+        return reply
+    if again.get("text") != reply.get("output") and not again.get("truncated"):
+        reply.update(output=again["text"], output_length=again["length"], **_compile_lines(again["text"]))
+    return reply
+
+
+@mcp.tool()
+async def read_output(offset: Int = 0, max_chars: Int = 100000) -> dict[str, Any]:
+    """Read FontLab's Output panel, where scripts print and the feature compiler reports.
+
+    offset: the length a read before returned, to get only what came since; cleared is true when the
+    panel now holds less (FontLab cleared it), and the text is then all of it. A longer text is cut to its
+    last max_chars characters (truncated).
+    """
+    return await _call("output", {"offset": offset, "max_chars": max_chars})
+
+
+@mcp.tool()
+async def screenshot(window: str = "", max_width: Int = 1600):
+    """A picture (PNG) of one of FontLab's windows as Qt draws it now, even behind other programs: the main
+    window, or the window whose title is window (a dialog, a script's window; exact, else the only title
+    that contains it). A wider picture is scaled down to max_width pixels (0: full size)."""
+    reply = await _call("screenshot", {"window": window, "max_width": max_width}, timeout=60.0)
+    data = base64.b64decode(reply.pop("png_base64"))
+    return [Image(data=data, format="png"), reply]
 
 
 @mcp.tool()

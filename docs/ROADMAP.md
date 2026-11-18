@@ -5,6 +5,10 @@
 - Every read proven live on test fonts ([FONTLAB7-API.md](FONTLAB7-API.md)), with fonts named by id, path, or name.
 - Undoable writes: kerning pairs, metrics, glyph names, code points, component glyphs, anchors, and feature code, and `undo`.
 
+## Done in 1.1.0
+
+What FreeLab Script Suite's live probes did by hand, as tools, each proven live on test fonts: opening and closing fonts (`open_font`, `close_font`), bringing a font to the front, compiling feature code with FontLab's own compiler and reading its errors, reading the *Output* panel, and pictures of FontLab's windows.
+
 ## Next
 
 - **Drawing contours** and **deleting glyphs**, each one a single History step like the writes in 1.0.0, verified by a re-read before it is reported as done. Check the FontLab 8 traps listed in [FONTLAB7-API.md](FONTLAB7-API.md) first.
