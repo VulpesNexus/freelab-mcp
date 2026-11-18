@@ -90,6 +90,29 @@ The rows below are new in 1.2.0, proven live on 2026-11-19 in FontLab 7.2.0 on t
 | Windows `kernel32`, `advapi32` | `CreateFileW` with a protected one-entry access list in its `SECURITY_ATTRIBUTES`, no sharing; `SetFileSecurityW` as the fallback | Win32, through `ctypes` | the state file and *opened.json* | **live** inside FontLab's Python: `icacls` shows one entry (the user, full access, nothing inherited) on both; `ping` says `state_file_private: true` |
 | Windows `user32`, `gdi32` (the server) | `EnumWindows`, `GetWindowThreadProcessId`, `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT)`, `StretchBlt` into a DIB, `SetThreadDpiAwarenessContext` | Win32, through `ctypes` | `screenshot` with `source="screen"` | **live** at 100 % display scaling: the main window full size (2576 × 1408, its frame included) and scaled, and *Coordinates Rounding* by title, with its title bar (496 × 233, where Qt's picture is 480 × 194); above 100 % unproven |
 
+## The window tools (1.3.0)
+
+New in 1.3.0 ([WINDOW-TOOLS.md](WINDOW-TOOLS.md)), and **stub-tested only**: the spy fakes of *tests/widgetfakes.py* allow these members and no other, but none has run in FontLab yet. Several are already used live by FreeLab Script Suite (the suite column), which makes them likely, not proven.
+
+| Object | Member | Used by | Suite |
+|---|---|---|---|
+| `QApplication` | `topLevelWidgets()`, `activeModalWidget()` | every window tool | yes |
+| `QObject`, `QWidget` | `children()`, `isWidgetType()`, `isWindow()`, `inherits(name)`, `metaObject().className()`, `objectName`, `property(name)` (a dynamic property; `None` when unset), `isVisible()`, `parentWidget()`, `layout()`, `windowTitle`, `enabled`, `modal`, `accessibleName`, `toolTip`, `findChildren(QProgressBar)`, `findChildren(QMenuBar)` | the walk, the conventions, busy | most |
+| `QLayout`, `QLayoutItem` | `count()`, `itemAt(i)`; `widget()`, `layout()` | a control's caption from the label before it | yes |
+| `QAbstractButton` | `text`, `checkable`, `checked`, `click()` | `click`, `set_value` | `click()`: no |
+| `QPushButton`, `QToolButton` | `menu()`; `popupMode`, `defaultAction()` | a button's menu entries | partly |
+| `QCheckBox` | `tristate`, `checkState()` | `set_value` | no |
+| `QComboBox` | `count`, `itemText(i)`, `currentIndex`, `currentText`, `setCurrentIndex(i)`, the signal `activated(int)` emitted by calling it | `set_value` | no |
+| `QSpinBox`, `QDoubleSpinBox`, `QAbstractSlider` | `value`, `minimum`, `maximum`, `readOnly`, `setValue(v)`, the signal `editingFinished()` emitted | `set_value` | no |
+| `QLineEdit` | `text`, `readOnly`, `setText(t)`, the signals `textEdited(QString)` and `editingFinished()` emitted | `set_value` | no |
+| `QTextEdit`, `QPlainTextEdit`, `QTextBrowser` | `toPlainText()`, `toHtml()`, `readOnly`, `setPlainText(t)`, the signal `anchorClicked(QUrl)` emitted with `QtCore.QUrl(href)` | `read_text`, `click_link`, `set_value` | no |
+| `QLabel` | `text`, `textFormat`, `buddy()`, `openExternalLinks`, the signal `linkActivated(QString)` emitted | captions, `read_text`, `click_link` | partly |
+| `QTabWidget`, `QTabBar` | `count`, `tabText(i)`, `currentIndex`, `setCurrentIndex(i)`, `isTabEnabled(i)`; `widget(i)` | `set_value`, tab context | partly |
+| `QAbstractItemView`, `QTreeView` | `model()`, `selectionModel().isSelected(index)`, `setCurrentIndex(index)`, the signals `clicked`, `doubleClicked`, and `activated(QModelIndex)` emitted; `isExpanded(index)` | `read_list`, `click` and `set_value` on a row | no |
+| `QAbstractItemModel` | `rowCount(parent)`, `columnCount(parent)`, `index(row, column, parent)`, `data(index, role)`, `headerData(section, Qt.Horizontal, role)`, `flags(index)`, `setData(index, value, Qt.CheckStateRole)`; `QtCore.QModelIndex()` for the root | `read_list`, `set_value` on a row | no |
+| `QProgressBar` | `value`, `minimum`, `maximum` | busy | yes |
+| `QMenuBar`, `QMenu`, `QAction` | `actions()`; `text`, `objectName`, `enabled`, `visible`, `checkable`, `checked`, `isSeparator()`, `menu()`, `property(name)`, `trigger()` | `list_menu`, `run_menu_command`, button menus | yes |
+
 ## Writes, found live (2026-11-16)
 
 FontLab 7.2.0, the six corpus fonts above, never saved.
@@ -199,6 +222,22 @@ FontLab 7.2.0, test fonts from the corpus, never saved over their files; the che
 - **`getPlainPairsDict` withheld for a large font**: no test font came near 500,000 flattened pairs.
 - **`set_prefix` inside a rename**: no test font named a candidate glyph in its prefix outside the *Classes* panel's lines.
 - **The state file against another account**: born with one entry (`icacls`); a second account holding it open was not tried.
+
+### The window tools (1.3.0), to prove live
+
+Each to be proven by driving a whole FreeLab Script Suite workflow through the tools, on a disposable test font:
+
+- **Emitting a signal by calling it**, as PythonQt's documentation says: `QComboBox.activated(i)` (with its two overloads, `int` and `QString`), `editingFinished()`, `textEdited(text)`, `QTextBrowser.anchorClicked(QUrl)`, `QLabel.linkActivated(href)`, and a view's `clicked`, `doubleClicked`, and `activated(QModelIndex)`, each reaching the script's slot (the suite connects them by signature: `activated(int)`, `anchorClicked(QUrl)`, `itemDoubleClicked(QTreeWidgetItem*,int)` through the tree's own `doubleClicked`).
+- **`QAbstractButton.click()`** from a timer: the slot runs, a check box toggles (`toggled(bool)` too), and a tool button whose menu shows at the press (`InstantPopup`) is never clicked; a push button with a menu is never clicked either.
+- **One wrapper per Qt object**: `activeModalWidget()` and `topLevelWidgets()` give the same Python object for a window (`is` or `==`), as do a label's `buddy()` and a layout's `itemAt(i).widget()` for a control; the re-check when a timer fires depends on it.
+- **`property(name)` of an unset dynamic property is `None`**, and a property set from Python (`setProperty("mcpBusy", True)`, a text) reads back as a `bool` or a text.
+- **`isWindow()`** of a dialog a window parents is true, so the walk leaves it out; a floating panel is a top-level window that inherits `QDockWidget`.
+- **A walk of FontLab's main window** (`list_window_controls("main")`, thousands of widgets) stays under a second or so, and under `MAX_WALK`; the panels' addresses read well (*Features > Compile features … > button*).
+- **The model calls** on the suite's `QTreeWidget`s and `QTableView`s: `QtCore.QModelIndex()` as the root, `data()` giving text or `None`, `flags()` convertible with `int()`, `setData(index, 2, Qt.CheckStateRole)` emitting `itemChanged`, and `setCurrentIndex(index)` selecting the row (`itemSelectionChanged`).
+- **Busy and idle**: the suite's busy bar (`freelabBusyBar`, a `QProgressBar` shown only while it works) is seen as busy and then idle; its input guard does not stop the listener's sockets and timers, so `wait_idle` gets answers while the work runs; a click whose work pumps events leaves the action `running` until the work is over.
+- **A modal dialog during an action**: a suite question (`QMessageBox.exec_()`) shown by a click is the active modal widget; `wait_idle` returns it, and a `click` on it (with `mcpScriptWindow` set on it) runs inside its loop and lets the first action end.
+- **Menus**: the main window's `QMenuBar` is found by `findChildren`; *Scripts > FreeLab* lists the suite's commands without being opened first (FontLab may build it as it opens: then `list_menu` says so), and `trigger()` on one, from the listener's timer, runs the script as the menu does (FontLab's script runner with the listener's frames on the stack: its module globals keep `__builtins__`).
+- **FontLab's own windows**: whether a floating window of FontLab's (not a panel) shows a progress bar while idle (it would be taken for busy), and what classes FontLab's questions have (`DlgClosePackage` and *Coordinates Rounding* are questions whatever their class: any modal dialog is).
 
 ### A font with no window tab (candidates)
 

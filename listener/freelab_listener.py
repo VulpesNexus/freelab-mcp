@@ -24,7 +24,7 @@ import sys
 import time
 import traceback
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 PROTOCOL = 1
 HOST = "127.0.0.1"
 DEFAULT_PORT = 47761
@@ -65,6 +65,13 @@ RISKY_ACTIONS = [
      "Removes the glyph's kerning pairs and kerning class memberships along with the glyph.", True),
     ("save_font", "save_font", "Writes the font's file on disk (File > Save, or a UFO or VFB file).", True),
     ("export_font", "export_font", "Writes font files on disk through FontLab's export.", True),
+    ("question_control", "click, set_value, click_link",
+     "Clicks or changes a control of a question FontLab is asking (a Save question, Coordinates Rounding, ...), "
+     "as answer_dialog does.", True),
+    ("risky_command", "click, set_value, click_link, run_menu_command",
+     "Runs a command of FontLab's File menu, a button or menu command named Save, Export, Close, Quit, Exit, Revert, "
+     "or Discard (outside a script's own window), or a control a script marks risky: it may write files or throw "
+     "work away.", True),
     ("run_python", "run_python",
      "Always available, not gated: runs any code inside FontLab, with FontLab's access to files and the network.",
      False),
@@ -3198,6 +3205,1384 @@ def op_screenshot(listener, args):
 
 
 # ---------------------------------------------------------------------------
+# Windows and their controls: generic tools over any Qt window, FontLab's own and scripts' alike
+# ---------------------------------------------------------------------------
+# Reads run inline and only read. An action (a click, a value set, a link followed, a menu command) is
+# checked here, then run from a timer a moment after the reply, as open_font is: it may open a modal dialog
+# or start long work, and a request must not wait on either. It is checked again when its timer fires, and
+# window_state and action_result say what became of it (the server's wait_idle polls them).
+#
+# Optional conventions a script can follow to be driven more surely (docs/WINDOW-TOOLS.md):
+#   - a control's objectName, unique in its window, is its address;
+#   - the dynamic property mcpBusy on a window is truthy while it works (a text names the step);
+#   - mcpScriptWindow on a window (and so on the windows it holds) says it is a script's: its controls are
+#     ordinary actions; a dialog shown modal is a script's own question only when it carries it itself, since
+#     FontLab may parent a question of its own to a script's window;
+#   - mcpRisky on a control or a menu command (or on a widget holding controls): its click may write files or
+#     throw work away, so it needs risky mode.
+
+BUSY_PROPERTY = "mcpBusy"
+SCRIPT_WINDOW_PROPERTY = "mcpScriptWindow"
+RISKY_PROPERTY = "mcpRisky"
+ACTION_DELAY_MS = 50
+ACTION_LOST_S = 30.0  # an action still queued this long after it was asked never ran (its timer was lost)
+MAX_ACTIONS_KEPT = 50
+MAX_WALK = 20000  # widgets visited in one window
+MAX_DEPTH = 64
+DEFAULT_CONTROLS = 300
+MAX_CONTROLS = 5000
+DEFAULT_ROWS = 100
+MAX_ROWS = 1000
+MAX_TREE_ROWS = 20000  # rows a tree is walked for, to count them (a walk holds FontLab: kept short)
+MAX_COLUMNS = 64
+MAX_CHOICES = 200
+MAX_LINKS = 2000
+SHORT_TEXT = 160
+CAPTION_CHARS = 48
+DEFAULT_TEXT_CHARS = 100000
+MAX_TEXT_CHARS = 4 * 1024 * 1024
+DISPLAY_ROLE, CHECK_STATE_ROLE, HORIZONTAL = 0, 10, 1  # Qt::DisplayRole, Qt::CheckStateRole, Qt::Horizontal
+USER_CHECKABLE = 16  # Qt::ItemIsUserCheckable
+INSTANT_POPUP = 2  # QToolButton::InstantPopup: a press opens the menu (modal), so a click needs an entry
+# A command named so may write files or throw work away: risky, unless a script's window says otherwise.
+RISKY_WORDS = re.compile(u"(?<![a-z])(save|export|close|quit|exit|revert|discard)(?![a-z])")
+EXTERNAL_LINK = re.compile(u"^(https?|ftp|mailto|file|javascript):", re.I)
+SKIPPED_WINDOWS = ("QMenu", "QTipLabel", "QComboBoxPrivateContainer")  # popups, not windows to drive
+_KIND_OF_CLASS = {
+    "QPushButton": "button", "QToolButton": "button", "QCommandLinkButton": "button", "QCheckBox": "check",
+    "QRadioButton": "radio", "QComboBox": "combo", "QFontComboBox": "combo", "QSpinBox": "spin",
+    "QDoubleSpinBox": "spin", "QLineEdit": "field", "QTextEdit": "text", "QPlainTextEdit": "text",
+    "QTextBrowser": "log", "QLabel": "label", "QTabWidget": "tabs", "QTabBar": "tabs", "QTreeWidget": "tree",
+    "QTreeView": "tree", "QListWidget": "list", "QListView": "list", "QTableWidget": "table", "QTableView": "table",
+    "QProgressBar": "progress", "QSlider": "slider"}
+_CONTAINERS = frozenset([
+    "QWidget", "QFrame", "QSplitter", "QSplitterHandle", "QScrollArea", "QStackedWidget", "QGroupBox", "QDockWidget",
+    "QToolBar", "QMainWindow", "QDialog", "QStatusBar", "QMenuBar", "QScrollBar", "QSizeGrip", "QRubberBand",
+    "QHeaderView", "QToolBox"])
+_KIND_ORDER = (  # for other classes (FontLab's own, a script's subclass): the first Qt class it inherits
+    ("QHeaderView", None), ("QScrollBar", None), ("QMenuBar", None), ("QTextBrowser", "log"), ("QTextEdit", "text"),
+    ("QPlainTextEdit", "text"), ("QLineEdit", "field"), ("QAbstractSpinBox", "spin"), ("QComboBox", "combo"),
+    ("QCheckBox", "check"), ("QRadioButton", "radio"), ("QAbstractButton", "button"), ("QTabWidget", "tabs"),
+    ("QTabBar", "tabs"), ("QTreeView", "tree"), ("QTableView", "table"), ("QAbstractItemView", "list"),
+    ("QLabel", "label"), ("QProgressBar", "progress"), ("QAbstractSlider", "slider"))
+CONTROL_KINDS = ("button", "check", "radio", "combo", "spin", "field", "text", "log", "tabs", "list", "tree", "table",
+                 "label", "progress", "slider")
+ROW_KINDS = ("list", "tree", "table")
+_LINK = re.compile(u'<a\\s[^>]*?href\\s*=\\s*(?:"([^"]*)"|\'([^\']*)\')[^>]*>(.*?)</a\\s*>', re.I | re.S)
+_NUMERIC_ENTITY = re.compile(u"&#([0-9]+);")
+_BREAK = re.compile(u"<br\\s*/?>", re.I)
+_unichr = unichr if PY2 else chr  # noqa: F821
+
+
+def _same(a, b):
+    """Whether two wrappers are one Qt object (PythonQt keeps one wrapper per object while it is held)."""
+    if a is b:
+        return True
+    try:
+        return a is not None and b is not None and bool(a == b)
+    except Exception:
+        return False
+
+
+def _try(read, default=None):
+    try:
+        return read()
+    except Exception:
+        return default
+
+
+def _character(number):
+    """A code point as text; above U+FFFF in Python 2.7's narrow build (FontLab 7's), as a surrogate pair."""
+    if not 0 < number < 0x110000:
+        return u"�"
+    try:
+        return _unichr(number)
+    except ValueError:
+        return (b"\\U%08x" % number).decode("unicode-escape")
+
+
+def _unescape(text):
+    text = _NUMERIC_ENTITY.sub(lambda m: _character(int(m.group(1))), text)
+    for entity, character in _ENTITIES:
+        text = text.replace(entity, character)
+    return text
+
+
+def _plain(text):
+    """Rich text as plain text: tags out, line breaks kept, entities decoded."""
+    return _unescape(_TAGS.sub(u"", _BREAK.sub(u"\n", _text(text))))
+
+
+def _shorten(text, limit):
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + u"\u2026"
+
+
+def _caption(text, limit=CAPTION_CHARS):
+    """A text as a caption: plain, no mnemonic, on one line, without a closing colon, shortened."""
+    if text is None:
+        return u""
+    text = _text(text)
+    text = _plain(text) if _RICH.search(text) else _MNEMONIC.sub(r"\1", text)
+    return _shorten(u" ".join(text.split()).rstrip(u":\uff1a").strip(), limit)
+
+
+def _first_line(text):
+    for line in _text(text or u"").splitlines():
+        if line.strip():
+            return line
+    return u""
+
+
+def _entry_words(text):
+    """A menu entry's or a choice's text as compared: no mnemonic, no shortcut after a tab, no closing
+    ellipsis, a curly apostrophe as a straight one, case ignored."""
+    text = _MNEMONIC.sub(r"\1", _text(text or u"")).split(u"\t")[0].replace(u"\u2019", u"'").strip()
+    for tail in (u"\u2026", u"..."):
+        if text.endswith(tail):
+            text = text[:-len(tail)].rstrip()
+    return u" ".join(text.split()).lower()
+
+
+def _object_name(obj):
+    return _try(lambda: _text(_prop(obj, "objectName") or u""), u"")
+
+
+def _class_name(obj):
+    return _try(lambda: _text(obj.metaObject().className()), u"")
+
+
+def _window_title(widget):
+    return _try(lambda: _text(_prop(widget, "windowTitle") or u"").strip(), u"")
+
+
+def _flagged(widget, name):
+    """Whether a dynamic property (a convention) is set, truthy, on the widget or a widget holding it."""
+    for _ in range(MAX_DEPTH):
+        if widget is None:
+            return False
+        try:
+            if widget.property(name):
+                return True
+            widget = widget.parentWidget()
+        except Exception:
+            return False
+    return False
+
+
+def _script_window(widget, waiting):
+    """Whether a window is a script's own (mcpScriptWindow): the dialog FontLab waits on only when it says so
+    itself (FontLab may parent a question of its own to a script's window), any other window also when a window
+    holding it does."""
+    if waiting:
+        return bool(_try(lambda: widget.property(SCRIPT_WINDOW_PROPERTY), False))
+    return _flagged(widget, SCRIPT_WINDOW_PROPERTY)
+
+
+def _risky_named(*texts):
+    """Whether a text names a command that may write files or throw work away (an objectName's words too:
+    actionSaveFont)."""
+    for text in texts:
+        if text and RISKY_WORDS.search(re.sub(u"([a-z])([A-Z])", u"\\1 \\2", _text(text)).lower()):
+            return True
+    return False
+
+
+# -- windows -------------------------------------------------------------------
+
+def _window_entries(QtGui):
+    """The visible top-level windows, each with its key: "main" for FontLab's main window, else its title (its
+    objectName or class when untitled), with #1, #2, ... when several share it."""
+    entries = []
+    for widget in QtGui.QApplication.instance().topLevelWidgets():
+        try:
+            if not widget.isVisible():
+                continue
+        except Exception:
+            continue
+        cls = _class_name(widget)
+        if not cls or cls in SKIPPED_WINDOWS:
+            continue
+        entries.append({"widget": widget, "title": _window_title(widget), "class": cls, "name": _object_name(widget),
+                        "main": cls == "MainWindow"})
+    groups = {}
+    for entry in entries:
+        base = u"main" if entry["main"] else (entry["title"] or entry["name"] or entry["class"])
+        groups.setdefault(base, []).append(entry)
+    for base, group in groups.items():
+        for number, entry in enumerate(group):
+            entry["key"] = base if len(group) == 1 else u"%s#%d" % (base, number + 1)
+    return entries
+
+
+def _find_window(QtGui, wanted, modal):
+    """The window entry wanted names: its key (list_windows), "main", "dialog" (the dialog FontLab waits on), a
+    title (exact, else the only one containing it), an objectName, or a class."""
+    if not isinstance(wanted, string_types) or not wanted.strip():
+        raise FreeLabError("bad_args", "window must be a window's key from list_windows, \"main\" for FontLab's main "
+                                       "window, or \"dialog\" for the dialog FontLab waits on.")
+    wanted = _text(wanted).strip()
+    entries = _window_entries(QtGui)
+    if wanted.lower() == u"dialog":
+        if modal is None:
+            raise FreeLabError("not_found", "No dialog is waiting.")
+        for entry in entries:
+            if _same(entry["widget"], modal):
+                return entry
+        return {"widget": modal, "key": u"dialog", "title": _window_title(modal), "class": _class_name(modal),
+                "name": _object_name(modal), "main": False}
+    low = wanted.lower()
+    for test in (lambda e: e["key"] == wanted, lambda e: e["title"] == wanted,
+                 lambda e: e["key"].lower() == low or e["title"].lower() == low,
+                 lambda e: e["name"] == wanted or e["class"] == wanted, lambda e: low in e["title"].lower()):
+        found = [entry for entry in entries if test(entry)]
+        if len(found) == 1:
+            return found[0]
+        if len(found) > 1:
+            raise FreeLabError("ambiguous_window", u"%d windows match '%s': %s. Give one's key." % (
+                len(found), wanted, u"; ".join(entry["key"] for entry in found)))
+    raise FreeLabError("not_found", u"No window is '%s'. The windows shown: %s." % (
+        wanted, u"; ".join(entry["key"] for entry in entries) or u"none"))
+
+
+def _window_busy(widget, main, QtGui):
+    """Whether a window works: its mcpBusy property when it has one (a text names the step), else, but for
+    FontLab's main window and its panels (a panel may show a bar for good), a progress bar shown and not full
+    (an empty range is a busy indicator)."""
+    value = _try(lambda: widget.property(BUSY_PROPERTY))
+    if value is not None:
+        busy = {"busy": bool(value), "busy_by": "property"}
+        if busy["busy"] and isinstance(value, string_types) and value.strip():
+            busy["step"] = _text(value).strip()
+        return busy
+    if not main and not _try(lambda: widget.inherits("QDockWidget"), True):
+        for bar in _try(lambda: _real_list(widget.findChildren(QtGui.QProgressBar), "findChildren()"), []):
+            try:
+                if not bar.isVisible():
+                    continue
+                low, high, value = int(_prop(bar, "minimum")), int(_prop(bar, "maximum")), int(_prop(bar, "value"))
+            except Exception:
+                continue
+            if high == low or value < high:
+                busy = {"busy": True, "busy_by": "progress_bar"}
+                if high > low:
+                    busy["progress"] = round(max(0.0, float(value - low) / (high - low)), 3)
+                return busy
+    return {"busy": False}
+
+
+def _pending_actions(listener, own=None):
+    """The listener's actions still queued or running, oldest first (one queued long ago never ran: skipped)."""
+    now, found = time.time(), []
+    for key in sorted(listener.actions):
+        record = listener.actions[key]
+        if record["id"] == own or record["state"] not in ("queued", "running"):
+            continue
+        if record["state"] == "queued" and now - record.get("asked", now) > ACTION_LOST_S:
+            record.update({"state": "skipped", "code": "lost", "reason": u"Its timer never fired."})
+            continue
+        found.append(record)
+    return found
+
+
+def _describe_window(entry, modal, QtGui, listener):
+    widget = entry["widget"]
+    waiting = modal is not None and _same(widget, modal)
+    script = _script_window(widget, waiting)
+    about = {"window": entry["key"], "title": entry["title"], "class": entry["class"], "main": entry["main"],
+             "modal": bool(_try(lambda: _prop(widget, "modal"), False)), "waiting": waiting,
+             "question": waiting and not script, "script_window": script}
+    if entry["name"]:
+        about["object_name"] = entry["name"]
+    about.update(_window_busy(widget, entry["main"], QtGui))
+    running = [r["id"] for r in _pending_actions(listener) if r.get("window") == entry["key"]]
+    if running:
+        about["action_running"] = running[0]
+        if not about["busy"]:
+            about.update({"busy": True, "busy_by": "action"})
+    return about
+
+
+@op("windows")
+def op_windows(listener, args):
+    """The visible top-level windows: each one's key (what the window tools take), title, class, whether it is
+    modal, whether FontLab waits on it (and whether it is a question of FontLab's), and whether it is busy."""
+    QtGui = _qt()[1]
+    modal = QtGui.QApplication.instance().activeModalWidget()
+    return {"windows": [_describe_window(entry, modal, QtGui, listener) for entry in _window_entries(QtGui)],
+            "dialog_waiting": modal is not None}
+
+
+# -- controls ------------------------------------------------------------------
+
+class _Control(object):
+    """A control of a window: its widget, kind, the tabs, group boxes, and panels around it, its caption,
+    objectName, and address."""
+
+    def __init__(self, widget, kind, context):
+        self.widget, self.kind, self.context = widget, kind, context
+        self.name = _object_name(widget)
+        self.caption = None
+        self.address = None
+
+
+_CLASS_INFO = {}  # a class name -> (its kind, "group" or "dock" for a group box or a docked panel): one look each
+
+
+def _class_info(widget):
+    """(the control kind of a widget, or None; "group" or "dock" when it is a group box or a docked panel, whose
+    title names what it holds), looked up once per class: a window of FontLab's holds thousands of widgets."""
+    cls = _class_name(widget)
+    if cls not in _CLASS_INFO:
+        kind, holder = _KIND_OF_CLASS.get(cls), None
+        if kind is None and cls not in _CONTAINERS:
+            for qt_class, found in _KIND_ORDER:
+                if widget.inherits(qt_class):
+                    kind = found
+                    break
+        if kind is None:
+            holder = "group" if widget.inherits("QGroupBox") else "dock" if widget.inherits("QDockWidget") else None
+        _CLASS_INFO[cls] = (kind, holder)
+    return _CLASS_INFO[cls]
+
+
+def _walk_controls(window):
+    """Every control of a window, shown or not, in Qt's order, each with the tabs (of a QTabWidget), group
+    boxes, and docked panels around it; and whether the walk stopped at MAX_WALK widgets. Windows of their own
+    (a dialog the window parents) and the inside of a control (a spin box's field) are not walked."""
+    found, seen = [], [0]
+
+    def visit(widget, context, depth):
+        children = _try(lambda: _real_list(widget.children(), "children()"), [])
+        for child in children:
+            seen[0] += 1
+            if seen[0] > MAX_WALK:
+                return
+            try:
+                if not child.isWidgetType() or child.isWindow():
+                    continue
+                kind, holder = _class_info(child)
+            except Exception:
+                continue
+            if kind == "tabs" and _try(lambda: child.inherits("QTabWidget"), False):
+                found.append(_Control(child, kind, context))
+                for index in range(_try(lambda: int(_prop(child, "count")), 0)):
+                    page = _try(lambda: child.widget(index))
+                    if page is not None and depth < MAX_DEPTH:
+                        tab = _caption(_try(lambda: child.tabText(index), u"")) or u"tab %d" % (index + 1)
+                        visit(page, context + [tab], depth + 1)
+                continue
+            if kind is not None:
+                if not _object_name(child).startswith(u"qt_"):  # (Qt's own parts: a tab widget's bar)
+                    found.append(_Control(child, kind, context))
+                continue
+            segment = None
+            if holder == "group":
+                segment = _caption(_try(lambda: _prop(child, "title")))
+            elif holder == "dock":
+                segment = _caption(_window_title(child))
+            if depth < MAX_DEPTH:
+                visit(child, context + [segment] if segment else context, depth + 1)
+    visit(window, [], 0)
+    return found, seen[0] > MAX_WALK
+
+
+def _before_in_layout(layout, widget, depth=0):
+    """The widget just before widget in a layout (nested layouts searched), None when widget comes first, False
+    when it is not in it."""
+    previous = None
+    for index in range(int(layout.count())):
+        item = layout.itemAt(index)
+        if item is None:
+            continue
+        inner = item.widget()
+        if inner is not None:
+            if _same(inner, widget):
+                return previous
+            previous = inner
+            continue
+        nested = item.layout()
+        if nested is not None and depth < 8:
+            found = _before_in_layout(nested, widget, depth + 1)
+            if found is not False:
+                return previous if found is None else found
+    return False
+
+
+def _layout_caption(widget):
+    """The text of the label just before a control in its layout (Master: before a dropdown), or u""."""
+    try:
+        parent = widget.parentWidget()
+        layout = parent.layout() if parent is not None else None
+        before = _before_in_layout(layout, widget) if layout is not None else None
+        if before and before.inherits("QLabel"):
+            return _caption(_label_text(before))
+    except Exception:
+        pass
+    return u""
+
+
+def _action_text(action):
+    return u"" if action is None else _text(_prop(action, "text") or u"")
+
+
+def _control_caption(control, buddies):
+    """What names a control for its address: a button's text (else its accessible name, its action's text, or
+    the first line of its tooltip); another control's accessible name, the label whose buddy it is, or the
+    label just before it in its layout. Labels have none: their text is what they show."""
+    widget, kind = control.widget, control.kind
+    if kind == "label":
+        return None
+    reads = []
+    if kind in ("button", "check", "radio"):
+        reads.append(lambda: _prop(widget, "text"))
+    reads.append(lambda: _prop(widget, "accessibleName"))
+    if kind == "button":
+        reads.append(lambda: _action_text(widget.defaultAction()) if widget.inherits("QToolButton") else u"")
+        reads.append(lambda: _first_line(_prop(widget, "toolTip")))
+    for read in reads:
+        text = _caption(_try(read, u""))
+        if text:
+            return text
+    if kind == "button":
+        return None
+    for buddy, label in buddies:
+        if _same(buddy, widget):
+            text = _caption(_try(lambda: _label_text(label), u""))
+            if text:
+                return text
+    return _layout_caption(widget) or None
+
+
+def _controls(window):
+    """A window's controls with their addresses (see _Control), and whether the walk was cut short. An address
+    is the control's objectName when no other control of the window has it, else the tabs, group boxes, and
+    panels around it, its caption, and its kind, joined by " > ", with #1, #2, ... when several share that."""
+    controls, truncated = _walk_controls(window)
+    buddies = []
+    for control in controls:
+        if control.kind == "label":
+            buddy = _try(lambda: control.widget.buddy())
+            if buddy is not None:
+                buddies.append((buddy, control.widget))
+    names = {}
+    for control in controls:
+        control.caption = _control_caption(control, buddies)
+        if control.name:
+            names[control.name] = names.get(control.name, 0) + 1
+    groups, order = {}, []
+    for control in controls:
+        if control.name and names[control.name] == 1:
+            control.address = control.name
+            continue
+        base = u" > ".join(list(control.context) + ([control.caption] if control.caption else []) + [control.kind])
+        if base not in groups:
+            groups[base] = []
+            order.append(base)
+        groups[base].append(control)
+    for base in order:
+        for number, control in enumerate(groups[base]):
+            control.address = base if len(groups[base]) == 1 else u"%s#%d" % (base, number + 1)
+    return controls, truncated
+
+
+def _shown(control):
+    return bool(_try(lambda: control.widget.isVisible(), False))
+
+
+def _find_control(controls, wanted, window_key):
+    """The control wanted names: its address, its objectName, or its caption (one control's; the one shown when
+    only one of several is)."""
+    if not isinstance(wanted, string_types) or not wanted.strip():
+        raise FreeLabError("bad_args", "control must be a control's address from list_window_controls, its "
+                                       "objectName, or its caption.")
+    wanted = _text(wanted).strip()
+    words = _entry_words(wanted)
+    for test in (lambda c: c.address == wanted, lambda c: c.name == wanted, lambda c: c.address.lower() == wanted.lower(),
+                 lambda c: bool(c.caption) and _entry_words(c.caption) == words):
+        found = [control for control in controls if test(control)]
+        if len(found) > 1:
+            shown = [control for control in found if _shown(control)]
+            found = shown if len(shown) == 1 else found
+        if len(found) == 1:
+            return found[0]
+        if len(found) > 1:
+            raise FreeLabError("ambiguous_control", u"%d controls of '%s' match '%s': %s. Give one's address." % (
+                len(found), window_key, wanted, u"; ".join(control.address for control in found[:20])))
+    near = [c.address for c in controls if words and words in c.address.lower()] or \
+        [c.address for c in controls if _shown(c)]
+    raise FreeLabError("not_found", u"The window '%s' has no control '%s'%s." % (
+        window_key, wanted, (u"; controls: " + u"; ".join(near[:25])) if near else u""))
+
+
+def _button_menu(widget):
+    """A push or tool button's menu, or None."""
+    if widget.inherits("QToolButton") or widget.inherits("QPushButton"):
+        return widget.menu()
+    return None
+
+
+def _needs_entry(widget, menu):
+    """Whether a click on the button would only open its menu (modal): a push button's, or a tool button's
+    shown at the press (InstantPopup). A menu that opens on a held press or from its arrow does not."""
+    if menu is None:
+        return False
+    if widget.inherits("QPushButton"):
+        return True
+    return _try(lambda: int(_prop(widget, "popupMode")), INSTANT_POPUP) == INSTANT_POPUP
+
+
+def _menu_entries(menu):
+    """[(action, its text as shown)] of a menu's entries, separators and hidden entries left out."""
+    entries = []
+    for action in _real_list(menu.actions(), "actions()"):
+        try:
+            if action.isSeparator() or not _prop(action, "visible"):
+                continue
+        except Exception:
+            continue
+        entries.append((action, _MNEMONIC.sub(r"\1", _text(_prop(action, "text") or u"")).split(u"\t")[0].strip()))
+    return entries
+
+
+def _menu_at(level, path, where):
+    """(action, [entry texts]) of the entry path names in a menu or menu bar: entries' texts joined by ">"."""
+    parts = [part.strip() for part in _text(path).split(u">")]
+    if not parts or not all(parts):
+        raise FreeLabError("bad_args", u"A menu path names each entry, joined by \">\": File > Open Fonts.")
+    trail = []
+    for number, part in enumerate(parts):
+        entries = _menu_entries(level)
+        found = [(action, text) for action, text in entries if _entry_words(text) == _entry_words(part)]
+        if not found:
+            raise FreeLabError("not_found", u"%s has no entry '%s'; its entries: %s." % (
+                u" > ".join(trail) or where, part, u", ".join(text for _a, text in entries) or u"none"))
+        if len(found) > 1:
+            raise FreeLabError("ambiguous_control", u"%s has %d entries '%s'." % (
+                u" > ".join(trail) or where, len(found), part))
+        action, text = found[0]
+        trail.append(text)
+        if number < len(parts) - 1:
+            submenu = action.menu()
+            if submenu is None:
+                raise FreeLabError("not_found", u"%s is a command, not a menu." % u" > ".join(trail))
+            level = submenu
+    return action, trail
+
+
+def _number_value(value):
+    if isinstance(value, bool) or value is None:
+        raise ValueError
+    if isinstance(value, integer_types + (float,)):
+        number = float(value)
+    else:
+        number = float(_text(value).strip())
+    if number != number or number in (float("inf"), float("-inf")):
+        raise ValueError
+    return number
+
+
+def _describe_control(control, question, script):
+    """A control as list_window_controls lists it: address, kind, caption, objectName, shown, enabled, whether
+    a click needs risky mode, and what it holds (a choice, a value, a text shortened, rows, tabs)."""
+    widget, kind, reads = control.widget, control.kind, _Reads()
+    entry = {"address": control.address, "kind": kind, "visible": _shown(control), "enabled": reads.prop(widget, "enabled")}
+    if control.caption:
+        entry["caption"] = control.caption
+    if control.name:
+        entry["object_name"] = control.name
+    try:
+        if kind in ("button", "check", "radio"):
+            entry["text"] = _caption(reads.prop(widget, "text"), SHORT_TEXT)
+            if kind == "button":
+                if reads.prop(widget, "checkable"):
+                    entry["checked"] = reads.prop(widget, "checked")
+                menu = _button_menu(widget)
+                if menu is not None:
+                    entry["menu"] = [text for _action, text in _menu_entries(menu)][:MAX_CHOICES]
+                    entry["click_needs_entry"] = _needs_entry(widget, menu)
+            else:
+                entry["checked"] = reads.prop(widget, "checked")
+        elif kind == "combo":
+            count = int(_prop(widget, "count"))
+            entry["choices"] = [_text(widget.itemText(i)) for i in range(min(count, MAX_CHOICES))]
+            if count > MAX_CHOICES:
+                entry["choices_count"] = count
+            entry["current"] = reads.prop(widget, "currentText")
+            entry["current_index"] = reads.prop(widget, "currentIndex")
+        elif kind in ("spin", "progress", "slider"):
+            for key in ("value", "minimum", "maximum"):
+                entry[key] = reads.prop(widget, key)
+            if kind == "spin":
+                entry["read_only"] = reads.prop(widget, "readOnly")
+        elif kind == "field":
+            entry["text"] = _shorten(_text(reads.prop(widget, "text") or u""), SHORT_TEXT)
+            entry["read_only"] = reads.prop(widget, "readOnly")
+        elif kind in ("text", "log"):
+            text = _text(widget.toPlainText())
+            entry["length"] = len(text)
+            entry["preview"] = _shorten(u" ".join(text[:SHORT_TEXT * 2].split()), SHORT_TEXT)
+            entry["read_only"] = reads.prop(widget, "readOnly")
+        elif kind == "tabs":
+            entry["tabs"] = [_caption(widget.tabText(i), SHORT_TEXT) for i in range(int(_prop(widget, "count")))]
+            entry["current"] = reads.prop(widget, "currentIndex")
+        elif kind in ROW_KINDS:
+            QtCore = _qt()[0]
+            model = widget.model()
+            root = QtCore.QModelIndex()
+            columns = min(int(model.columnCount(root)), MAX_COLUMNS)
+            entry["columns"] = [_cell(model.headerData(c, HORIZONTAL, DISPLAY_ROLE)) for c in range(columns)]
+            entry["rows"] = int(model.rowCount(root))
+        elif kind == "label":
+            raw = _text(reads.prop(widget, "text") or u"")
+            entry["text"] = _shorten(_label_text(widget), SHORT_TEXT)
+            if u"<a " in raw.lower():
+                entry["links"] = len(_links(raw))
+    except Exception as exc:
+        reads.unreadable[kind] = _exc_text(exc)
+    risk = _control_risk(control, question, script, click=True)
+    if risk:
+        entry["risky"] = True
+    return reads.attach(entry)
+
+
+def _control_risk(control, question, script, click=False, texts=(), marked=None):
+    """The risky action a control's use is (RISKY_ACTIONS), or None: any control of a question FontLab asks;
+    a control (or menu command) a script marks mcpRisky; and, outside a script's window, a click on a button
+    (or a menu entry) named like Save, Export, Close, Quit, Exit, Revert, or Discard."""
+    if question:
+        return "question_control"
+    if _flagged(control.widget, RISKY_PROPERTY) or (marked is not None and _try(lambda: marked.property(RISKY_PROPERTY))):
+        return "risky_command"
+    if script or not click or control.kind != "button":
+        return None
+    widget = control.widget
+    named = list(texts) or [_try(lambda: _prop(widget, "text")), _try(lambda: _prop(widget, "toolTip")),
+                            _try(lambda: _prop(widget, "accessibleName")), control.name]
+    if not texts and _try(lambda: widget.inherits("QToolButton"), False):
+        action = _try(lambda: widget.defaultAction())
+        if action is not None:
+            named += [_try(lambda: _action_text(action)), _object_name(action)]
+    return "risky_command" if _risky_named(*named) else None
+
+
+@op("window_controls")
+def op_window_controls(listener, args):
+    """A window's controls (shown ones, unless include_hidden), each with its address, a page at a time."""
+    QtGui = _qt()[1]
+    modal = QtGui.QApplication.instance().activeModalWidget()
+    entry = _find_window(QtGui, args.get("window"), modal)
+    include_hidden = _bool_arg(args, "include_hidden")
+    offset = _int_arg(args, "offset", 0, 0, 10 ** 7)
+    limit = _int_arg(args, "limit", DEFAULT_CONTROLS, 1, MAX_CONTROLS)
+    kinds = args.get("kinds")
+    if kinds is not None and (not isinstance(kinds, list) or not all(k in CONTROL_KINDS for k in kinds)):
+        raise FreeLabError("bad_args", u"kinds must be a list of: %s." % u", ".join(CONTROL_KINDS))
+    waiting = modal is not None and _same(entry["widget"], modal)
+    script = _script_window(entry["widget"], waiting)
+    question = waiting and not script
+    controls, truncated = _controls(entry["widget"])
+    listed = []
+    for control in controls:
+        if kinds and control.kind not in kinds:
+            continue
+        if not include_hidden and (not _shown(control) or (
+                control.kind == "label" and not _try(lambda: _label_text(control.widget), u""))):
+            continue
+        listed.append(control)
+    page = listed[offset:offset + limit]
+    reply = {"window": entry["key"], "title": entry["title"], "class": entry["class"], "question": question,
+             "script_window": script, "count": len(listed), "offset": offset, "more": offset + len(page) < len(listed),
+             "controls": [_describe_control(control, question, script) for control in page]}
+    if truncated:
+        reply["walk_truncated"] = True
+    reply.update(_window_busy(entry["widget"], entry["main"], QtGui))
+    return reply
+
+
+def _read_target(args, kinds):
+    QtGui = _qt()[1]
+    entry = _find_window(QtGui, args.get("window"), QtGui.QApplication.instance().activeModalWidget())
+    control = _find_control(_controls(entry["widget"])[0], args.get("control"), entry["key"])
+    if control.kind not in kinds:
+        raise FreeLabError("wrong_kind", u"'%s' is a %s; this reads a %s." % (control.address, control.kind,
+                                                                              u", ".join(kinds)))
+    return entry, control
+
+
+def _cell(value):
+    """A model's value as JSON: text, a number, a bool, or None (an icon, a color, ...)."""
+    if value is None or isinstance(value, bool) or isinstance(value, integer_types + (float,)):
+        return to_jsonable(value)
+    if isinstance(value, string_types + (bytes,)):
+        return _text(value)
+    return None
+
+
+def _model_rows(model, kind, QtCore, start, count, count_all=True):
+    """([(row number, parent index, row in parent, depth)] of rows start to start + count, the rows counted,
+    whether the count stopped at MAX_TREE_ROWS). A tree's rows go depth first, its children right after each
+    row, collapsed or not; other views' rows are their model's top level."""
+    root = QtCore.QModelIndex()
+    if kind != "tree":
+        total = int(model.rowCount(root))
+        return [(n, root, n, 0) for n in range(start, min(total, start + count))], total, False
+    rows, counter, stopped = [], [0], [False]
+
+    def walk(parent, depth):
+        for row in range(int(model.rowCount(parent))):
+            if counter[0] >= MAX_TREE_ROWS or (not count_all and counter[0] >= start + count):
+                stopped[0] = True
+                return
+            number = counter[0]
+            counter[0] += 1
+            if start <= number < start + count:
+                rows.append((number, parent, row, depth))
+            if depth < MAX_DEPTH:
+                child = model.index(row, 0, parent)
+                if int(model.rowCount(child)) > 0:
+                    walk(child, depth + 1)
+                    if stopped[0]:
+                        return
+    walk(root, 0)
+    return rows, counter[0], stopped[0]
+
+
+def _row_texts(model, parent, row, columns):
+    return [_cell(model.data(model.index(row, column, parent), DISPLAY_ROLE)) for column in columns]
+
+
+@op("read_list")
+def op_read_list(listener, args):
+    """Rows of a list, tree, or table: each one's text per column, check state, selection, and, in a tree,
+    its depth, child count, and whether it is expanded; a page at a time."""
+    entry, control = _read_target(args, ROW_KINDS)
+    offset = _int_arg(args, "offset", 0, 0, 10 ** 7)
+    limit = _int_arg(args, "limit", DEFAULT_ROWS, 1, MAX_ROWS)
+    QtCore = _qt()[0]
+    view = control.widget
+    model = view.model()
+    available = int(model.columnCount(QtCore.QModelIndex()))
+    columns = args.get("columns")
+    if columns is None:
+        columns = list(range(min(available, MAX_COLUMNS)))
+    elif not isinstance(columns, list) or not columns or len(columns) > MAX_COLUMNS or not all(
+            isinstance(c, integer_types) and not isinstance(c, bool) and 0 <= c < available for c in columns):
+        raise FreeLabError("bad_args", u"columns must be a list of column numbers from 0 to %d." % (available - 1))
+    rows, total, stopped = _model_rows(model, control.kind, QtCore, offset, limit)
+    selection = _try(lambda: view.selectionModel())
+    listed = []
+    for number, parent, row, depth in rows:
+        index = model.index(row, 0, parent)
+        item = {"row": number, "texts": _row_texts(model, parent, row, columns)}
+        check = _try(lambda: model.data(index, CHECK_STATE_ROLE))
+        if isinstance(check, integer_types) and not isinstance(check, bool):
+            item["checked"] = {0: False, 2: True}.get(int(check), u"partial")
+        if selection is not None:
+            item["selected"] = bool(_try(lambda: selection.isSelected(index), False))
+        if control.kind == "tree":
+            item["depth"] = depth
+            children = int(model.rowCount(index))
+            if children:
+                item["children"] = children
+                item["expanded"] = bool(_try(lambda: view.isExpanded(index), False))
+        listed.append(item)
+    reply = {"window": entry["key"], "control": control.address, "kind": control.kind,
+             "columns": [_cell(model.headerData(c, HORIZONTAL, DISPLAY_ROLE)) for c in columns],
+             "column_numbers": columns, "rows": listed, "offset": offset, "total": total,
+             "more": offset + len(listed) < total}
+    if stopped:
+        reply["total_counted_to"] = MAX_TREE_ROWS
+    return reply
+
+
+def _links(html):
+    """[{"href", "text"}] of the links in rich text, in order."""
+    found = []
+    for match in _LINK.finditer(_text(html)):
+        href = _unescape(match.group(1) if match.group(1) is not None else match.group(2))
+        found.append({"href": href, "text": u" ".join(_plain(match.group(3)).split())})
+        if len(found) >= MAX_LINKS:
+            break
+    return found
+
+
+@op("read_text")
+def op_read_text(listener, args):
+    """A label's, field's, text box's, or log's whole text (plain), from offset, with the links it holds."""
+    entry, control = _read_target(args, ("label", "field", "text", "log", "button", "check", "radio", "combo"))
+    offset = _int_arg(args, "offset", 0, 0, 10 ** 9)
+    limit = _int_arg(args, "max_chars", DEFAULT_TEXT_CHARS, 1, MAX_TEXT_CHARS)
+    widget, kind, links = control.widget, control.kind, None
+    if kind == "label":
+        raw = _text(_prop(widget, "text") or u"")
+        text = _label_text(widget)
+        links = _links(raw) if u"<a " in raw.lower() else []
+    elif kind in ("text", "log"):
+        text = _text(widget.toPlainText())
+        if kind == "log":
+            links = _links(widget.toHtml())
+    elif kind == "combo":
+        text = _text(_prop(widget, "currentText") or u"")
+    elif kind == "field":
+        text = _text(_prop(widget, "text") or u"")
+    else:
+        text = _MNEMONIC.sub(r"\1", _text(_prop(widget, "text") or u""))
+    start = min(offset, len(text))
+    reply = {"window": entry["key"], "control": control.address, "kind": kind, "text": text[start:start + limit],
+             "start": start, "length": len(text), "truncated": len(text) - start > limit}
+    if links is not None:
+        reply["links"] = links
+        if len(links) >= MAX_LINKS:
+            reply["links_truncated"] = True
+    return reply
+
+
+# -- actions -------------------------------------------------------------------
+
+class _Plan(object):
+    """An action checked and ready: what it acts on (fingerprint, compared again when its timer fires), what
+    the reply says of it, and perform(), which does it and returns what changed."""
+
+    def __init__(self, window, fingerprint, about, perform, target=None):
+        self.window, self.fingerprint, self.about, self.perform = window, fingerprint, about, perform
+        self.target = target  # the widget or menu command acted on: the very one again when the timer fires
+
+
+def _refuse_while_waiting(listener, QtGui, modal, waiting, own):
+    """Actions wait for one another and for the windows' work: while a dialog waits, only it can be driven
+    (Qt itself lets no input reach another window then); while an earlier action is queued or runs, or a window
+    works, nothing else is done (a script's work reads the fonts as they are, and blocks input meanwhile)."""
+    if waiting:
+        return
+    if modal is not None:
+        about = _describe_dialog(modal)
+        raise FreeLabError("dialog_open", u"A dialog is waiting (%s): only it can be driven until it is answered "
+                                          u"(window \"dialog\"). Nothing was done." % _dialog_words(about), {"dialog": about})
+    pending = _pending_actions(listener, own)
+    if pending:
+        raise FreeLabError("busy", u"An earlier action (%d, %s) is still %s: wait_idle waits until it is over. Nothing "
+                                   u"was done." % (pending[0]["id"], pending[0]["tool"], pending[0]["state"]))
+    for entry in _window_entries(QtGui):
+        busy = _window_busy(entry["widget"], entry["main"], QtGui)
+        if busy["busy"]:
+            raise FreeLabError("busy", u"The window '%s' is busy%s: wait_idle waits until its work is over. Nothing "
+                                       u"was done." % (entry["key"], u" (%s)" % busy["step"] if busy.get("step") else u""),
+                               {"window": entry["key"]})
+
+
+def _dialog_words(about):
+    return u"%s; buttons: %s" % (u" ".join(about.get("text") or []) or about.get("title") or about.get("class"),
+                                 u", ".join(about.get("buttons") or []))
+
+
+def _action_window(listener, args, own):
+    """(window entry, whether it is a question of FontLab's, whether it is a script's own window, the fingerprint of
+    the window), refused while something else waits or works (_refuse_while_waiting)."""
+    QtGui = _qt()[1]
+    modal = QtGui.QApplication.instance().activeModalWidget()
+    entry = _find_window(QtGui, args.get("window"), modal)
+    waiting = modal is not None and _same(entry["widget"], modal)
+    script = _script_window(entry["widget"], waiting)
+    question = waiting and not script
+    _refuse_while_waiting(listener, QtGui, modal, waiting, own)
+    fingerprint = (entry["key"], entry["class"], entry["title"])
+    if question:  # (that very question, as answer_dialog: another font's Save question is not it)
+        fingerprint += (json.dumps(_describe_dialog(entry["widget"]), sort_keys=True),)
+    return entry, question, script, fingerprint
+
+
+def _action_control(entry, args, kinds):
+    control = _find_control(_controls(entry["widget"])[0], args.get("control"), entry["key"])
+    if control.kind not in kinds:
+        raise FreeLabError("wrong_kind", u"'%s' is a %s, which this does not take (it takes a %s)." % (
+            control.address, control.kind, u", ".join(kinds)))
+    if not _shown(control):
+        raise FreeLabError("unavailable", u"'%s' is hidden (on another tab, or folded away): nothing was done." % control.address)
+    if not _try(lambda: _prop(control.widget, "enabled"), False):
+        raise FreeLabError("disabled", u"'%s' is disabled: nothing was done." % control.address)
+    return control
+
+
+def _require_for(args, risk, what):
+    if not risk:
+        return
+    try:
+        _require_risky(args, risk)
+    except FreeLabError as exc:
+        exc.message = u"%s %s" % (what, exc.message)
+        raise
+
+
+def _start_action(listener, args, tool, plan):
+    """Checks an action (plan), then runs it from a timer a moment after the reply, checked again then: what it
+    acts on must be as it was (the same window, control, and, for a question, the very question), and nothing
+    else may wait or work. action_result says what became of it."""
+    first = plan(listener, args, None)
+    _check_deadline(listener)
+    record = listener.new_action(tool, first.window, first.about)
+
+    def run():
+        if listener.stopped:
+            record.update({"state": "skipped", "code": "listener_stopped", "reason": u"The listener stopped."})
+            return
+        try:
+            again = plan(listener, args, record["id"])
+            if again.fingerprint != first.fingerprint or not _same(first.target, again.target):
+                raise FreeLabError("changed", u"By the time of the action, what it was to act on had changed (another "
+                                              u"window, control, row, or question): nothing was done.")
+        except FreeLabError as exc:
+            record.update({"state": "skipped", "code": exc.code, "reason": exc.message})
+            return
+        except Exception as exc:
+            record.update({"state": "skipped", "code": "exception", "reason": _exc_text(exc)})
+            return
+        record["state"] = "running"
+        started = time.time()
+        try:
+            result = again.perform()
+            record["state"] = "done"
+            if result:
+                record["result"] = to_jsonable(result)
+        except Exception as exc:
+            record.update({"state": "failed", "error": _exc_text(exc)})
+        finally:
+            record["seconds"] = round(time.time() - started, 3)
+    listener.later(ACTION_DELAY_MS, run, "window_action")
+    reply = {"action_id": record["id"], "queued": True, "window": first.window}
+    reply.update(first.about)
+    return reply
+
+
+def _row_target(view, kind, args):
+    """(model, parent index, row in parent, the row's texts) of the row args["row"] numbers (as read_list does)."""
+    QtCore = _qt()[0]
+    number = _int_arg(args, "row", None, 0, MAX_TREE_ROWS)
+    model = view.model()
+    rows = _model_rows(model, kind, QtCore, number, 1, count_all=False)[0]
+    if not rows:
+        raise FreeLabError("not_found", u"There is no row %d (read_list numbers the rows)." % number)
+    _number_, parent, row, _depth = rows[0]
+    columns = list(range(min(int(model.columnCount(QtCore.QModelIndex())), MAX_COLUMNS)))
+    return model, parent, row, _row_texts(model, parent, row, columns)
+
+
+def _plan_click(listener, args, own):
+    entry, question, script, fingerprint = _action_window(listener, args, own)
+    control = _action_control(entry, args, ("button", "check", "radio") + ROW_KINDS)
+    widget, kind = control.widget, control.kind
+    item = args.get("entry") or u""
+    if not isinstance(item, string_types):
+        raise FreeLabError("bad_args", "entry must be a menu entry's text (submenus joined by \">\").")
+    about = {"control": control.address, "kind": kind}
+    fingerprint += (control.address, kind)
+    if kind in ROW_KINDS:
+        if item:
+            raise FreeLabError("bad_args", "entry is for a button's menu; a list's row is given by row.")
+        double = _bool_arg(args, "double")
+        model, parent, row, texts = _row_target(widget, kind, args)
+        column = _int_arg(args, "column", 0, 0, max(0, int(model.columnCount(parent)) - 1))
+        _require_for(args, _control_risk(control, question, script), u"'%s' is a control of a question FontLab asks, or one "
+                                                                      u"marked risky." % control.address)
+        about.update({"row": args.get("row"), "texts": texts, "double": double})
+
+        def perform_row():
+            index = model.index(row, column, parent)
+            widget.setCurrentIndex(index)  # (selects it, as the press of a click does)
+            widget.clicked(index)  # (PythonQt emits a signal called like a slot; a tree's itemClicked follows)
+            if double:
+                widget.doubleClicked(index)
+                widget.activated(index)  # (Windows activates an item on a double click)
+            return {"row": args.get("row"), "texts": texts, "double": double}
+        return _Plan(entry["key"], fingerprint + (tuple(texts), column, double), about, perform_row, widget)
+    if args.get("row") is not None:
+        raise FreeLabError("bad_args", "row is for a list, tree, or table.")
+    if item:
+        menu = _button_menu(widget) if kind == "button" else None
+        if menu is None:
+            raise FreeLabError("wrong_kind", u"'%s' has no menu: click it without entry." % control.address)
+        action, trail = _menu_at(menu, item, control.address)
+        if action.menu() is not None:
+            raise FreeLabError("wrong_kind", u"%s is a menu: give one of its entries." % u" > ".join(trail))
+        if not _prop(action, "enabled"):
+            raise FreeLabError("disabled", u"%s > %s is disabled: nothing was done." % (control.address, u" > ".join(trail)))
+        risk = _control_risk(control, question, script, click=True, texts=(trail[-1], _object_name(action)), marked=action)
+        _require_for(args, risk, u"'%s' > %s is a command that may write files or throw work away, or a control of a "
+                                 u"question FontLab asks." % (control.address, u" > ".join(trail)))
+        about["entry"] = u" > ".join(trail)
+
+        def perform_entry():
+            action.trigger()
+            return {"entry": u" > ".join(trail)}
+        return _Plan(entry["key"], fingerprint + (tuple(trail),), about, perform_entry, action)
+    menu = _button_menu(widget) if kind == "button" else None
+    if _needs_entry(widget, menu):
+        raise FreeLabError("wrong_kind", u"A click on '%s' only opens its menu: give entry, one of: %s." % (
+            control.address, u", ".join(text for _a, text in _menu_entries(menu))))
+    risk = _control_risk(control, question, script, click=True)
+    _require_for(args, risk, u"'%s' is a command that may write files or throw work away (by its name, or marked so), "
+                             u"or a control of a question FontLab asks." % control.address)
+
+    def perform():
+        widget.click()  # (pressed, released, clicked, and toggled, as a user's click)
+        result = {"clicked": control.address}
+        if kind in ("check", "radio") or _try(lambda: _prop(widget, "checkable"), False):
+            result["checked"] = bool(_try(lambda: _prop(widget, "checked"), False))
+        return result
+    return _Plan(entry["key"], fingerprint, about, perform, widget)
+
+
+@op("click")
+def op_click(listener, args):
+    """Clicks a button, check box, or radio button (or a button's menu entry, or a row of a list), as a user's
+    click does, from a timer a moment after the reply. Refused for a hidden or disabled control, while
+    something else waits or works, and without risky mode for a risky one (_control_risk)."""
+    return _start_action(listener, args, "click", _plan_click)
+
+
+def _truth(value):
+    if isinstance(value, bool):
+        return value
+    words = {u"true": True, u"on": True, u"yes": True, u"checked": True, u"false": False, u"off": False, u"no": False,
+             u"unchecked": False}
+    if isinstance(value, string_types) and _text(value).strip().lower() in words:
+        return words[_text(value).strip().lower()]
+    raise FreeLabError("bad_args", "value must be true or false here.")
+
+
+def _plan_set_value(listener, args, own):
+    entry, question, script, fingerprint = _action_window(listener, args, own)
+    control = _action_control(entry, args, ("check", "radio", "combo", "spin", "field", "text", "tabs", "slider") + ROW_KINDS)
+    widget, kind = control.widget, control.kind
+    _require_for(args, _control_risk(control, question, script), u"'%s' is a control of a question FontLab asks, or one "
+                                                                  u"marked risky." % control.address)
+    if "value" not in args:
+        raise FreeLabError("bad_args", "value is missing.")
+    value = args.get("value")
+    about = {"control": control.address, "kind": kind}
+    fingerprint += (control.address, kind)
+    if kind in ROW_KINDS:
+        wanted = _truth(value)
+        model, parent, row, texts = _row_target(widget, kind, args)
+        index = model.index(row, 0, parent)
+        if not int(model.flags(index)) & USER_CHECKABLE:
+            raise FreeLabError("wrong_kind", u"Row %s of '%s' has no check box." % (args.get("row"), control.address))
+        about.update({"row": args.get("row"), "texts": texts, "value": wanted})
+
+        def perform_row():
+            before = _try(lambda: model.data(index, CHECK_STATE_ROLE))
+            model.setData(index, 2 if wanted else 0, CHECK_STATE_ROLE)  # (as a user's tick: the view's itemChanged)
+            return {"row": args.get("row"), "before": before, "after": _try(lambda: model.data(index, CHECK_STATE_ROLE))}
+        return _Plan(entry["key"], fingerprint + (tuple(texts), wanted), about, perform_row, widget)
+    if args.get("row") is not None:
+        raise FreeLabError("bad_args", "row is for a list, tree, or table.")
+    if kind in ("check", "radio"):
+        wanted = _truth(value)
+        about["value"] = wanted
+        fingerprint += (wanted,)
+    if kind == "check":
+        tristate = bool(_try(lambda: _prop(widget, "tristate"), False))
+
+        def state():
+            return int(widget.checkState()) if tristate else (2 if _prop(widget, "checked") else 0)
+
+        def perform():
+            before = state()
+            for _ in range(3):  # (a box of three states goes through them in turn, as clicks do)
+                if state() == (2 if wanted else 0):
+                    break
+                widget.click()
+            return {"before": before == 2 if before != 1 else u"partial", "after": state() == 2}
+        perform_value = perform
+    elif kind == "radio":
+        if not wanted:
+            raise FreeLabError("bad_args", "A radio button is turned off by choosing another: give true.")
+
+        def perform_value():
+            before = bool(_prop(widget, "checked"))
+            if not before:
+                widget.click()
+            return {"before": before, "after": bool(_prop(widget, "checked"))}
+    elif kind == "combo":
+        count = int(_prop(widget, "count"))
+        texts = [_text(widget.itemText(i)) for i in range(count)]
+        if isinstance(value, bool):
+            raise FreeLabError("bad_args", "value must be the entry's text (or its number).")
+        if isinstance(value, integer_types):
+            if not 0 <= value < count:
+                raise FreeLabError("bad_args", u"'%s' has %d entries: value must be from 0 to %d." % (control.address, count, count - 1))
+            index = value
+        else:
+            matches = [i for i, text in enumerate(texts) if _entry_words(text) == _entry_words(value)]
+            if not matches:
+                raise FreeLabError("not_found", u"'%s' has no entry '%s'; its entries: %s." % (
+                    control.address, _text(value), u", ".join(texts[:MAX_CHOICES])))
+            index = matches[0]
+        about["value"] = texts[index]
+        fingerprint += (index, texts[index])
+
+        def perform_value():
+            before = _text(_prop(widget, "currentText") or u"")
+            widget.setCurrentIndex(index)  # (currentIndexChanged, if it changed)
+            widget.activated(index)  # (what a user's choice emits besides; PythonQt emits a signal called like a slot)
+            return {"before": before, "after": _text(_prop(widget, "currentText") or u"")}
+    elif kind in ("spin", "slider"):
+        if kind == "spin" and _try(lambda: _prop(widget, "readOnly"), False):
+            raise FreeLabError("unavailable", u"'%s' is read-only: nothing was done." % control.address)
+        if kind == "spin" and not (widget.inherits("QSpinBox") or widget.inherits("QDoubleSpinBox")):
+            raise FreeLabError("wrong_kind", u"'%s' is a spin box of another kind (a date, a time): not set." % control.address)
+        try:
+            number = _number_value(value)
+        except ValueError:
+            raise FreeLabError("bad_args", "value must be a number here.")
+        whole = not widget.inherits("QDoubleSpinBox")
+        if whole and number != int(number):
+            raise FreeLabError("bad_args", u"'%s' takes whole numbers." % control.address)
+        low, high = float(_prop(widget, "minimum")), float(_prop(widget, "maximum"))
+        if not low <= number <= high:
+            raise FreeLabError("bad_args", u"'%s' takes %g to %g." % (control.address, low, high))
+        number = int(number) if whole else number
+        about["value"] = number
+        fingerprint += (number,)
+
+        def perform_value():
+            before = _prop(widget, "value")
+            widget.setValue(number)  # (valueChanged, if it changed)
+            if kind == "spin":
+                widget.editingFinished()  # (as a user's typing ends)
+            return {"before": before, "after": _prop(widget, "value")}
+    elif kind in ("field", "text"):
+        if _try(lambda: _prop(widget, "readOnly"), False):
+            raise FreeLabError("unavailable", u"'%s' is read-only: nothing was done." % control.address)
+        if isinstance(value, bool) or not isinstance(value, string_types + integer_types + (float,)):
+            raise FreeLabError("bad_args", "value must be the text to put in.")
+        text = _text(value)
+        about["value"] = _shorten(text, SHORT_TEXT)
+        fingerprint += (text,)
+
+        def perform_value():
+            if kind == "field":
+                before = _text(_prop(widget, "text") or u"")
+                widget.setText(text)  # (textChanged)
+                widget.textEdited(text)  # (what typing emits besides)
+                widget.editingFinished()
+                return {"before": _shorten(before, SHORT_TEXT), "after": _shorten(_text(_prop(widget, "text") or u""), SHORT_TEXT)}
+            widget.setPlainText(text)  # (textChanged)
+            return {"length": len(_text(widget.toPlainText()))}
+    else:  # tabs
+        count = int(_prop(widget, "count"))
+        texts = [_text(widget.tabText(i)) for i in range(count)]
+        if isinstance(value, bool):
+            raise FreeLabError("bad_args", "value must be the tab's text (or its number).")
+        if isinstance(value, integer_types):
+            if not 0 <= value < count:
+                raise FreeLabError("bad_args", u"'%s' has %d tabs: value must be from 0 to %d." % (control.address, count, count - 1))
+            index = value
+        else:
+            matches = [i for i, text in enumerate(texts) if _entry_words(text) == _entry_words(value)]
+            if not matches:
+                raise FreeLabError("not_found", u"'%s' has no tab '%s'; its tabs: %s." % (
+                    control.address, _text(value), u", ".join(_caption(t, SHORT_TEXT) for t in texts)))
+            index = matches[0]
+        if not widget.isTabEnabled(index):
+            raise FreeLabError("disabled", u"The tab '%s' of '%s' is disabled: nothing was done." % (texts[index], control.address))
+        about["value"] = _caption(texts[index], SHORT_TEXT)
+        fingerprint += (index, texts[index])
+
+        def perform_value():
+            before = int(_prop(widget, "currentIndex"))
+            widget.setCurrentIndex(index)  # (currentChanged, as a click on the tab)
+            return {"before": before, "after": int(_prop(widget, "currentIndex"))}
+    return _Plan(entry["key"], fingerprint, about, perform_value, widget)
+
+
+@op("set_value")
+def op_set_value(listener, args):
+    """Sets a control as a user's edit does, from a timer a moment after the reply: ticks or unticks a check
+    box (or a row's), chooses a radio button, a dropdown's entry (by its text), or a tab, sets a spin box,
+    slider, field, or text box; and emits what the user's edit would besides (activated, editingFinished,
+    textEdited)."""
+    return _start_action(listener, args, "set_value", _plan_set_value)
+
+
+def _plan_link(listener, args, own):
+    entry, question, script, fingerprint = _action_window(listener, args, own)
+    control = _action_control(entry, args, ("label", "log"))
+    widget = control.widget
+    href, text = args.get("href") or u"", args.get("text") or u""
+    if not isinstance(href, string_types) or not isinstance(text, string_types) or not (href.strip() or text.strip()):
+        raise FreeLabError("bad_args", "Give the link's href, or its text, as read_text lists them.")
+    if control.kind == "label":
+        if _try(lambda: _prop(widget, "openExternalLinks"), False):
+            raise FreeLabError("unavailable", u"'%s' opens its links in a web browser: FreeLab MCP never opens one." % control.address)
+        links = _links(_text(_prop(widget, "text") or u""))
+    else:
+        links = _links(widget.toHtml())
+    if href.strip():
+        found = [link for link in links if link["href"] == _text(href).strip()]
+    else:
+        found = [link for link in links if u" ".join(link["text"].split()).lower() == u" ".join(_text(text).split()).lower()]
+    if not found:
+        raise FreeLabError("not_found", u"'%s' has no link %s; its links: %s." % (
+            control.address, u"to '%s'" % href if href.strip() else u"'%s'" % text,
+            u"; ".join(u"%s (%s)" % (link["text"], link["href"]) for link in links[:20]) or u"none"))
+    if len(set(link["href"] for link in found)) > 1:
+        raise FreeLabError("ambiguous_control", u"%d links of '%s' read '%s', to %s: give href." % (
+            len(found), control.address, text, u", ".join(sorted(set(link["href"] for link in found))[:10])))
+    target = found[0]["href"]
+    if EXTERNAL_LINK.match(target):
+        raise FreeLabError("unavailable", u"The link goes to %s, outside FontLab: FreeLab MCP never opens one." % target)
+    _require_for(args, _control_risk(control, question, script), u"'%s' is a control of a question FontLab asks, or one "
+                                                                  u"marked risky." % control.address)
+    QtCore = _qt()[0]
+
+    def perform():
+        if control.kind == "log":
+            widget.anchorClicked(QtCore.QUrl(target))  # (what a click on the link emits; the view is not made to follow it)
+        else:
+            widget.linkActivated(target)
+        return {"link": target}
+    return _Plan(entry["key"], fingerprint + (control.address, target), {"control": control.address, "link": target},
+                 perform, widget)
+
+
+@op("click_link")
+def op_click_link(listener, args):
+    """Follows a link of a log (a text browser) or a label as a click does (anchorClicked, linkActivated), from a
+    timer a moment after the reply. A link out of FontLab (a web page, a mail) is never followed."""
+    return _start_action(listener, args, "click_link", _plan_link)
+
+
+def _menu_bar(QtGui):
+    main = _main_window(QtGui)
+    bars = _real_list(main.findChildren(QtGui.QMenuBar), "findChildren()")
+    for bar in bars:
+        if _same(_try(lambda: bar.parentWidget()), main):
+            return bar
+    if not bars:
+        raise FreeLabError("not_found", "FontLab's menu bar was not found.")
+    return bars[0]
+
+
+def _menu_risk(action, trail):
+    """A menu command is risky when it is in FontLab's File menu, named like Save, Export, Close, Quit, Exit,
+    Revert, or Discard, or marked mcpRisky."""
+    if _entry_words(trail[0]) == u"file" or _risky_named(trail[-1], _object_name(action)) or \
+            _try(lambda: action.property(RISKY_PROPERTY)):
+        return "risky_command"
+    return None
+
+
+@op("menu")
+def op_menu(listener, args):
+    """The main window's menus (path ""), or the entries of the menu path names: each one's text, whether it is a
+    menu or a command, enabled, checked, and whether running it needs risky mode. A menu FontLab fills only as
+    it opens may list nothing until it has been opened once."""
+    QtGui = _qt()[1]
+    path = args.get("path") or u""
+    if not isinstance(path, string_types):
+        raise FreeLabError("bad_args", "path must be a menu's path, such as Scripts > FreeLab.")
+    bar = _menu_bar(QtGui)
+    trail, level = [], bar
+    if path.strip():
+        action, trail = _menu_at(bar, path, u"The menu bar")
+        level = action.menu()
+        if level is None:
+            raise FreeLabError("wrong_kind", u"%s is a command, not a menu: run_menu_command runs it." % u" > ".join(trail))
+    entries = []
+    for action, text in _menu_entries(level):
+        submenu = _try(lambda: action.menu())
+        item = {"text": text, "kind": "menu" if submenu is not None else "command",
+                "enabled": bool(_try(lambda: _prop(action, "enabled"), False))}
+        if submenu is None:
+            if _try(lambda: _prop(action, "checkable"), False):
+                item["checked"] = bool(_try(lambda: _prop(action, "checked"), False))
+            if _menu_risk(action, trail + [text]):
+                item["risky"] = True
+        entries.append(item)
+    reply = {"path": u" > ".join(trail), "entries": entries}
+    if trail and not entries:
+        reply["note"] = u"This menu lists no entry: FontLab may fill it only as it opens (open it once on screen)."
+    return reply
+
+
+def _plan_menu(listener, args, own):
+    QtGui = _qt()[1]
+    _refuse_while_waiting(listener, QtGui, QtGui.QApplication.instance().activeModalWidget(), False, own)
+    path = args.get("path")
+    if not isinstance(path, string_types) or not path.strip():
+        raise FreeLabError("bad_args", "path must be a menu command's path, such as Scripts > FreeLab > Font Check.")
+    action, trail = _menu_at(_menu_bar(QtGui), path, u"The menu bar")
+    command = u" > ".join(trail)
+    if action.menu() is not None:
+        raise FreeLabError("wrong_kind", u"%s is a menu: list_menu lists its entries." % command)
+    if not _prop(action, "enabled"):
+        raise FreeLabError("disabled", u"%s is disabled: nothing was done." % command)
+    _require_for(args, _menu_risk(action, trail), u"%s is in FontLab's File menu, named like a command that may write "
+                                                  u"files or throw work away, or marked risky." % command)
+
+    def perform():
+        action.trigger()  # (as the menu's click: FontLab runs the command, or the script, now)
+        result = {"command": command}
+        if _try(lambda: _prop(action, "checkable"), False):
+            result["checked"] = bool(_try(lambda: _prop(action, "checked"), False))
+        return result
+    return _Plan(u"main", ("menu", tuple(trail), _object_name(action)), {"command": command}, perform, action)
+
+
+@op("run_menu_command")
+def op_run_menu_command(listener, args):
+    """Runs a command of the main window's menus by its path (Scripts > FreeLab > Font Check), as a click on it
+    does, from a timer a moment after the reply. Refused while a dialog waits, an action runs, or a window works,
+    and without risky mode for a risky command (_menu_risk)."""
+    return _start_action(listener, args, "run_menu_command", _plan_menu)
+
+
+@op("action_result")
+def op_action_result(listener, args):
+    """What became of an action: state queued, running, done (with what changed), skipped (checked again when
+    its timer fired, it was not done: code and reason), or failed (it raised: error)."""
+    action_id = _int_arg(args, "action_id", None, 1, 10 ** 9)
+    if action_id not in listener.actions:
+        raise FreeLabError("not_found", "No action of that id in this listener.")
+    _pending_actions(listener)  # (a lost one marked skipped)
+    return {"action": dict(listener.actions[action_id])}
+
+
+@op("window_state")
+def op_window_state(listener, args):
+    """What wait_idle polls: the dialog waiting (if any), the windows that work, the listener's actions queued
+    or running and the last one, and, for window, whether it is still shown and busy. Reads only."""
+    QtGui = _qt()[1]
+    modal = QtGui.QApplication.instance().activeModalWidget()
+    reply = {"dialog": None, "question": False, "busy_windows": []}
+    entries = _window_entries(QtGui)
+    if modal is not None:
+        reply["dialog"] = _describe_dialog(modal)
+        reply["question"] = not _script_window(modal, True)
+        keys = [entry["key"] for entry in entries if _same(entry["widget"], modal)]
+        reply["dialog_window"] = keys[0] if keys else u"dialog"
+    for entry in entries:
+        busy = _window_busy(entry["widget"], entry["main"], QtGui)
+        if busy["busy"]:
+            busy["window"] = entry["key"]
+            reply["busy_windows"].append(busy)
+    wanted = args.get("window") or u""
+    if wanted:
+        try:
+            reply["window"] = _describe_window(_find_window(QtGui, wanted, modal), modal, QtGui, listener)
+        except FreeLabError as exc:
+            if exc.code != "not_found":
+                raise
+            reply["window"] = None
+    pending = _pending_actions(listener)
+    reply["actions_pending"] = [{"id": r["id"], "tool": r["tool"], "state": r["state"], "window": r.get("window")}
+                                for r in pending]
+    if listener.actions:
+        reply["last_action"] = dict(listener.actions[max(listener.actions)])
+    return reply
+
+
+# ---------------------------------------------------------------------------
 # Saving and exporting: risky actions (RISKY_ACTIONS), each run from a timer after the reply
 # ---------------------------------------------------------------------------
 
@@ -3619,6 +5004,8 @@ class Listener(object):
         self.opened = self._load_opened()
         self.answer_outcomes = {}  # answer_dialog's id -> what became of its click (None: still to come)
         self.answers_made = 0
+        self.actions = {}  # the window tools' actions by id: each one's tool, window, state, and outcome
+        self.actions_made = 0
         self.state_private = None  # True once the state file is readable by this user only; else why not
         self.bad_tokens = []  # when requests with a wrong token came (BAD_TOKEN_LIMIT)
         self.throttled_until = 0.0
@@ -3669,6 +5056,16 @@ class Listener(object):
         if len(kept) != len(self.opened):
             self.opened = kept
             self.save_opened()
+
+    def new_action(self, tool, window, about):
+        """A window tool's action, queued (see _start_action); the last MAX_ACTIONS_KEPT are kept."""
+        self.actions_made += 1
+        record = {"id": self.actions_made, "tool": tool, "window": window, "state": "queued", "asked": time.time()}
+        record.update(about)
+        self.actions[self.actions_made] = record
+        for old in [k for k in self.actions if k <= self.actions_made - MAX_ACTIONS_KEPT]:
+            del self.actions[old]
+        return record
 
     def new_answer(self):
         self.answers_made += 1

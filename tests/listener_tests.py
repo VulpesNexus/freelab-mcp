@@ -2058,9 +2058,16 @@ class RiskyTests(FontCase):
             ("save_font", {"font": 7}),
             ("export_font", {"font": 7, "folder": self.tmp}),
             ("close_font", {"font": 7, "discard_changes": True}),
+            ("click", {"window": "dialog", "control": "OK"}),  # (a control of FontLab's question)
+            ("run_menu_command", {"path": "File > Save Font"}),  # (once the question is gone: below)
         ]
         refused = set()
         for op, args in cases:
+            if op == "run_menu_command":
+                import widgetfakes
+                self.state.question = None
+                self.state.menu_bar = widgetfakes.Widget("QMenuBar", actions=[widgetfakes.Action(
+                    u"&File", menu=widgetfakes.menu(widgetfakes.Action(u"&Save Font...", name=u"actionSaveFont")))])
             for risky in (None, False, 1, "true"):
                 payload = dict(args)
                 if risky is not None:

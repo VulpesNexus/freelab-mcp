@@ -804,6 +804,13 @@ class FontLabState(object):
         self.export_writes = True  # False: an export writes no file
         self.saved = []  # the fonts File > Save saved (the font in front)
         self.on_modal = None  # what the user does once a modal question shows (modal), then None
+        # The window tools (widgetfakes): scripts' windows shown, the modal one among them FontLab waits on,
+        # the main window's own widgets and dynamic properties, and its menu bar.
+        self.qt_windows = []
+        self.qt_modal = None
+        self.main_children = []
+        self.main_props = {}
+        self.menu_bar = None
 
     def ask(self, title, kind=u"QDialog", buttons=(u"OK",), text=u"", then=None):
         """FontLab shows a question (a modal dialog other than the Save one)."""
@@ -1039,6 +1046,7 @@ QT_MODULES = ("PythonQt", "PythonQt.QtCore", "PythonQt.QtGui")
 def install_qt(state):
     """Fake PythonQt: QPointF, QTransform, and FontLab's main window with its Edit > Undo action. Returns
     what it replaced, for uninstall_qt."""
+    import widgetfakes  # (here: it imports this module)
     saved = dict((name, sys.modules.get(name)) for name in QT_MODULES)
 
     class QAction(object):
@@ -1110,6 +1118,11 @@ def install_qt(state):
         class_name = "QWidget"
         objectName = ""
         windowTitle = u""
+        enabled = True
+        modal = False
+        toolTip = u""
+        accessibleName = u""
+        top = False  # a top-level window
 
         def metaObject(self):
             return Meta(self.class_name)
@@ -1128,6 +1141,18 @@ def install_qt(state):
 
         def isWidgetType(self):
             return True
+
+        def isWindow(self):
+            return self.top
+
+        def property(self, name):
+            return None
+
+        def parentWidget(self):
+            return None
+
+        def layout(self):
+            return None
 
         def grab(self):
             state.grabs.append(self.windowTitle)
@@ -1179,13 +1204,20 @@ def install_qt(state):
 
     class QAbstractButton(Widget):
         kinds = ("QAbstractButton",)
+        class_name = "QPushButton"
+        checkable = False
+        checked = False
 
     class QLabel(Widget):
         kinds = ("QLabel",)
+        class_name = "QLabel"
         textFormat = 2
 
         def __init__(self, text):
             self.text = text
+
+        def buddy(self):
+            return None
 
     class QTextEdit(Widget):
         objectName = "textOutput"
@@ -1229,6 +1261,7 @@ def install_qt(state):
     class SavePrompt(Widget):
         class_name = "DlgClosePackage"
         windowTitle = u"FontLab Warning"
+        top = modal = True
 
         def findChildren(self, kind):
             if kind is QLabel:
@@ -1253,6 +1286,8 @@ def install_qt(state):
                 then(self.text)
 
     class Question(Widget):
+        top = modal = True
+
         @property
         def class_name(self):
             return state.question_class
@@ -1262,15 +1297,23 @@ def install_qt(state):
             return state.question
 
         def children(self):
-            return [QLabel(state.question_text)] + [QuestionAnswer(text) for text in state.question_buttons]
+            shown = (state.question, state.question_text, tuple(state.question_buttons))
+            if self.parts is None or self.parts[0] != shown:  # (the same buttons while the same question shows)
+                self.parts = (shown, [QLabel(state.question_text)] + [QuestionAnswer(t) for t in state.question_buttons])
+            return list(self.parts[1])
+
+        parts = None
 
     class Window(Widget):
+        top = True
+
         def __init__(self, title):
             self.windowTitle = title
 
     class MainWindow(Widget):
         class_name = "MainWindow"
         windowTitle = u"FontLab 7"
+        top = True
 
         def findChildren(self, kind):
             if kind is QAction:
@@ -1282,7 +1325,18 @@ def install_qt(state):
                 return [OtherCompileButton()] + ([CompileButton()] if state.features_panel else [])
             if kind is QTextEdit:
                 return [QTextEdit(False), QTextEdit(True)] if state.output_panel else []
+            if kind is widgetfakes.QMenuBar:
+                return [state.menu_bar] if state.menu_bar is not None else []
             return []
+
+        def children(self):
+            return list(state.main_children)
+
+        def property(self, name):
+            return state.main_props.get(name)
+
+    # One wrapper per window, as PythonQt keeps one per Qt object while it is held.
+    main, prompt, question, plain = MainWindow(), SavePrompt(), Question(), {}
 
     class QApplication(object):
         @staticmethod
@@ -1290,13 +1344,18 @@ def install_qt(state):
             return QApplication()
 
         def topLevelWidgets(self):
-            return [MainWindow()] + [Window(title) for title in state.windows] + \
-                ([SavePrompt()] if state.prompt is not None else []) + ([Question()] if state.question else [])
+            for title in state.windows:
+                if title not in plain:
+                    plain[title] = Window(title)
+            return [main] + [plain[title] for title in state.windows] + list(state.qt_windows) + \
+                ([prompt] if state.prompt is not None else []) + ([question] if state.question else [])
 
         def activeModalWidget(self):
             if state.prompt is not None:
-                return SavePrompt()
-            return Question() if state.question else None
+                return prompt
+            if state.question:
+                return question
+            return state.qt_modal
 
     class QTimer(object):
         @staticmethod
@@ -1341,9 +1400,11 @@ def install_qt(state):
     core = types.ModuleType("PythonQt.QtCore")
     core.QPointF = QPointF
     core.QTimer, core.QByteArray, core.QBuffer, core.QIODevice = QTimer, QByteArray, QBuffer, QIODevice
+    core.QUrl, core.QModelIndex = widgetfakes.QUrl, widgetfakes.QModelIndex
     gui = types.ModuleType("PythonQt.QtGui")
     gui.QTransform, gui.QApplication, gui.QAction = QTransform, QApplication, QAction
     gui.QTabWidget, gui.QAbstractButton, gui.QLabel, gui.QTextEdit = QTabWidget, QAbstractButton, QLabel, QTextEdit
+    gui.QProgressBar, gui.QMenuBar = widgetfakes.QProgressBar, widgetfakes.QMenuBar
     root = types.ModuleType("PythonQt")
     root.QtCore, root.QtGui = core, gui
     sys.modules.update({"PythonQt": root, "PythonQt.QtCore": core, "PythonQt.QtGui": gui})

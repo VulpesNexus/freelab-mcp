@@ -22,9 +22,10 @@ PY27_DIR = Path(os.environ.get("FREELAB_PY27_DIR") or Path(os.environ.get("LOCAL
 PY27 = PY27_DIR / "tools" / "python.exe"
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 PY27_FILES = (
-    "listener/freelab_listener.py", "tests/fakes.py", "tests/listener_tests.py",
+    "listener/freelab_listener.py", "tests/fakes.py", "tests/widgetfakes.py", "tests/listener_tests.py",
+    "tests/window_tests.py",
 )
-PY27_SUITES = ("tests/listener_tests.py",)
+PY27_SUITES = ("tests/listener_tests.py", "tests/window_tests.py")
 
 
 def run_py3() -> tuple[bool, list[str]]:

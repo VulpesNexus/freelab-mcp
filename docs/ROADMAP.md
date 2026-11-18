@@ -22,8 +22,13 @@ Proven live on test fonts, with what FontLab did, in [FONTLAB7-API.md](FONTLAB7-
 - **Risky mode** ([RISKY.md](RISKY.md)): saving, exporting, answering FontLab's questions, throwing away changes, and rewriting or removing a glyph's references, off unless the user asks.
 - The listener's state file closed to other accounts on Windows; peers outside the loopback refused; wrong tokens throttled.
 
+## Done in 1.3.0 (on fakes)
+
+- **Window tools** ([WINDOW-TOOLS.md](WINDOW-TOOLS.md)): any FontLab window driven as a user would, FreeLab Script Suite's tool windows included, without `run_python`: windows and their controls listed with stable addresses, clicks, values, list rows, texts with their links, menu commands, and `wait_idle` for the work an action starts. Actions run from a timer after the reply and are checked again then; questions of FontLab's and commands that save, export, close, or revert need risky mode; optional conventions (`objectName`, `mcpBusy`, `mcpScriptWindow`, `mcpRisky`) let a script be driven more surely.
+
 ## Next
 
+- **The window tools proven live**, by driving a whole FreeLab Script Suite workflow through them ([the list](FONTLAB7-API.md#the-window-tools-130-to-prove-live)).
 - **What 1.2.0 still lacks live proof of**, as listed in [FONTLAB7-API.md](FONTLAB7-API.md#not-yet-proven-live): `screenshot` from the screen above 100 % scaling, among others.
 - **A font with no window tab**: a way to bring it forward or close it (the candidates are listed there).
 - **Classes of the Classes panel** in `update_references` and `remove_references`, if `fgFont.groups` proves to change them.

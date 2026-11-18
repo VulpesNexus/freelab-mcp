@@ -29,7 +29,8 @@ EXPECTED_TOOLS = {"fontlab_status", "list_fonts", "get_current_font", "list_glyp
                   "set_feature_code", "undo", "run_python", "launch_fontlab", "quit_fontlab", "restart_fontlab",
                   "open_font", "close_font", "bring_font_to_front", "compile_features", "read_output", "screenshot",
                   "set_risky_mode", "list_risky_actions", "answer_dialog", "save_font", "export_font", "delete_glyph",
-                  "set_glyph_outline"}
+                  "set_glyph_outline", "list_windows", "list_window_controls", "click", "set_value", "read_list",
+                  "read_text", "click_link", "list_menu", "run_menu_command", "wait_idle"}
 WRITE_TOOLS = {"set_kerning_pair", "remove_kerning_pair", "set_glyph_metrics", "rename_glyph", "set_glyph_unicodes",
                "add_component_glyph", "set_anchor", "remove_anchor", "set_feature_code", "undo",
                "close_font", "bring_font_to_front", "compile_features", "delete_glyph", "set_glyph_outline",
@@ -39,7 +40,14 @@ RISKY_PLACES = {"close_font.discard_changes": ("close_font", "discard_changes"),
                 "open_font.answer": ("open_font", "answer"), "quit_fontlab.discard_changes": ("quit_fontlab", "discard_changes"),
                 "rename_glyph.update_references": ("rename_glyph", "update_references"),
                 "delete_glyph.remove_references": ("delete_glyph", "remove_references"),
-                "save_font": ("save_font", None), "export_font": ("export_font", None), "run_python": ("run_python", None)}
+                "save_font": ("save_font", None), "export_font": ("export_font", None), "run_python": ("run_python", None),
+                # (risky only for some controls or commands, which the listener tells apart: said in the description)
+                "question_control": ("click", "*"), "risky_command": ("run_menu_command", "*")}
+
+
+def entry_tools(action):
+    """The tools RISKY_ACTIONS names for an action."""
+    return [name.strip() for key, tools, _reason, _enforced in fl.RISKY_ACTIONS if key == action for name in tools.split(",")]
 
 
 class ServerCase(unittest.TestCase):
@@ -138,8 +146,8 @@ class ToolTests(ServerCase):
         status = asyncio.run(server.fontlab_status())
         self.assertEqual(status["fonts_open"], 0)
         self.assertEqual(status["listener"]["listener"], fl.VERSION)
-        self.assertEqual(status["server"], "1.2.0")
-        self.assertEqual(fl.VERSION, "1.2.0")
+        self.assertEqual(status["server"], "1.3.0")
+        self.assertEqual(fl.VERSION, "1.3.0")
 
     def test_font_and_glyph_tools(self):
         self.open_sample()
@@ -429,7 +437,10 @@ class RiskyToolTests(WindowCase):
         self.assertEqual(set(RISKY_PLACES), set(entry["action"] for entry in server.risky.ACTIONS))
         tools = self.tools()
         for action, (tool, argument) in RISKY_PLACES.items():
-            if argument is None:
+            if argument == "*":
+                for name in entry_tools(action):
+                    self.assertIn("[risky]", tools[name].description, (action, name))
+            elif argument is None:
                 self.assertTrue(tools[tool].description.startswith("[risky]"), tool)
             else:
                 self.assertIn("[risky]", tools[tool].inputSchema["properties"][argument]["description"], (tool, argument))
@@ -437,7 +448,7 @@ class RiskyToolTests(WindowCase):
         self.assertIn("own words", tools["set_risky_mode"].description)
         self.assertIn("never on your own initiative", server.mcp.instructions)
         listed = asyncio.run(server.list_risky_actions())
-        self.assertEqual((listed["risky_mode"], listed["source"], len(listed["actions"])), (False, "listener file", 9))
+        self.assertEqual((listed["risky_mode"], listed["source"], len(listed["actions"])), (False, "listener file", 11))
 
     def test_risky_tools_are_refused_until_risky_mode_is_on(self):
         folder = os.path.join(self.tmp, "out")
@@ -552,6 +563,125 @@ class RiskyToolTests(WindowCase):
         with self.assertRaisesRegex(RuntimeError, r"\[bad_args\] source"):
             asyncio.run(server.screenshot(source="desktop"))
         self.assertEqual(asyncio.run(server.screenshot())[1]["source"], "qt")
+
+
+class WindowDrivingTests(WindowCase):
+    """The window tools through the real server, client, and listener: a script's tool window driven as a user
+    would, actions run on the listener's thread from its timers, and wait_idle waiting on their work."""
+
+    def setUp(self):
+        super().setUp()
+        import widgetfakes as W
+        from window_tests import TITLE, ToolWindow
+        self.W, self.title = W, TITLE
+        self.tool = ToolWindow()
+        self.tool.window._f_props["mcpScriptWindow"] = True
+        self.state.qt_windows = [self.tool.window]
+
+    def work(self, seconds):
+        """The Apply button's work: the window busy (mcpBusy) for a while, as a script's long work."""
+        window = self.tool.window
+        until = time.time() + seconds
+
+        def check():
+            if time.time() < until:
+                self.state.timers.append((10, check))
+            else:
+                window._f_props["mcpBusy"] = False
+
+        def start():
+            window._f_props["mcpBusy"] = u"Kerning"
+            self.state.timers.append((10, check))
+        self.tool.apply._f_on["clicked"] = start
+
+    def test_list_and_read(self):
+        keys = [w["window"] for w in asyncio.run(server.list_windows())["windows"]]
+        self.assertEqual(keys, ["main", self.title])
+        listed = asyncio.run(server.list_window_controls("auto kerning", kinds=["combo", "spin"]))
+        self.assertEqual([c["address"] for c in listed["controls"]], ["Master > combo", "Tolerance > spin"])
+        rows = asyncio.run(server.read_list(self.title, "tree", limit=2, columns=[0]))
+        self.assertEqual([r["texts"] for r in rows["rows"]], [["A V"], ["A Vtilde"]])
+        text = asyncio.run(server.read_text(self.title, "log"))
+        self.assertEqual([link["href"] for link in text["links"]], ["glyph:A", "glyph:V", "https://example.org/help"])
+
+    def test_a_click_then_wait_idle(self):
+        self.work(0.3)
+        reply = asyncio.run(server.click(self.title, "Apply", wait_s=2))
+        self.assertEqual((reply["state"], reply["result"]), ("done", {"clicked": "Apply > button#1"}))
+        with self.assertRaisesRegex(RuntimeError, r"\[busy\] The window 'FreeLab Auto Kerning .*' is busy \(Kerning\)"):
+            asyncio.run(server.set_value(self.title, "Tolerance", 3))
+        started = time.monotonic()
+        idle = asyncio.run(server.wait_idle(self.title, timeout_s=10, settle_s=0.05))
+        self.assertGreater(time.monotonic() - started, 0.2)
+        self.assertEqual((idle["idle"], idle["last_action"]["state"], idle["window"]["busy"]), (True, "done", False))
+        reply = asyncio.run(server.set_value(self.title, "Tolerance", 3))
+        self.assertEqual(reply["result"], {"before": 5, "after": 3})
+
+    def test_wait_idle_times_out_and_stops_at_a_dialog(self):
+        self.work(30)
+        asyncio.run(server.click(self.title, "Apply"))
+        with self.assertRaisesRegex(RuntimeError, r"\[still_busy\] Not idle after 0.3 s"):
+            asyncio.run(server.wait_idle(timeout_s=0.3))
+        self.tool.window._f_props["mcpBusy"] = False
+        self.state.ask(u"Coordinates Rounding", buttons=[u"OK"])
+        waited = asyncio.run(server.wait_idle(self.title, timeout_s=5))
+        self.assertEqual((waited["idle"], waited["question"], waited["dialog"]["title"]), (False, True, "Coordinates Rounding"))
+        self.assertIn("risky mode", waited["note"])
+        with self.assertRaisesRegex(RuntimeError, r"\[dialog_open\]"):
+            asyncio.run(server.click(self.title, "Apply"))
+        with self.assertRaisesRegex(RuntimeError, r"\[risky_mode_off\] .*own words"):
+            asyncio.run(server.click("dialog", "OK"))
+        asyncio.run(server.set_risky_mode(True))
+        self.assertEqual(asyncio.run(server.click("dialog", "OK"))["state"], "done")
+        self.assertEqual(self.state.answers, [u"OK"])
+
+    def test_a_closed_window_ends_the_wait(self):
+        self.tool.close._f_on["clicked"] = lambda: self.state.qt_windows.remove(self.tool.window)
+        self.assertEqual(asyncio.run(server.click(self.title, "Close"))["state"], "done")
+        self.assertTrue(asyncio.run(server.wait_idle(self.title, timeout_s=5))["window_closed"])
+
+    def test_an_action_skipped_at_its_turn_is_an_error(self):
+        original = fl._start_action
+
+        def racing(listener, args, tool, plan):
+            reply = original(listener, args, tool, plan)
+            self.tool.apply._f_set(enabled=False)  # (disabled between the reply and the timer)
+            return reply
+        fl._start_action = racing
+        try:
+            with self.assertRaisesRegex(RuntimeError, r"\[disabled\] Nothing was done \(checked again"):
+                asyncio.run(server.click(self.title, "Apply"))
+        finally:
+            fl._start_action = original
+        self.assertEqual(self.tool.applied, [])
+
+    def test_menus_and_links(self):
+        W = self.W
+        check = W.Action(u"Font Check")
+        self.state.menu_bar = W.Widget("QMenuBar", actions=[
+            W.Action(u"&File", menu=W.menu(W.Action(u"&Save Font...", name=u"actionSaveFont"))),
+            W.Action(u"Scripts", menu=W.menu(W.Action(u"FreeLab", menu=W.menu(check))))])
+        self.assertEqual([e["text"] for e in asyncio.run(server.list_menu("Scripts > FreeLab"))["entries"]], ["Font Check"])
+        self.assertEqual(asyncio.run(server.run_menu_command("Scripts > FreeLab > Font Check"))["state"], "done")
+        self.assertEqual(check._f_triggered, 1)
+        with self.assertRaisesRegex(RuntimeError, r"\[risky_mode_off\] File > Save Font"):
+            asyncio.run(server.run_menu_command("File > Save Font"))
+        reply = asyncio.run(server.click_link(self.title, "log", text="V"))
+        self.assertEqual((reply["state"], self.tool.log._f_emitted), ("done", [("anchorClicked", "glyph:V")]))
+        reply = asyncio.run(server.click(self.title, "FreeLab tools", entry="Font Check"))
+        self.assertEqual((reply["result"], self.tool.font_check._f_triggered), ({"entry": "Font Check"}, 1))
+        with self.assertRaisesRegex(RuntimeError, r"\[bad_args\] wait_s"):
+            asyncio.run(server.click(self.title, "Apply", wait_s=-1))
+
+    def test_values_through_mcp(self):
+        """FastMCP's own argument handling: a value true stays a bool, a number a number, a text a text."""
+        for value, address, after in ((True, "Only kerned pairs > check", True), (12, "Tolerance > spin", 12),
+                                      ("Bold", "Master > combo", "Bold")):
+            result = asyncio.run(server.mcp.call_tool("set_value", {"window": self.title, "control": address, "value": value}))
+            blocks = result[0] if isinstance(result, tuple) else result
+            self.assertEqual(json.loads(blocks[0].text)["result"]["after"], after)
+        self.tool.page1._f_add(self.W.Widget("QLineEdit", name="note", text="x"))
+        self.assertEqual(asyncio.run(server.set_value(self.title, "note", ""))["result"]["after"], "", "a field emptied")
 
 
 class ScreenTests(unittest.TestCase):
