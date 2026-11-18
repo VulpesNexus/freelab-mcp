@@ -16,6 +16,7 @@ FreeLab Script Suite, the separate `freelab-script-suite` repository, holds tool
 ## Requirements
 
 - FontLab 7 for Windows (developed against 7.2.0), with its Python working. FontLab 7 runs scripts with a **64-bit** Python 2.7 installed on the system (a 32-bit one does not work); the FontLab 7 installer offers one. If *Window > Panels > Scripting* cannot run a one-line `print(1)`, fix that first: [docs/PYTHON27.md](docs/PYTHON27.md).
+- **macOS** is untried. The listener and the server are plain Python and Qt, as FontLab 7 for macOS has them, so the reads and writes should carry over; the Windows-only parts are the installer (PowerShell), `launch_fontlab` and `restart_fontlab` (they look for FontLab's Windows program), `screenshot` with `source="screen"` (Windows' PrintWindow), and the state file's access list. Off Windows the state file is kept in *~/.local/state/FreeLab*.
 - Python 3.10 or newer with version 1 of the `mcp` package (`pip install "mcp>=1.2,<2"`), for the server; version 2 renamed the server API.
 
 ## Install
