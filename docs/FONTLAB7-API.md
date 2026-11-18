@@ -33,7 +33,7 @@ The reads were proven live on 2026-11-16 on six corpus fonts, each opened from i
 | `flPackage` | `getAllGroups()` | method, list of `(kern class, name, id, mark, glyph names)` | `rename_glyph` | **live** (2026-11-08) |
 | `flPackage` | `renameGlyph(fgGlyph, name, True)` | method, bool | `rename_glyph` | documented, **live**: see below |
 | `flPackage` | `addGlyph(flGlyph)` | method | `add_component_glyph` | documented, **live**: adds a copy without layers |
-| `flPackage` | `deleteGlyph(flGlyph)` | method | `add_component_glyph` (taking out a glyph FontLab did not build) | documented, **live** in FreeLab (2026-11-10); the listener's use is stub-tested only |
+| `flPackage` | `deleteGlyph(flGlyph)` | method | `add_component_glyph` (taking out a glyph FontLab did not build), `delete_glyph` (below) | documented, **live** in FreeLab (2026-11-10); the listener's use is stub-tested only |
 | `flPackage` | `setFlag(2, True)` | method | every write | **live**: marks the font modified (`hasChanges` `True`) |
 | `flPackage`, `flGlyph` | `currentHistoryState()`, `initialHistoryState()` | methods, int | every write, `undo` | **live**: a state is a number that grows with each step (an Undo goes back to the earlier number; a step after an Undo gets a new one) |
 | `fontlab` module | `flGlyph()`, then `name` | constructor, settable property | `add_component_glyph` | **live** |
@@ -69,13 +69,32 @@ The reads were proven live on 2026-11-16 on six corpus fonts, each opened from i
 | `PythonQt.QtGui` | the main window's `QAbstractButton` `buttonCompile` whose `toolTip` starts *Compile features (*; `enabled`, `click()` | Qt | `compile_features` | **live** (2026-11-19): two other buttons share the name (the *Scripting* panel's); the compile runs within the click (11 to 22 ms on Bellefair and Varela Round), clears the *Output* panel, prints nothing for code that compiles, and `[F] glyph class not defined (text was "@nonexistent")` then `[F] Fatal error in font "…" in file "features" at line …` for a class it lacks |
 | `PythonQt.QtGui` | the *Output* panel: the main window's `QTextEdit` `textOutput` (two of them, the first hidden and empty), `isVisible()`, `toPlainText()` | Qt | `output`, `compile_features` | **live** (2026-11-15 in FreeLab, 2026-11-19 here) |
 | `PythonQt.QtGui`, `PythonQt.QtCore` | `QWidget.grab()`, `QPixmap.scaledToWidth(w, 1)`, `save(QBuffer, "PNG")` into a `QByteArray`, `data()` | Qt | `screenshot` | **live** (2026-11-19): `data()` is a `str` of the PNG bytes in Python 2.7; `grab()` draws the window even with another program over it |
-| `PythonQt.QtGui` | `QApplication.activeModalWidget()`, its labels' and buttons' `text` | Qt | `dialog` | **live** (2026-11-07): closing with an edited font shows `DlgClosePackage`, *FontLab Warning*, *Save changes to "…" before closing?*, with *Don't Save*, *Cancel*, and *OK* |
+| `PythonQt.QtGui` | `QApplication.activeModalWidget()`, its labels' and buttons' `text` | Qt | `dialog`, `answer_dialog` | **live** (2026-11-07): closing with an edited font shows `DlgClosePackage`, *FontLab Warning*, *Save changes to "…" before closing?*, with *Don't Save*, *Cancel*, and *OK*. For a font of several masters the question quotes its family name (`tfn`): *Save changes to  "Rubik" before closing?* for Rubik Light (live, 2026-11-19), so `close_font` matches `tfn` too |
+
+The rows below are new in 1.2.0. Each is stub-tested; none of the listener's or the server's uses is **proven live yet** (see [Not yet proven live](#not-yet-proven-live-120)), though some calls were proven in FreeLab Script Suite.
+
+| Object | Member | Kind | Used by | Level |
+|---|---|---|---|---|
+| `fgKerning` | `getPlainPairsDict()` | method, dict of (left, right) glyph names → value | `kerning` with `resolved` | live in FreeLab (2026-11-08, above); **not yet proven live** here |
+| `fgKerning` | `groups[name] = (members, side)` | assignment | `rename_glyph` (`update_references`), `delete_glyph` (`remove_references`) | live in FreeLab (2026-11-08: replaces a class and keeps its pairs); **not yet proven live** here, nor its Undo |
+| `fgOTLayout` | `set_prefix(code)` | method | `rename_glyph` (`update_references`) | documented; **not yet proven live** |
+| `flPackage` | `deleteGlyph(flGlyph)` | method | `delete_glyph` | live in FreeLab (2026-11-10); the step recorded with the font before it and Undo bringing the glyph back are **not yet proven live** |
+| `fontlab` module | `flContour([QPointF, …])`, then `closed`, and each node's `type` and `smooth` | constructor, settable properties | `set_outline` | live in FreeLab (2026-11-17: all nodes on the curve, `closed` and `smooth` set; its handles were set to `curve`); setting `type` to `off` and reading it back as given is **not yet proven live** |
+| `flShape` | `clearContours()`, `addContours(contours, True)`, `update()`; `flContour.clone()` | methods | `set_outline` | live in FreeLab (Font Check, 2026-11-11); **not yet proven live** here |
+| `fontlab` module, `flLayer` | `flShape()`, `addShape(shape)`, `removeShape(shape)`, `update()` | constructor, methods | `set_outline` (a layer with no shape of its own; `removeShape` only to take back a shape FontLab did not keep) | `flShape()` and `addShape` live in FreeLab (2026-11-17), `update()` live (2026-11-14), `removeShape` documented; **not yet proven live** here |
+| `PythonQt.QtGui` | the main window's `QAction`s `actionFeaturesPanel` and `actionOutputPanel` (*Window > Panels*): `checked`, `trigger()` | Qt | `compile_features` | names seen live in the menu (2026-11-19); triggering them and finding the *Compile* button and *Output* panel at once after are **not yet proven live** |
+| `PythonQt.QtGui` | *File > Save*: a main-window `QAction` named `actionSave`, `actionSave_Font`, or `actionSave_Fonts`, else one whose text is *Save* or *Save Font*; `trigger()` | Qt | `save_font` without a path | **not proven**: the action's name is a guess |
+| `fgFont` | `save(path, save_vfb)` | method | `save_font` with a path | documented (*save font in UFO or VFB format*); **not yet proven live** |
+| `fontlab` module, `flWorkspace` | `ExportControl()`, `load()`, `profileName`, `destinationMode` (3), `destinationFolder`; `exportFont(package, control)` | constructor, settable properties, method | `export_font` | live in FreeLab (2026-11-14 and -18, run directly); run from a timer, with timers clicking *OK* (else *Close*) on its `DlgSavePackage` message, **not yet proven live** |
+| `PythonQt.QtCore` | `QTimer.singleShot` callbacks clicking a modal question's button (`_keep_answering`) | Qt | `open_font` (`answer`), `quit` (`discard_changes`), `export_font` | timers fire inside a modal's loop (live); clicking *Coordinates Rounding*'s button from one, and *Don't Save* on each question of a quit, **not yet proven live** |
+| Windows `advapi32` | `SetFileSecurityW` with a protected one-entry access list | Win32, through `ctypes` | the state file and *opened.json* | run by the test gate under Python 3 and the official Python 2.7 on Windows 11; inside FontLab's Python **not yet proven live** |
+| Windows `user32`, `gdi32` (the server) | `EnumWindows`, `GetWindowThreadProcessId`, `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT)`, `StretchBlt` into a DIB, `SetThreadDpiAwarenessContext` | Win32, through `ctypes` | `screenshot` with `source="screen"` | **not yet proven live** (the PNG writing and the window choice are unit-tested) |
 
 ## Writes, found live (2026-11-16)
 
 FontLab 7.2.0, the six corpus fonts above, never saved.
 
-- **Undo acts on the font in front.** `actionUndo` triggered while Amiri was in front undid Amiri's last step, though the step just recorded was Rubik's. FontLab 7 offers scripts no call to bring a font to the front (`flWorkspace` has no setter for it, and `flItems` no request), so `undo` refuses a font that is not in front instead of undoing another one. Choosing the font's window tab does it (2026-11-19): `bring_font_to_front`.
+- **Undo acts on the font in front.** `actionUndo` triggered while Amiri was in front undid Amiri's last step, though the step just recorded was Rubik's. FontLab 7 offers scripts no call to bring a font to the front (`flWorkspace` has no setter for it, and `flItems` no request), so `undo` refused a font that is not in front instead of undoing another one. Choosing the font's window tab does it (2026-11-19): `bring_font_to_front`, and since 1.2.0 `undo` itself.
 - **`hasHistoryStates` is no sign of an edit** (2026-11-19): it read `True` for Varela Round and Bellefair just opened, both at `currentHistoryState() == initialHistoryState()` (0). `close_font` takes a font as changed when its History is past its first state or `hasChanges` is set.
 - **History steps cost about 0.3 to 1.8 s each and Undo 0.8 to 3.8 s** with the clipboard free (`OpenClipboard` succeeded); the 17 s of 2026-11-14 came from a locked clipboard.
 - **`renameGlyph(fgGlyph, name, True)` follows components only.** It renamed Amiri's `_1392` and the component of `uni0628` that drew it, and Undo put both back. It left kerning pairs, kerning classes, other classes, and feature code naming the old name. Worse, undoing a rename of a glyph with kerning pairs of its own lost those pairs: Amiri's `V` (40 pairs) and `fraction` (1 pair) came back without them. `rename_glyph` therefore refuses a glyph that kerning, a class, or feature code uses.
@@ -153,6 +172,27 @@ Glyphbridge-FontLab-MCP records these for FontLab 8 in its *mental-model/FONTLAB
 - After a write through the modern API, `fontlab.Update(<flGlyph>)` syncs the legacy view; the legacy `font.update()` can throw unsynced work away.
 - `flLayer.boundingBox` is a property, not a method.
 - GUI-made kerning lives in `flPackage.kerning(<master>)`; the legacy `font.kerning` can be empty while FontLab applies kerning.
+
+## Not yet proven live (1.2.0)
+
+Everything 1.2.0 adds was written without touching FontLab and tested on the spy fakes only. To raise each row above to **live**, on a disposable test font:
+
+- **`set_outline`**: replace a glyph's outline with a closed contour of on-curve nodes, then one with `off` and `curve` nodes; read it back with `get_glyph_outline` (types, smoothness, coordinates), check the glyph's box in FontLab, and `undo` it. Then a layer with only components (a new shape added, the components kept).
+- **`delete_glyph`**: delete an unused glyph, check the Font window drops it, `undo`, check it is back with its layers, name, and code points.
+- **`rename_glyph` with `update_references`** and **`delete_glyph` with `remove_references`**: on a font whose glyph has pairs of its own, kerning class memberships, and feature code; read every master's pairs and classes and the code after, then `undo` and read them again. FontLab once lost a glyph's pairs on the Undo of a plain rename (2026-11-16): that is what this must show not to happen.
+- **`get_kerning` with `resolved`**: compare `fontlab` and `computed` on class pairs, a glyph exception, and a pair of no entry.
+- **`compile_features`** with the *Features* panel never opened in the session, then with the *Output* panel closed; and against a known error, whether `located` names the right feature and line (with the *Classes* panel's classes counted, or without them).
+- **`undo` and `compile_features`** on a font behind another: the font in front afterward, and the step titles *Edit > Undo* names right after the tab was chosen.
+- **`open_font` with `answer`**, **`answer_dialog`**, **`quit_fontlab` with `discard_changes`** (two edited test fonts), **`save_font`** (find *File > Save*'s `objectName` first), and **`export_font`** into a temporary folder.
+- **`screenshot` with `source="screen"`**: the main window, a dialog by title, a scaled picture, on a display scaled above 100 %.
+
+### A font with no window tab (candidates)
+
+`bring_font_to_front`, `undo`, `compile_features`, `save_font`, and `close_font` choose a font's window tab, and refuse a font that has none (`not_found`). *Window > New Font Tab* (`actionOpen_Font_Window` in FreeLab Script Suite's notes) opens a tab of the current font only, so it cannot reach another. Calls to probe, one at a time, on a disposable font opened with no window: `flWorkspace.instance().closePackage(package)` and `flPackage.close(False)` (documented: *close(save=False)*) for closing; `fontlab.flItems.requestLoadingFont(path)` with the path of the font already open, to see whether FontLab brings it forward, opens a window of it, or opens it a second time. None is used yet.
+
+### Classes of the Classes panel (candidate)
+
+`update_references` and `remove_references` refuse a glyph in a class of FontLab's *Classes* panel (`getAllGroups()` with `kernGroup` false): no call to change one is proven. `fgFont.groups` (`fgGroups`: `get`, `asDict`, `fromDict`, of `fgGroup` with a `FeaClassGroupMode`) looks like one; it is documented, and not tried.
 
 ## Proving a call live
 

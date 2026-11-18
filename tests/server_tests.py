@@ -26,10 +26,19 @@ EXPECTED_TOOLS = {"fontlab_status", "list_fonts", "get_current_font", "list_glyp
                   "get_kerning", "get_features", "set_kerning_pair", "remove_kerning_pair", "set_glyph_metrics",
                   "rename_glyph", "set_glyph_unicodes", "add_component_glyph", "set_anchor", "remove_anchor",
                   "set_feature_code", "undo", "run_python", "launch_fontlab", "quit_fontlab", "restart_fontlab",
-                  "open_font", "close_font", "bring_font_to_front", "compile_features", "read_output", "screenshot"}
+                  "open_font", "close_font", "bring_font_to_front", "compile_features", "read_output", "screenshot",
+                  "set_risky_mode", "list_risky_actions", "answer_dialog", "save_font", "export_font", "delete_glyph",
+                  "set_glyph_outline"}
 WRITE_TOOLS = {"set_kerning_pair", "remove_kerning_pair", "set_glyph_metrics", "rename_glyph", "set_glyph_unicodes",
                "add_component_glyph", "set_anchor", "remove_anchor", "set_feature_code", "undo",
-               "close_font", "bring_font_to_front", "compile_features"}  # (the tools that name their font)
+               "close_font", "bring_font_to_front", "compile_features", "delete_glyph", "set_glyph_outline",
+               "save_font", "export_font"}  # (the tools that name their font)
+# Where each enforced risky action shows in the tools: (tool, argument), the argument None for a whole tool.
+RISKY_PLACES = {"close_font.discard_changes": ("close_font", "discard_changes"), "answer_dialog": ("answer_dialog", None),
+                "open_font.answer": ("open_font", "answer"), "quit_fontlab.discard_changes": ("quit_fontlab", "discard_changes"),
+                "rename_glyph.update_references": ("rename_glyph", "update_references"),
+                "delete_glyph.remove_references": ("delete_glyph", "remove_references"),
+                "save_font": ("save_font", None), "export_font": ("export_font", None), "run_python": ("run_python", None)}
 
 
 class ServerCase(unittest.TestCase):
@@ -56,6 +65,7 @@ class ServerCase(unittest.TestCase):
             time.sleep(0.005)
 
     def tearDown(self):
+        server.risky.Mode.enabled = False
         self.stop_event.set()
         if self.thread:
             self.thread.join(5)
@@ -127,7 +137,8 @@ class ToolTests(ServerCase):
         status = asyncio.run(server.fontlab_status())
         self.assertEqual(status["fonts_open"], 0)
         self.assertEqual(status["listener"]["listener"], fl.VERSION)
-        self.assertEqual(status["server"], "1.1.0")
+        self.assertEqual(status["server"], "1.2.0")
+        self.assertEqual(fl.VERSION, "1.2.0")
 
     def test_font_and_glyph_tools(self):
         self.open_sample()
@@ -241,11 +252,10 @@ class WriteToolTests(ServerCase):
         reply = asyncio.run(server.set_kerning_pair("WriteSans-Regular", "B", "A", -12))
         self.assertEqual((reply["font"]["id"], reply["value"], reply["history"]["recorded"]), (7, -12.0, True))
         self.assertEqual(asyncio.run(server.get_kerning(7, left="B", right="A"))["value"], -12.0)
-        with self.assertRaisesRegex(RuntimeError, r"\[not_in_front\]"):
-            asyncio.run(server.undo(7))
-        self.state.current = self.font
         undone = asyncio.run(server.undo(7, expected_state=reply["history"]["history_state"]))
         self.assertTrue(undone["undone"])
+        self.assertEqual((undone["brought_forward"], undone["front_restored"]["font"]["id"]), (True, 1))
+        self.assertIs(self.state.current, self.state.fonts[0], "the font that was in front is back")
 
     def test_left_out_arguments_are_not_sent(self):
         reply = asyncio.run(server.set_glyph_metrics(7, glyph="A", advance_width=550))
@@ -323,9 +333,8 @@ class WriteToolTests(ServerCase):
             asyncio.run(server.set_kerning_pair("Nope", "B", "A", -5))
 
 
-class WindowToolTests(ServerCase):
-    """Opening, closing, bringing to the front, compiling, the Output panel, and pictures, through the real
-    server, client, and listener, on the fakes; FontLab's timers fire on the listener's thread."""
+class WindowCase(ServerCase):
+    """Two fonts and FontLab's windows, faked; FontLab's timers fire on the listener's thread."""
 
     def setUp(self):
         super().setUp()
@@ -346,6 +355,11 @@ class WindowToolTests(ServerCase):
 
     def ids(self):
         return [entry["id"] for entry in asyncio.run(server.list_fonts())["fonts"]]
+
+
+class WindowToolTests(WindowCase):
+    """Opening, closing, bringing to the front, compiling, the Output panel, and pictures, through the real
+    server, client, and listener, on the fakes."""
 
     def test_open_then_close_a_font(self):
         opened = asyncio.run(server.open_font(self.path))
@@ -375,7 +389,7 @@ class WindowToolTests(ServerCase):
         self.state.asks_to_save.add(101)
         with self.assertRaisesRegex(RuntimeError, r"\[unsaved_changes\]"):
             asyncio.run(server.close_font(101))
-        with self.assertRaisesRegex(RuntimeError, r"\[not_opened_here\]"):
+        with self.assertRaisesRegex(RuntimeError, r"\[risky_mode_off\] .*was not opened with open_font"):
             asyncio.run(server.close_font(7, discard_changes=True))
         closed = asyncio.run(server.close_font(101, discard_changes=True, font_name="FreeSans-Regular"))
         self.assertEqual((closed["closed"], closed["changes_discarded"]), (True, True))
@@ -400,6 +414,165 @@ class WindowToolTests(ServerCase):
         self.assertEqual([block.type for block in blocks], ["image", "text"])
         self.assertEqual(blocks[0].mimeType, "image/png")
         self.assertIn('"width": 2000', blocks[1].text)
+
+
+class RiskyToolTests(WindowCase):
+    """Risky mode through the real server: off by default, the list read from the listener's file."""
+
+    def tools(self):
+        return {t.name: t for t in asyncio.run(server.mcp.list_tools())}
+
+    def test_one_list_and_every_risky_place_is_marked(self):
+        self.assertEqual(server.risky.ACTIONS, [{"action": a, "tools": t, "reason": r, "enforced": e}
+                                                for a, t, r, e in fl.RISKY_ACTIONS])
+        self.assertEqual(set(RISKY_PLACES), set(entry["action"] for entry in server.risky.ACTIONS))
+        tools = self.tools()
+        for action, (tool, argument) in RISKY_PLACES.items():
+            if argument is None:
+                self.assertTrue(tools[tool].description.startswith("[risky]"), tool)
+            else:
+                self.assertIn("[risky]", tools[tool].inputSchema["properties"][argument]["description"], (tool, argument))
+                self.assertIn("[risky]", tools[tool].description, tool)
+        self.assertIn("own words", tools["set_risky_mode"].description)
+        self.assertIn("never on your own initiative", server.mcp.instructions)
+        listed = asyncio.run(server.list_risky_actions())
+        self.assertEqual((listed["risky_mode"], listed["source"], len(listed["actions"])), (False, "listener file", 9))
+
+    def test_risky_tools_are_refused_until_risky_mode_is_on(self):
+        folder = os.path.join(self.tmp, "out")
+        os.mkdir(folder)
+        calls = [lambda: server.answer_dialog("OK"), lambda: server.save_font(7), lambda: server.export_font(7, folder),
+                 lambda: server.rename_glyph(7, "Q", "Qalt", update_references=True),
+                 lambda: server.delete_glyph(7, "Q", remove_references=True),
+                 lambda: server.open_font(self.path, answer="OK"), lambda: server.quit_fontlab(discard_changes=True),
+                 lambda: server.restart_fontlab(discard_changes=True)]
+        for call in calls:
+            with self.assertRaisesRegex(RuntimeError, r"\[risky_mode_off\] .*own words"):
+                asyncio.run(call())
+        self.assertEqual((self.state.steps, self.state.loads, self.state.exports), ([], [], []))
+        self.assertEqual(asyncio.run(server.set_risky_mode(True))["risky_mode"], True)
+        self.assertTrue(asyncio.run(server.list_risky_actions())["risky_mode"])
+        self.assertFalse(asyncio.run(server.set_risky_mode(False))["risky_mode"])
+
+    def test_answer_a_question(self):
+        asyncio.run(server.set_risky_mode(True))
+        self.state.ask(u"Coordinates Rounding", buttons=[u"OK", u"Cancel"], text=u"Round the coordinates?")
+        reply = asyncio.run(server.answer_dialog("OK", expected_title="Coordinates Rounding", wait_s=5))
+        self.assertEqual((reply["answered"], reply["button"], reply["next_dialog"]), (True, "OK", None))
+        self.assertEqual(self.state.answers, [u"OK"])
+
+    def test_open_a_font_answering_its_question(self):
+        asyncio.run(server.set_risky_mode(True))
+        self.state.hold_open = True
+        opened = asyncio.run(server.open_font(self.path, answer="OK", wait_s=10))
+        self.assertEqual((opened["opened"], opened["font"]["id"], self.state.answers), (True, 101, [u"OK"]))
+
+    def test_save_and_export(self):
+        asyncio.run(server.set_risky_mode(True))
+        path = os.path.join(self.tmp, "Copy.ufo")
+        saved = asyncio.run(server.save_font(7, path=path, wait_s=10))
+        self.assertEqual((saved["saved"], saved["path"], saved["how"]), (True, path, "fgFont.save"))
+        with self.assertRaisesRegex(RuntimeError, r"\[file_exists\]"):
+            asyncio.run(server.save_font(7, path=path, wait_s=10))
+        folder = os.path.join(self.tmp, "out")
+        os.mkdir(folder)
+        exported = asyncio.run(server.export_font(7, folder, format="OpenType PS", wait_s=10))
+        self.assertEqual((exported["files"], exported["format"]), ([os.path.join(folder, "WriteSans-Regular.ttf")],
+                                                                     "OpenType PS"))
+        self.assertEqual(self.state.answers, [u"OK"], "its Font Exported message closed")
+
+    def test_references_and_outlines_through_the_server(self):
+        asyncio.run(server.set_risky_mode(True))
+        reply = asyncio.run(server.rename_glyph(7, "Q", "Qalt", update_references=True))
+        self.assertEqual(reply["references"]["features"], ["ss01"])
+        drawn = asyncio.run(server.set_glyph_outline(7, [{"nodes": [{"x": 0, "y": 0}, {"x": 100, "y": 0},
+                                                                   {"x": 50, "y": 80}]}], glyph="B"))
+        self.assertEqual(drawn["nodes"], 3)
+        self.assertEqual(asyncio.run(server.get_glyph_outline("B", font=7, apply_transforms=True))["node_count"], 3)
+        self.assertEqual(asyncio.run(server.get_kerning(7, left="V", right="A", resolved=True))["value"], -50.0)
+        self.assertTrue(asyncio.run(server.delete_glyph(7, "space"))["deleted"])
+
+    def test_compile_errors_are_located(self):
+        self.state.compiler = lambda font: u'[F] Fatal error in font "W" in file "features" at line 8\n'
+        reply = asyncio.run(server.compile_features(7))
+        self.assertEqual((reply["located"]["tag"], reply["located"]["line_in_feature"]), ("ss01", 2))
+
+    def test_screenshot_from_the_screen(self):
+        seen = []
+
+        def capture(pid, title, max_width):
+            seen.append((pid, title, max_width))
+            return b"\x89PNGscreen", {"window": "FontLab 7", "width": 800, "height": 600, "source": "screen"}
+        saved = server.screen.capture
+        server.screen.capture = capture
+        try:
+            picture, about = asyncio.run(server.screenshot(max_width=800, source="screen"))
+        finally:
+            server.screen.capture = saved
+        self.assertEqual((picture.data, about["source"], seen), (b"\x89PNGscreen", "screen", [(os.getpid(), "", 800)]))
+        with self.assertRaisesRegex(RuntimeError, r"\[bad_args\] source"):
+            asyncio.run(server.screenshot(source="desktop"))
+        self.assertEqual(asyncio.run(server.screenshot())[1]["source"], "qt")
+
+
+class ScreenTests(unittest.TestCase):
+    def test_png_round_trip(self):
+        import struct
+        import zlib
+        bgra = bytes([1, 2, 3, 0, 10, 20, 30, 0, 100, 110, 120, 0, 7, 8, 9, 0])  # 2 x 2 pixels
+        data = server.screen.png(2, 2, server.screen.bgra_to_rgb(bgra))
+        self.assertEqual(data[:8], b"\x89PNG\r\n\x1a\n")
+        width, height, depth, kind = struct.unpack(">IIBB", data[16:26])
+        self.assertEqual((width, height, depth, kind), (2, 2, 8, 2))
+        length = struct.unpack(">I", data[33:37])[0]
+        self.assertEqual(data[37:41], b"IDAT")
+        rows = zlib.decompress(data[41:41 + length])
+        self.assertEqual(rows, b"\x00" + bytes([3, 2, 1, 30, 20, 10]) + b"\x00" + bytes([120, 110, 100, 9, 8, 7]))
+        self.assertTrue(data.endswith(b"IEND\xaeB`\x82"))
+        with self.assertRaises(ValueError):
+            server.screen.png(2, 2, b"\x00")
+
+    def test_which_window(self):
+        choose = server.screen.choose_window
+        windows = [{"hwnd": 1, "title": "FontLab 7", "owned": False, "width": 1600, "height": 900},
+                   {"hwnd": 2, "title": "FreeLab Proof", "owned": True, "width": 1800, "height": 1000},
+                   {"hwnd": 3, "title": "FreeLab Proof Settings", "owned": True, "width": 400, "height": 300},
+                   {"hwnd": 4, "title": "", "owned": False, "width": 0, "height": 0}]
+        self.assertEqual(choose(windows)["hwnd"], 1, "the largest window no other owns")
+        self.assertEqual(choose(windows, "FreeLab Proof")["hwnd"], 2, "exact first")
+        self.assertEqual(choose(windows, "settings")["hwnd"], 3)
+        for title, code in (("Proof", "ambiguous_window"), ("Metrics", "not_found")):
+            with self.assertRaises(server.screen.CaptureError) as ctx:
+                choose(windows, title)
+            self.assertEqual(ctx.exception.code, code)
+        with self.assertRaises(server.screen.CaptureError):
+            choose([])
+
+    def test_capture_scales_and_restores_dpi(self):
+        calls = []
+
+        class Api(object):
+            def dpi_aware(self):
+                calls.append("aware")
+                return 17
+
+            def restore_dpi(self, previous):
+                calls.append(("restore", previous))
+
+            def windows(self, pid):
+                return [{"hwnd": 5, "title": "FontLab 7", "owned": False, "width": 400, "height": 200}]
+
+            def minimized(self, hwnd):
+                return False
+
+            def print_window(self, hwnd, width, height, out_width, out_height):
+                calls.append((width, height, out_width, out_height))
+                return b"\x00\x00\xff\x00" * (out_width * out_height)
+
+        data, about = server.screen.capture(42, "", 100, _api=Api)
+        self.assertEqual((about["width"], about["height"]), (100, 50))
+        self.assertEqual(calls, ["aware", (400, 200, 100, 50), ("restore", 17)])
+        self.assertEqual(data[:8], b"\x89PNG\r\n\x1a\n")
 
 
 class ClientLimitTests(unittest.TestCase):
@@ -593,6 +766,25 @@ class LaunchTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, r"\[save_prompt\].*Save changes to \"Test\"") as ctx:
             asyncio.run(server.quit_fontlab(wait_s=60))
         self.assertIn("left on screen", str(ctx.exception))
+
+    def test_quit_with_discard_changes_waits_through_save_questions(self):
+        sent = []
+
+        async def call(op, args=None, timeout=None):
+            if op == "dialog":
+                return {"dialog": self.dialog}
+            sent.append((op, args))
+            return {"quitting": True, "edited": 1, "discard_changes": True}
+        server._call = call
+        self.dialog = {"class": "DlgClosePackage", "title": "FontLab Warning", "text": ["Save changes?"], "buttons": []}
+        states = [True, True, False]
+        server.launcher.fontlab_running = lambda: states.pop(0)
+        server.risky.Mode.enabled = True
+        try:
+            self.assertEqual(asyncio.run(server.quit_fontlab(discard_changes=True)), {"quit": True, "changes_discarded": True})
+        finally:
+            server.risky.Mode.enabled = False
+        self.assertEqual(sent, [("quit", {"discard_changes": True, "risky": True})])
 
     def test_restart_quits_then_launches(self):
         self.fake_call([{"quitting": True}, None, {"listener": "0.1.0"}])

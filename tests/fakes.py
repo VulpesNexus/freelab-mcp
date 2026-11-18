@@ -101,6 +101,7 @@ class QTransform(object):
 
 class flNode(Native):
     _members = ("x", "y", "type", "smooth")
+    _settable = ("type", "smooth")  # (set on the nodes of a contour made from points: set_outline)
 
     def __init__(self, x, y, kind="on", smooth=False):
         object.__setattr__(self, "x", x)
@@ -110,7 +111,8 @@ class flNode(Native):
 
 
 class flContour(Native):
-    _members = ("closed", "nodes")
+    _members = ("closed", "nodes", "clone")
+    _settable = ("closed",)
 
     def __init__(self, nodes, closed=True):
         object.__setattr__(self, "_f_nodes", list(nodes))
@@ -118,6 +120,16 @@ class flContour(Native):
 
     def nodes(self):
         return list(self._f_nodes)
+
+    def clone(self):
+        return flContour([flNode(n.x, n.y, n.type, n.smooth) for n in self._f_nodes], self.closed)
+
+
+def contour_of_points(points):
+    """fontlab.flContour(list of QPointF): every node on the curve, the contour open (FontLab 7's reference)."""
+    if not isinstance(points, list) or not all(type(p).__name__ == "QPointF" for p in points):
+        raise TypeError("flContour takes a list of QPointF")
+    return flContour([flNode(p.x(), p.y()) for p in points], False)
 
 
 class flShapeData(Native):
@@ -128,14 +140,37 @@ class flShapeData(Native):
 
 
 class flShape(Native):
-    _members = ("name", "isComponent", "transform", "contours", "shapeData")
+    _members = ("name", "isComponent", "transform", "contours", "shapeData", "clearContours", "addContours", "update")
 
     def __init__(self, contours, name="", transform=None, component=False, component_glyph=""):
-        object.__setattr__(self, "contours", list(contours))
+        object.__setattr__(self, "_f_contours", list(contours))
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "transform", transform or QTransform())
         object.__setattr__(self, "isComponent", component)
         object.__setattr__(self, "shapeData", flShapeData(component_glyph if component else ""))
+        object.__setattr__(self, "_f_round", False)  # True: FontLab keeps whole coordinates
+        object.__setattr__(self, "_f_drop", False)  # True: addContours keeps nothing
+        object.__setattr__(self, "_f_updates", 0)
+
+    @property
+    def contours(self):
+        return list(self._f_contours)
+
+    def clearContours(self):
+        object.__setattr__(self, "_f_contours", [])
+
+    def addContours(self, contours, notify):
+        if self._f_drop:
+            return
+        for contour in contours:
+            if self._f_round:
+                for node in contour.nodes():
+                    object.__setattr__(node, "x", float(round(node.x)))
+                    object.__setattr__(node, "y", float(round(node.y)))
+            self._f_contours.append(contour)
+
+    def update(self):
+        object.__setattr__(self, "_f_updates", self._f_updates + 1)
 
 
 class flPinPoint(Native):
@@ -151,7 +186,7 @@ class flPinPoint(Native):
 class flLayer(Native):
     _members = ("name", "shapes", "advanceWidth", "boundingBox", "shapesCount", "nodesCount", "isNull", "inkBox",
                 "anchors", "findAnchor", "addAnchor", "removeAnchor", "applyTransform", "metricsLeft", "metricsRight",
-                "metricsWidth", "setGlyphComponents")
+                "metricsWidth", "setGlyphComponents", "addShape", "removeShape", "update")
     _settable = ("advanceWidth",)
 
     def __init__(self, name, shapes=(), width=500.0, bbox=None, anchors=(), ink=None):
@@ -210,6 +245,16 @@ class flLayer(Native):
         if not xs:
             return QRectF(0, 0, 0, 0)
         return QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+
+    def addShape(self, shape):
+        self._f_shapes.append(shape)
+        return shape
+
+    def removeShape(self, shape, recursive=True):
+        self._f_shapes.remove(shape)
+
+    def update(self):
+        pass
 
     def findAnchor(self, name):
         for anchor in self._f_anchors:
@@ -328,7 +373,7 @@ class flGlyph(Native):
 
 class fgFeatures(Native):
     """fgPackage.features: the feature code, by tag, in FontLab's order, and its prefix."""
-    _members = ("keys", "get_feature", "set_feature", "get_prefix", "remove")
+    _members = ("keys", "get_feature", "set_feature", "get_prefix", "set_prefix", "remove")
 
     def __init__(self, features=(), prefix=""):
         object.__setattr__(self, "_f_features", list(features))
@@ -363,12 +408,15 @@ class fgFeatures(Native):
     def get_prefix(self):
         return self._f_prefix
 
+    def set_prefix(self, code):
+        object.__setattr__(self, "_f_prefix", code)
+
     def remove(self, tag):
         object.__setattr__(self, "_f_features", [(key, code) for key, code in self._f_features if key != tag])
 
 
 class fgFont(Native):
-    _members = ("keys", "id", "features", "rebuildMaps")
+    _members = ("keys", "id", "features", "rebuildMaps", "save")
 
     def __init__(self, names, package=None, font_id=1, features=None):
         object.__setattr__(self, "_f_names", list(names))
@@ -376,6 +424,20 @@ class fgFont(Native):
         object.__setattr__(self, "id", font_id)
         object.__setattr__(self, "features", features or fgFeatures())
         object.__setattr__(self, "_f_rebuilds", 0)
+        object.__setattr__(self, "_f_saves", [])
+
+    def save(self, path, save_vfb=False):
+        """fgFont.save: a VFB file, or a UFO folder."""
+        import os
+        self._f_saves.append((path, save_vfb))
+        if save_vfb:
+            with open(path, "wb") as handle:
+                handle.write(b"vfb")
+            return
+        if not os.path.isdir(path):
+            os.mkdir(path)
+        with open(os.path.join(path, "metainfo.plist"), "wb") as handle:
+            handle.write(b"ufo %d" % len(self._f_saves))
 
     def keys(self):
         if self._f_package is not None:
@@ -409,15 +471,39 @@ class fgKerningGroups(Native):
 
     def __init__(self, groups):
         object.__setattr__(self, "_f_groups", groups)
+        object.__setattr__(self, "_f_refuse", False)  # True: class writes are not kept
 
     def asDict(self):
         return dict((name, (list(members), side)) for name, (members, side) in self._f_groups.items())
+
+    def __setitem__(self, name, value):
+        """groups[name] = (members, side): makes a class, or replaces one and keeps its pairs (live, 2026-11-08)."""
+        if self._f_refuse:
+            return
+        members, side = value
+        self._f_groups[name] = (list(members), side)
 
 
 class fgKerning(Native):
     """flPackage.kerning(master). A name that is also a class's is taken as the class, as FontLab does
     (live, 2026-11-08): pairs are keyed (name, mode) on each side."""
-    _members = ("keys", "items", "get", "remove", "groups")
+    _members = ("keys", "items", "get", "remove", "groups", "getPlainPairsDict")
+
+    def getPlainPairsDict(self):
+        """Every kerned glyph pair, classes flattened, the most specific entry winning (as FontLab, live)."""
+        if self._f_plain == "raise":
+            raise RuntimeError("getPlainPairsDict failed")
+        plain = {}
+
+        def members(name, mode):
+            return list(self._f_groups[name][0]) if mode == "groupMode" else [name]
+        def rank(entry):  # (@class @class, then @class glyph, glyph @class, glyph glyph: the last one wins)
+            return (entry[0][1] == "glyphMode", entry[1][1] == "glyphMode")
+        for left, right, value in sorted(self._f_pairs, key=rank):
+            for l in members(*left):
+                for r in members(*right):
+                    plain[(l, r)] = value + (self._f_plain or 0.0)
+        return plain
 
     def __init__(self, groups=None, pairs=()):
         object.__setattr__(self, "_f_groups", dict(groups or {}))
@@ -426,6 +512,7 @@ class fgKerning(Native):
         object.__setattr__(self, "_f_drop", False)  # True: writes are not kept
         object.__setattr__(self, "_f_round", False)  # True: values kept in whole units, as FontLab does
         object.__setattr__(self, "_f_skew", 0.0)  # every value written lands this far off (restores too)
+        object.__setattr__(self, "_f_plain", None)  # "raise": getPlainPairsDict raises; a number: its values that far off
         for left, right, value in pairs:
             self._f_pairs.append((left, right, float(value)))
 
@@ -620,7 +707,18 @@ class _PackageObject(Native):
 
 
 class _Workspace(Native):
-    _members = ("currentPackage", "hasChanges", "packages")
+    _members = ("currentPackage", "hasChanges", "packages", "exportFont")
+
+    def exportFont(self, package, control):
+        """flWorkspace.exportFont(package, ExportControl): writes the font into the control's folder, then shows
+        its Font Exported message (DlgSavePackage), which the export waits on (live)."""
+        state = object.__getattribute__(self, "_f_state")
+        state.exports.append((package, dict(control._f_values)))
+        folder = control._f_values.get("destinationFolder")
+        if folder and state.export_writes:
+            with open(folder + package.psn + ".ttf", "wb") as handle:
+                handle.write(b"exported")
+        state.ask(u"Font Exported", u"DlgSavePackage", [u"OK"], u"The font was exported.")
 
     def __init__(self, state):
         object.__setattr__(self, "_f_state", state)
@@ -662,11 +760,26 @@ class FontLabState(object):
         self.loads = []  # paths requestLoadingFont was given
         self.asks_to_save = set()  # ids of fonts whose closing FontLab asks about
         self.prompt = None  # the font FontLab's Save question is about, while it is shown
+        self.prompt_key = "ffn"  # the name the question quotes: ffn, or tfn (a font of several masters, live)
         self.answers = []  # the Save question's buttons clicked
         self.windows = []  # titles of other visible top-level windows
         self.grabs = []  # the windows grabbed
         self.hold_open = False  # True: requestLoadingFont stops on a question (Coordinates Rounding) instead
         self.question = None  # the title of a question FontLab shows (not the Save one)
+        self.question_class = u"QDialog"
+        self.question_buttons = [u"OK"]
+        self.question_text = u"Round the coordinates to whole units?"
+        self.question_then = None  # what FontLab does once the question is answered: called with the button's text
+        self.output_panel = True  # False: the Output panel was never made (no textOutput)
+        self.panels_chosen = []  # the Window > Panels actions triggered
+        self.exports = []  # (package, the ExportControl's values) of every exportFont
+        self.export_writes = True  # False: an export writes no file
+        self.saved = []  # the fonts File > Save saved (the font in front)
+
+    def ask(self, title, kind=u"QDialog", buttons=(u"OK",), text=u"", then=None):
+        """FontLab shows a question (a modal dialog other than the Save one)."""
+        self.question, self.question_class, self.question_buttons = title, kind, list(buttons)
+        self.question_text, self.question_then = text, then
 
     def fire_timers(self, up_to_ms=None):
         """Run the QTimer.singleShot callbacks due by up_to_ms (all, when None), in the order they are due."""
@@ -813,12 +926,37 @@ def install(state):
         def requestLoadingFont(path):
             """File > Open: the font opens at once (FontLab gives it the file's path) and comes to the front."""
             state.loads.append(path)
-            if state.hold_open:
-                state.question = u"Coordinates Rounding"
+            font_id = 100 + len(state.loads)
+
+            def load(_button=None):
+                font = sample_font(path=path, font_id=font_id)
+                state.fonts.append(font)
+                state.current = font
+            if state.hold_open:  # (Coordinates Rounding: the font opens once it is answered)
+                state.ask(u"Coordinates Rounding", buttons=[u"OK", u"Cancel"], text=u"Round the coordinates to whole units?",
+                          then=lambda button: load() if button == u"OK" else None)
                 return
-            font = sample_font(path=path, font_id=100 + len(state.loads))
-            state.fonts.append(font)
-            state.current = font
+            load()
+
+    class ExportControl(Native):
+        """fontlab.ExportControl: load() reads the user's last export settings; its fields are settable."""
+        _members = ("load", "profileName", "destinationMode", "destinationFolder")
+        _settable = ("profileName", "destinationMode", "destinationFolder")
+
+        def __init__(self):
+            object.__setattr__(self, "_f_values", {})
+
+        def load(self):
+            self._f_values.update({"profileName": u"OpenType TT", "destinationMode": 1, "destinationFolder": u""})
+
+        def __getattribute__(self, name):
+            if name in ("profileName", "destinationMode", "destinationFolder"):
+                return object.__getattribute__(self, "_f_values").get(name)
+            return Native.__getattribute__(self, name)
+
+        def __setattr__(self, name, value):
+            Native.__setattr__(self, name, value)
+            object.__getattribute__(self, "_f_values")[name] = value
 
     def wrap(item):
         font = object.__getattribute__(item, "_f_font")
@@ -832,6 +970,9 @@ def install(state):
     fontlab.flGlyph = lambda: flGlyph("", [])
     fontlab.GlyphComponent = _GlyphComponent
     fontlab.flPinPoint = flPinPoint
+    fontlab.flContour = contour_of_points
+    fontlab.flShape = lambda: flShape([])
+    fontlab.ExportControl = ExportControl
     fontlab.CountFonts = lambda: len(state.fonts)
     fontlab.ApplicationPath = lambda: "FontLab 7 (fake)"
     sys.modules["fontlab"] = fontlab
@@ -885,6 +1026,27 @@ def install_qt(state):
 
         def trigger(self):
             state.close_current()
+
+    class Panel(QAction):
+        """Window > Panels > a panel: checked while it is shown; choosing it makes it."""
+
+        def __init__(self, name, flag):
+            self.objectName, self.flag = name, flag
+
+        @property
+        def checked(self):
+            return getattr(state, self.flag)
+
+        def trigger(self):
+            state.panels_chosen.append(self.objectName)
+            setattr(state, self.flag, not getattr(state, self.flag))
+
+    class Save(QAction):
+        objectName = "actionSave"
+        text = u"&Save"
+
+        def trigger(self):
+            state.saved.append(state.current)
 
     class Meta(object):
         def __init__(self, name):
@@ -1021,7 +1183,7 @@ def install_qt(state):
 
         def findChildren(self, kind):
             if kind is QLabel:
-                return [QLabel(u'<b>Save changes to  "%s" before closing?</b>' % state.prompt.ffn),
+                return [QLabel(u'<b>Save changes to  "%s" before closing?</b>' % getattr(state.prompt, state.prompt_key)),
                         QLabel(u"If you don't save, your changes will be lost.")]
             if kind is QAbstractButton:
                 return [Answer(u"&Save"), Answer(u"&Don\u2019t Save"), Answer(u"Cancel")]
@@ -1030,15 +1192,28 @@ def install_qt(state):
         def children(self):
             return self.findChildren(QLabel) + self.findChildren(QAbstractButton)
 
+    class QuestionAnswer(QAbstractButton):
+        def __init__(self, text):
+            self.text = text
+
+        def click(self):
+            state.answers.append(self.text)
+            then = state.question_then
+            state.question, state.question_then = None, None
+            if then is not None:
+                then(self.text)
+
     class Question(Widget):
-        class_name = "QDialog"
+        @property
+        def class_name(self):
+            return state.question_class
 
         @property
         def windowTitle(self):
             return state.question
 
         def children(self):
-            return [QLabel(u"Round the coordinates to whole units?"), Answer(u"OK")]
+            return [QLabel(state.question_text)] + [QuestionAnswer(text) for text in state.question_buttons]
 
     class Window(Widget):
         def __init__(self, title):
@@ -1050,13 +1225,14 @@ def install_qt(state):
 
         def findChildren(self, kind):
             if kind is QAction:
-                return [Undo(), Redo(), CloseFonts()]
+                return [Undo(), Redo(), CloseFonts(), Panel("actionFeaturesPanel", "features_panel"),
+                        Panel("actionOutputPanel", "output_panel"), Save()]
             if kind is QTabWidget:
                 return [PanelTabs(), WindowTabs()]
             if kind is QAbstractButton:
                 return [OtherCompileButton()] + ([CompileButton()] if state.features_panel else [])
             if kind is QTextEdit:
-                return [QTextEdit(False), QTextEdit(True)]
+                return [QTextEdit(False), QTextEdit(True)] if state.output_panel else []
             return []
 
     class QApplication(object):

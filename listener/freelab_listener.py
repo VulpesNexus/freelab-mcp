@@ -24,7 +24,7 @@ import sys
 import time
 import traceback
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 PROTOCOL = 1
 HOST = "127.0.0.1"
 DEFAULT_PORT = 47761
@@ -41,6 +41,35 @@ MAX_NODES_LIMIT = 100000
 MODULE_NAME = "freelab_listener"
 QUIT_DELAY_MS = 300  # the main window closes from a later timer tick, once the quit request is handled
 MAX_ERRORS = 100  # errors kept for tests and probes (an error repeating every tick must not grow without end)
+BAD_TOKEN_LIMIT = 20  # this many requests with a wrong token within BAD_TOKEN_WINDOW_S ...
+BAD_TOKEN_WINDOW_S = 10.0
+THROTTLE_S = 5.0  # ... and every connection is closed unanswered for this long
+LOOPBACK = ("127.0.0.1", "::1")
+
+# Risky actions: refused unless the request carries risky: true, which the server sends only while the user
+# has turned risky mode on in their own words (docs/RISKY.md). This is the one list: the server reads it from
+# this file (a literal, never run), and the listener enforces it, so a client without the flag cannot do
+# them. (key, tools, why it is risky, enforced here)
+RISKY_ACTIONS = [
+    ("close_font.discard_changes", "close_font",
+     "Throws away the unsaved changes of a font that open_font did not open.", True),
+    ("answer_dialog", "answer_dialog",
+     "Clicks a button of a question FontLab is asking the user (Save, Don't Save, Coordinates Rounding, ...).", True),
+    ("open_font.answer", "open_font",
+     "Answers the question FontLab asks while it opens the font, such as Coordinates Rounding.", True),
+    ("quit_fontlab.discard_changes", "quit_fontlab, restart_fontlab",
+     "Answers Don't Save to every Save question FontLab asks while it closes: unsaved work is lost.", True),
+    ("rename_glyph.update_references", "rename_glyph",
+     "Rewrites kerning pairs, kerning classes, and feature code along with the name, in one History step.", True),
+    ("delete_glyph.remove_references", "delete_glyph",
+     "Removes the glyph's kerning pairs and kerning class memberships along with the glyph.", True),
+    ("save_font", "save_font", "Writes the font's file on disk (File > Save, or a UFO or VFB file).", True),
+    ("export_font", "export_font", "Writes font files on disk through FontLab's export.", True),
+    ("run_python", "run_python",
+     "Always available, not gated: runs any code inside FontLab, with FontLab's access to files and the network.",
+     False),
+]
+_RISKY_REASONS = dict((key, reason) for key, _tools, reason, _enforced in RISKY_ACTIONS)
 
 PY2 = sys.version_info[0] == 2
 if PY2:  # pragma: no cover - exercised by the Python 2.7 test run
@@ -160,6 +189,23 @@ def _int_arg(args, key, default, low, high):
     if not isinstance(value, integer_types) or isinstance(value, bool) or not low <= value <= high:
         raise FreeLabError("bad_args", "%s must be an integer from %d to %d." % (key, low, high))
     return value
+
+
+def _bool_arg(args, key, default=False):
+    value = args.get(key, default)
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise FreeLabError("bad_args", "%s must be true or false." % key)
+    return value
+
+
+def _require_risky(args, key):
+    """Refuses a risky action (RISKY_ACTIONS) unless the request says risky mode is on."""
+    if args.get("risky") is not True:
+        raise FreeLabError("risky_mode_off", u"%s is a risky action, refused while risky mode is off: %s Risky mode is "
+                           u"turned on with set_risky_mode, and only when the user has asked for it in their own words. "
+                           u"Nothing was changed." % (key, _RISKY_REASONS[key]), {"action": key})
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +478,7 @@ def op_ping(listener, args):
         "protocol": PROTOCOL,
         "python": sys.version.split()[0],
         "in_fontlab": False,
+        "state_file_private": listener.state_private,
     }
     try:
         fl = _fontlab()
@@ -443,6 +490,13 @@ def op_ping(listener, args):
     except FreeLabError:
         pass
     return info
+
+
+@op("risky_actions")
+def op_risky_actions(listener, args):
+    """The risky actions (RISKY_ACTIONS), for a server that cannot read this file."""
+    return {"actions": [{"action": key, "tools": tools, "reason": reason, "enforced": enforced}
+                        for key, tools, reason, enforced in RISKY_ACTIONS]}
 
 
 @op("status")
@@ -497,15 +551,22 @@ def op_quit(listener, args):
     if listener.quit_in_progress():
         raise FreeLabError("quit_in_progress", "FontLab is already closing (it may be asking on screen whether to save): "
                            "answer it in FontLab, or wait.")
+    discard = _bool_arg(args, "discard_changes")
+    if discard:
+        _require_risky(args, "quit_fontlab.discard_changes")
     workspace_changed, changed, edited = unsaved_work()
-    if workspace_changed or changed:
+    if (workspace_changed or changed) and not discard:
         parts = (["%d font%s" % (changed, "" if changed == 1 else "s")] if changed else []) + (["the workspace"] if workspace_changed else [])
         raise FreeLabError("unsaved_changes", "FontLab has unsaved changes (%s): save them, or close them in FontLab, "
                            "first. FreeLab never quits FontLab over unsaved work." % " and ".join(parts))
     if listener.deadline is not None and time.time() > listener.deadline:
         raise FreeLabError("expired", "The client gave up while FontLab checked for unsaved work; FontLab was not closed.")
+    if discard:  # (FontLab asks about each edited font in turn, from inside the main window's close)
+        _keep_answering(listener, "quit", u"Don't Save", time.time() + QUIT_ANSWER_S,
+                        lambda dialog: dialog.metaObject().className() == SAVE_PROMPT, once=False,
+                        keep_going=listener.quit_in_progress)  # (a quit cancelled on screen ends it)
     listener.request_quit()
-    return {"quitting": True, "edited": edited}
+    return {"quitting": True, "edited": edited, "discard_changes": discard}
 
 
 def _prop(obj, name):
@@ -529,6 +590,17 @@ def op_dialog(listener, args):
     dialog = app.activeModalWidget()
     if dialog is None:
         return {"dialog": None, "main_window": main_window, "windows": others}
+    return {"dialog": _describe_dialog(dialog), "main_window": main_window, "windows": others}
+
+
+def _describe_dialog(dialog):
+    texts, buttons = _dialog_parts(dialog)
+    return {"class": dialog.metaObject().className(), "title": _prop(dialog, "windowTitle"), "text": texts,
+            "buttons": [text for _button, text in buttons]}
+
+
+def _dialog_parts(dialog):
+    """(the texts of a dialog's visible labels, [(button, its text as shown)] of its visible push buttons)."""
     texts, buttons = [], []
 
     def walk(widget):
@@ -539,15 +611,99 @@ def op_dialog(listener, args):
                 if not (child.inherits("QCheckBox") or child.inherits("QRadioButton")):
                     text = _MNEMONIC.sub(r"\1", _prop(child, "text") or u"").strip()  # "&Save" -> "Save", "&&" -> "&"
                     if text:
-                        buttons.append(text)
+                        buttons.append((child, text))
             elif child.inherits("QLabel"):
                 text = _label_text(child)
                 if text:
                     texts.append(text)
             walk(child)
     walk(dialog)
-    return {"dialog": {"class": dialog.metaObject().className(), "title": _prop(dialog, "windowTitle"),
-                       "text": texts, "buttons": buttons}, "main_window": main_window, "windows": others}
+    return texts, buttons
+
+
+def _button_words(text):
+    """A button's text as compared: no mnemonic, a curly apostrophe as a straight one, case ignored."""
+    return _MNEMONIC.sub(r"\1", _text(text or u"")).replace(u"’", u"'").strip().lower()
+
+
+def _modal_dialog():
+    from PythonQt.QtGui import QApplication  # only inside FontLab
+    return QApplication.instance().activeModalWidget()
+
+
+def _click_modal_button(button, condition=None):
+    """Clicks the button of that text (or of the first of several texts it has) on the dialog FontLab waits
+    on, when there is one (and condition(dialog) holds); whether it clicked."""
+    dialog = _modal_dialog()
+    if dialog is None or (condition is not None and not condition(dialog)):
+        return False
+    buttons = _dialog_parts(dialog)[1]
+    for wanted in [_button_words(b) for b in ((button,) if isinstance(button, string_types) else button)]:
+        for widget, text in buttons:
+            if _button_words(text) == wanted:
+                widget.click()
+                return True
+    return False
+
+
+ANSWER_POLL_MS = 400  # how often a pending answer looks for its question
+QUIT_ANSWER_S = 120.0  # quit_fontlab with discard_changes answers Save questions this long
+OPEN_ANSWER_S = 120.0  # open_font with answer looks for the question this long
+
+
+def _keep_answering(listener, key, button, until, condition=None, once=True, keep_going=None):
+    """Clicks button on the dialog FontLab waits on, from a timer every ANSWER_POLL_MS until the time until
+    (seconds since the epoch) or until keep_going() is false (the action it answers for is over, so a later
+    question of the user's own is never answered): once, or on each such question in turn. Timers fire
+    inside a modal dialog's loop too (live), so this answers a question that a call made from another timer
+    is waiting on."""
+    def look():
+        if time.time() > until:
+            return
+        try:
+            if keep_going is not None and not keep_going():
+                return
+        except Exception:
+            return
+        if _click_modal_button(button, condition) and once:
+            return
+        listener.later(ANSWER_POLL_MS, look, key)
+    listener.later(ANSWER_POLL_MS, look, key)
+
+
+ANSWER_DELAY_MS = 50
+
+
+@op("answer_dialog")
+def op_answer_dialog(listener, args):
+    """[risky] Clicks a button of the dialog FontLab waits on, a moment after the reply (the click may start
+    what FontLab waited to do), only while it is still that dialog."""
+    _require_risky(args, "answer_dialog")
+    button = args.get("button")
+    if not isinstance(button, string_types) or not button.strip():
+        raise FreeLabError("bad_args", "button must be the text of one of the dialog's buttons.")
+    expected = args.get("expected_title") or u""
+    if not isinstance(expected, string_types):
+        raise FreeLabError("bad_args", "expected_title must be the dialog's title.")
+    _qt()
+    dialog = _modal_dialog()
+    if dialog is None:
+        raise FreeLabError("not_found", "FontLab is not waiting on a dialog: nothing was clicked.")
+    about = _describe_dialog(dialog)
+    title = _text(about["title"] or u"")
+    if expected.strip() and title.strip().lower() != _text(expected).strip().lower():
+        raise FreeLabError("dialog_changed", u"FontLab's dialog is titled '%s', not '%s': nothing was clicked." % (
+            title, expected), {"dialog": about})
+    if not any(_button_words(text) == _button_words(button) for text in about["buttons"]):
+        raise FreeLabError("no_button", u"FontLab's dialog '%s' has no button '%s'; its buttons: %s. Nothing was clicked." % (
+            title, button, u", ".join(about["buttons"])), {"dialog": about})
+    key = (about["class"], title)
+
+    def same(widget):
+        return (widget.metaObject().className(), _text(_prop(widget, "windowTitle") or u"")) == key
+    _check_deadline(listener)
+    listener.later(ANSWER_DELAY_MS, lambda: _click_modal_button(button, same), "answer_dialog")
+    return {"answering": _text(button).strip(), "dialog": about}
 
 
 def _top_windows(app):
@@ -710,6 +866,14 @@ def op_glyph(listener, args):
     return reads.attach(result)
 
 
+def _mapper(transform):
+    """A function placing a shape-local point as the shape's QTransform does (QTransform.map: x' = m11 x +
+    m21 y + dx, y' = m12 x + m22 y + dy), from the transform's six values read once."""
+    m11, m12, m21, m22 = float(transform.m11()), float(transform.m12()), float(transform.m21()), float(transform.m22())
+    dx, dy = float(transform.dx()), float(transform.dy())
+    return lambda x, y: (m11 * x + m21 * y + dx, m12 * x + m22 * y + dy)
+
+
 @op("outline")
 def op_outline(listener, args):
     package, count = target_package(args)
@@ -717,6 +881,7 @@ def op_outline(listener, args):
     reads = _Reads()
     layer, layer_source = _choose_layer(glyph, package, args.get("layer"), reads)
     max_nodes = _int_arg(args, "max_nodes", DEFAULT_MAX_NODES, 1, MAX_NODES_LIMIT)
+    apply = _bool_arg(args, "apply_transforms")
     shapes_out = []
     total = 0
     truncated = False
@@ -724,6 +889,7 @@ def op_outline(listener, args):
         if total >= max_nodes:
             truncated = True
             break
+        place = _mapper(shape.transform) if apply else (lambda x, y: (x, y))
         contours_out = []
         for contour in _real_list(shape.contours, "shape.contours"):
             if total >= max_nodes:
@@ -731,12 +897,10 @@ def op_outline(listener, args):
                 break
             nodes = _real_list(contour.nodes(), "contour.nodes()")
             room = max_nodes - total
-            nodes_out = [{
-                "x": node.x,
-                "y": node.y,
-                "type": _text(node.type),
-                "smooth": bool(node.smooth),
-            } for node in nodes[:room]]
+            nodes_out = []
+            for node in nodes[:room]:
+                x, y = place(node.x, node.y)
+                nodes_out.append({"x": x, "y": y, "type": _text(node.type), "smooth": bool(node.smooth)})
             total += len(nodes_out)
             entry = {"closed": bool(contour.closed), "nodes": nodes_out}
             if len(nodes) > room:
@@ -757,7 +921,8 @@ def op_outline(listener, args):
         "name": reads.prop(glyph, "name"),
         "layer": reads.prop(layer, "name", "layer"),
         "layer_source": layer_source,
-        "coordinates": "shape-local; each shape's transform [m11, m12, m21, m22, dx, dy] is not applied",
+        "coordinates": "the glyph's: each shape's transform [m11, m12, m21, m22, dx, dy] is applied" if apply else
+                       "shape-local; each shape's transform [m11, m12, m21, m22, dx, dy] is not applied",
         "shapes": shapes_out,
         "node_count": total,
         "truncated": truncated,
@@ -831,6 +996,56 @@ def _pair_side(item):
     return (u"@" if _text(item.mode) == u"groupMode" else u"") + _text(item.id)
 
 
+def _member_classes(groups, name, side):
+    """The kerning classes that hold glyph name and kern on that side, sorted."""
+    return sorted(c for c, entry in groups.items()
+                  if _text(entry[1]) in KERN_SIDES[side] and name in [_text(n) for n in entry[0]])
+
+
+def _resolved_pair(package, kerning, groups, left, right):
+    """The value a glyph pair gets through classes: FontLab's own (getPlainPairsDict, which flattens every
+    class pair to glyph pairs) and one computed here from the master's entries, the most specific winning:
+    glyph glyph, then glyph @class, @class glyph, @class @class (the UFO order). Names are glyphs here,
+    also one named like a class (its own entries are read by mode, which get() cannot)."""
+    for value, side in ((left, "left"), (right, "right")):
+        if not isinstance(value, string_types) or not value.strip() or value.startswith(u"@"):
+            raise FreeLabError("bad_args", "resolved takes glyph names for %s, not classes." % side)
+        if glyph_named(package, value) is None:
+            raise FreeLabError("no_glyph", u"%s has no glyph '%s'." % (_font_label(package), value))
+    left, right = _text(left), _text(right)
+    entries = {}
+    for pair, value in _real_list(kerning.items(), "fgKerning.items()"):
+        entries[(_pair_side(pair.left), _pair_side(pair.right))] = float(value)
+    lefts, rights = _member_classes(groups, left, "left"), _member_classes(groups, right, "right")
+    order = [(left, right)] + [(left, u"@" + c) for c in rights] + [(u"@" + c, right) for c in lefts] + \
+        [(u"@" + l, u"@" + r) for l in lefts for r in rights]
+    computed, through = None, None
+    for key in order:
+        if key in entries:
+            computed, through = entries[key], u"%s %s" % key
+            break
+    reply = {"left": left, "right": right, "resolved": True, "computed": computed, "through": through,
+             "left_classes": lefts, "right_classes": rights}
+    try:
+        plain = kerning.getPlainPairsDict()
+        if not isinstance(plain, dict):
+            raise TypeError("getPlainPairsDict gave a %s, not a dict" % type(plain).__name__)
+        fontlab_value = None
+        for (l, r), value in plain.items():
+            if _text(l) == left and _text(r) == right:
+                fontlab_value = float(value)
+                break
+    except Exception as exc:
+        reply.update({"value": computed, "resolved_by": "computed", "fontlab": None,
+                      "fontlab_error": _exc_text(exc)})
+        return reply
+    reply.update({"value": fontlab_value, "resolved_by": "fontlab", "fontlab": fontlab_value,
+                  "agree": fontlab_value == computed})
+    if len(lefts) > 1 or len(rights) > 1:
+        reply["note"] = u"The glyph is in more than one class on a side; the computed value took them in name order."
+    return reply
+
+
 @op("kerning")
 def op_kerning(listener, args):
     """One pair's own value, or a page of the master's pairs; with classes, the master's kerning classes."""
@@ -841,7 +1056,11 @@ def op_kerning(listener, args):
     left, right = args.get("left"), args.get("right")
     if (left is None) != (right is None):
         raise FreeLabError("bad_args", "Give both left and right for one pair, or neither for a page of pairs.")
-    if left is not None:
+    if _bool_arg(args, "resolved"):
+        if left is None:
+            raise FreeLabError("bad_args", "resolved needs a pair of glyphs: give left and right.")
+        result.update(_resolved_pair(package, kerning, groups, left, right))
+    elif left is not None:
         left_key, left_shown = _kern_side(package, groups, left, "left")
         right_key, right_shown = _kern_side(package, groups, right, "right")
         result.update({"left": left_shown, "right": right_shown, "value": _kern_value(kerning, left_key, right_key)})
@@ -888,8 +1107,8 @@ def op_features(listener, args):
 # step of its own ("(before)"), and so does a write after an Undo back to the font's first state. The font
 # recorded recursively holds its layers, kerning, and features, not its glyphs' own properties (name,
 # Unicode values): the glyphs a write changes are recorded too. A script's write leaves the font unmarked,
-# so FontLab could close it without asking: every write marks it (setFlag(2), ofChanged). Nothing here
-# saves, exports, or closes a font.
+# so FontLab could close it without asking: every write marks it (setFlag(2), ofChanged). No write saves,
+# exports, or closes a font (save_font and export_font are risky actions of their own).
 
 _RECORDED_FONTS = set()  # fonts (by id) whose whole state a step of this listener recorded
 MAX_CODE_BYTES = 1024 * 1024
@@ -1018,13 +1237,15 @@ class _Write(object):
         self.glyphs = list(glyphs)
         self.font_id = _font_id(package)
 
-    def begin(self):
-        """Records what Undo needs before anything changes; raises (nothing changed) when FontLab cannot."""
+    def begin(self, force=False):
+        """Records what Undo needs before anything changes; raises (nothing changed) when FontLab cannot.
+        force records the font and the write's glyphs whatever their state (a write of many parts, or one
+        that deletes a glyph)."""
         _check_deadline(self.listener)
         objects = []
-        if self.font_id not in _RECORDED_FONTS or _without_state(self.package):
+        if force or self.font_id not in _RECORDED_FONTS or _without_state(self.package):
             objects.append(self.package)
-        objects.extend(glyph for glyph in self.glyphs if _without_state(glyph))
+        objects.extend(glyph for glyph in self.glyphs if force or _without_state(glyph))
         if objects:
             try:
                 self.fl.flItems.notifyChangesApplied(u"%s (before)" % self.title, objects, True)
@@ -1300,6 +1521,165 @@ def op_set_metrics(listener, args):
     return reply
 
 
+def _word_re(name):
+    """A glyph name as a whole word of feature code: not inside a longer name, and not @name (a class)."""
+    return re.compile(u"(?<![A-Za-z0-9_.@\\-])%s(?![A-Za-z0-9_.\\-])" % re.escape(name))
+
+
+def _entries(kerning):
+    """{(left, right): value} of a master's own entries, classes written with @."""
+    return dict(((_pair_side(pair.left), _pair_side(pair.right)), float(value))
+                for pair, value in _real_list(kerning.items(), "fgKerning.items()"))
+
+
+class _References(object):
+    """What rename_glyph's update_references and delete_glyph's remove_references rewrite, planned before
+    anything changes: the glyph's own kerning pairs in every master (removed, and for a rename added again
+    under the new name with their values), its kerning class memberships, and for a rename the feature
+    code and prefix that name it (as a whole word, the rule _references uses). Refuses what FontLab's
+    scripting cannot rewrite: a class of the Classes panel (no call to change one is proven), a pair side
+    named like a kerning class (FontLab would read it as the class), and for a delete, feature code."""
+
+    def __init__(self, package, old, new):
+        self.package, self.old, self.new = package, old, new
+        self.pairs = []  # (master, kerning, (left, right) to remove, (left, right) to add or None, value)
+        self.classes = []  # (master, kerning, class, members before, members after, side)
+        self.features = []  # (tag, code before, code after)
+        self.prefix = None  # (prefix before, prefix after)
+        label = _font_label(package)
+        panel = sorted(set(_text(entry[1]) for entry in _real_list(package.getAllGroups(), "getAllGroups()")
+                           if not entry[0] and old in [_text(n) for n in entry[4]]))
+        if panel:
+            raise FreeLabError("glyph_in_use", u"Glyph '%s' is in the class%s %s of FontLab's Classes panel, which FontLab's "
+                               u"scripting offers no proven way to change: take it out there first. Nothing was "
+                               u"changed." % (old, "" if len(panel) == 1 else "es", u", ".join(panel)))
+        for master in [_text(m) for m in _real_list(package.masters, "flPackage.masters")]:
+            kerning, groups = _kerning(package, master)
+            for pair, value in _real_list(kerning.items(), "fgKerning.items()"):
+                sides = [(_text(item.id), _text(item.mode)) for item in (pair.left, pair.right)]
+                if not any(mode == u"glyphMode" and ident == old for ident, mode in sides):
+                    continue
+                for ident, mode in sides:
+                    if mode == u"glyphMode" and ident in groups:
+                        raise FreeLabError("class_name_clash", u"The kerning pair %s %s in master %s has a glyph '%s' "
+                                           u"named like a kerning class, which FontLab's scripting cannot address: "
+                                           u"nothing was changed." % (_pair_side(pair.left), _pair_side(pair.right),
+                                                                     master, ident))
+                add = None
+                if new is not None:
+                    if new in groups:
+                        raise FreeLabError("class_name_clash", u"'%s' is the name of a kerning class in master %s: "
+                                           u"FontLab would write the pairs of the renamed glyph as the class's. "
+                                           u"Nothing was changed." % (new, master))
+                    add = tuple(new if mode == u"glyphMode" and ident == old else ident for ident, mode in sides)
+                self.pairs.append((master, kerning, (sides[0][0], sides[1][0]), add, float(value),
+                                   tuple(m == u"groupMode" for _i, m in sides)))
+            for name, entry in sorted(groups.items()):
+                members = [_text(n) for n in entry[0]]
+                if old in members:
+                    after = [(new if n == old else n) for n in members if new is not None or n != old]
+                    self.classes.append((master, kerning, name, members, after, _text(entry[1])))
+        features = package.fgPackage.features
+        self.layout = features
+        word = _word_re(old)
+        tags = [_text(t) for t in _real_list(features.keys(), "features.keys()")]
+        uses = [(tag, _text(features.get_feature(tag))) for tag in tags]
+        uses = [(tag, code) for tag, code in uses if word.search(code)]
+        prefix = _text(features.get_prefix())
+        if new is None:
+            if uses or word.search(prefix):
+                raise FreeLabError("glyph_in_use", u"Glyph '%s' is named in the feature code of %s (%s): taking a name out "
+                                   u"of feature code could break it, so edit it first (set_feature_code). Nothing "
+                                   u"was changed." % (old, label, u", ".join(([u"prefix"] if word.search(prefix) else []) +
+                                                                            [tag for tag, _c in uses])))
+            return
+        self.features = [(tag, code, word.sub(lambda m: new, code)) for tag, code in uses]
+        if word.search(prefix):
+            self.prefix = (prefix, word.sub(lambda m: new, prefix))
+
+    @staticmethod
+    def _shown(names, groups_mode):
+        return tuple((u"@" if is_group else u"") + n for n, is_group in zip(names, groups_mode))
+
+    def remove_pairs(self):
+        for _master, kerning, old_key, _new_key, _value, _modes in self.pairs:
+            kerning.remove(old_key)
+
+    def add_pairs(self):
+        for _master, kerning, _old_key, new_key, value, _modes in self.pairs:
+            if new_key is not None:
+                kerning[new_key] = value
+
+    def rewrite(self):
+        for _master, kerning, name, _before, after, side in self.classes:
+            kerning.groups[name] = (after, side)
+        for tag, _before, after in self.features:
+            self.layout.set_feature(tag, after)
+        if self.prefix is not None:
+            self.layout.set_prefix(self.prefix[1])
+
+    def problems(self, restored=False):
+        """What does not read back as planned (or, restored, as it was before)."""
+        found = []
+        for master, kerning, old_key, new_key, value, modes in self.pairs:
+            entries = _entries(kerning)
+            gone, wanted = (new_key, old_key) if restored else (old_key, new_key)
+            gone_shown = None if gone is None else self._shown(gone, modes)
+            if gone_shown is not None and gone_shown in entries:
+                found.append(u"pair %s %s still in master %s" % (gone_shown + (master,)))
+            if wanted is not None:
+                read = entries.get(self._shown(wanted, modes))
+                if read is None or abs(read - value) > 0.5 + 1e-6:
+                    found.append(u"pair %s %s in master %s reads %s, not %g" % (self._shown(wanted, modes) + (master, read, value)))
+        for master, kerning, name, before, after, _side in self.classes:
+            entry = dict((_text(k), v) for k, v in kerning.groups.asDict().items()).get(name)
+            members = None if entry is None else [_text(n) for n in entry[0]]
+            if members != (before if restored else after):
+                found.append(u"kerning class %s in master %s holds %s" % (name, master, members))
+        for tag, before, after in self.features:
+            if not _same_code(_text(self.layout.get_feature(tag)), before if restored else after):
+                found.append(u"feature %s" % tag)
+        if self.prefix is not None and not _same_code(_text(self.layout.get_prefix()), self.prefix[0 if restored else 1]):
+            found.append(u"the prefix")
+        return found
+
+    def put_back(self):
+        """Everything but the glyph's name back as it was, each part tried whatever the others do."""
+        for tag, before, _after in self.features:
+            try:
+                self.layout.set_feature(tag, before)
+            except Exception:
+                pass
+        if self.prefix is not None:
+            try:
+                self.layout.set_prefix(self.prefix[0])
+            except Exception:
+                pass
+        for _master, kerning, name, before, _after, side in self.classes:
+            try:
+                kerning.groups[name] = (before, side)
+            except Exception:
+                pass
+        for _master, kerning, old_key, new_key, value, _modes in self.pairs:
+            try:
+                if new_key is not None and new_key != old_key:
+                    kerning.remove(new_key)
+            except Exception:
+                pass
+
+    def put_back_pairs(self):
+        for _master, kerning, old_key, _new_key, value, _modes in self.pairs:
+            try:
+                kerning[old_key] = value
+            except Exception:
+                pass
+
+    def summary(self):
+        return {"kerning_pairs": len(self.pairs),
+                "kerning_classes": [u"%s (%s)" % (name, master) for master, _k, name, _b, _a, _s in self.classes],
+                "features": [tag for tag, _b, _a in self.features], "prefix": self.prefix is not None}
+
+
 def _references(package, name):
     """Where a glyph name is used outside components: kerning pairs and classes in every master, other
     classes, and feature code (as a whole word). FontLab's rename does not follow these (live: the
@@ -1324,7 +1704,7 @@ def _references(package, name):
     if others:
         found.append(u"class%s %s" % ("" if len(others) == 1 else "es", u", ".join(others)))
     features = package.fgPackage.features
-    word = re.compile(u"(?<![A-Za-z0-9_.@\\-])%s(?![A-Za-z0-9_.\\-])" % re.escape(name))  # (@name is a class)
+    word = _word_re(name)
     tags = [t for t in _real_list(features.keys(), "features.keys()") if word.search(_text(features.get_feature(t)))]
     if word.search(_text(features.get_prefix())):
         tags.insert(0, u"prefix")
@@ -1338,34 +1718,124 @@ def op_rename_glyph(listener, args):
     package = write_target(args)
     glyph = _find_glyph(package, args, name_key="glyph")
     old = _text(glyph.name)
+    update = _bool_arg(args, "update_references")
     if args.get("new_name") == old:
         return _unchanged(package, glyph=old)
     new = _new_glyph_name(package, args, "new_name")
     used = _references(package, old)
+    refs = None
     if used:
-        raise FreeLabError("glyph_in_use", u"Glyph '%s' is used by %s: FontLab's rename would leave those pointing to the "
-                           u"old name, so nothing was renamed." % (old, u"; ".join(used)))
+        if not update:
+            raise FreeLabError("glyph_in_use", u"Glyph '%s' is used by %s: FontLab's rename would leave those pointing to "
+                               u"the old name, so nothing was renamed. update_references (a risky action) rewrites them "
+                               u"in the same step." % (old, u"; ".join(used)))
+        _require_risky(args, "rename_glyph.update_references")
+        refs = _References(package, old, new)
     write = _Write(listener, package, u"rename %s to %s" % (old, new), [glyph])
-    write.begin()
+    write.begin(force=refs is not None)  # (Undo of a rename lost the glyph's pairs when the font was not recorded)
 
     def renamed(name, gone):
         package.fgPackage.rebuildMaps()
         return glyph_named(package, name) is not None and glyph_named(package, gone) is None
 
     def change():
+        if refs is not None:
+            refs.remove_pairs()  # (while the old name is a glyph's)
         if not package.renameGlyph(glyph.fgGlyph, new, True):
             raise _NotKept(u"FontLab refused to rename '%s'" % old)
         if not renamed(new, old):
             raise _NotKept(u"FontLab's glyph list does not show '%s' renamed to '%s'" % (old, new))
+        if refs is not None:
+            refs.add_pairs()
+            refs.rewrite()
+            problems = refs.problems()
+            if problems:
+                raise _NotKept(u"FontLab did not keep every reference as rewritten (%s)" % u"; ".join(problems))
 
     def restore():
+        if refs is not None:
+            refs.put_back()  # (the new pairs out while the new name is still the glyph's)
         if _text(glyph.name) != old:
             package.renameGlyph(glyph.fgGlyph, old, True)
-        return renamed(old, new)
+        back = renamed(old, new)
+        if refs is not None:
+            refs.put_back_pairs()
+            back = back and not refs.problems(restored=True)
+        return back
 
     write.run(change, restore)
+    extra = {"references": refs.summary()} if refs is not None else {}
     return _write_reply(package, write.finish(), glyph=new, before=old,
-                        note="Components that use the glyph follow the new name (FontLab updates them).")
+                        note="Components that use the glyph follow the new name (FontLab updates them)." + (
+                            " Its kerning pairs, kerning classes, and feature code were rewritten in the same step."
+                            if refs is not None else ""), **extra)
+
+
+def _component_users(package, name):
+    """The glyphs that use glyph name as a component, in any layer."""
+    users = []
+    for other in _real_list(package.fgPackage.keys(), "fgFont.keys()"):
+        glyph = package.findName(other)
+        if _is_null(glyph, "a glyph") or _text(glyph.name) == name:
+            continue
+        for layer in _real_list(glyph.layers, "glyph.layers"):
+            if any(_component_glyph(shape) == name for shape in _real_list(layer.shapes, "layer.shapes")):
+                users.append(_text(glyph.name))
+                break
+    return users
+
+
+@op("delete_glyph")
+def op_delete_glyph(listener, args):
+    """Takes a glyph out of the font (package.deleteGlyph), one History step that Undo takes back. Refused
+    for a glyph other glyphs use as a component; one used by kerning or classes only with remove_references
+    (risky), and one named in feature code always (edit the code first)."""
+    package = write_target(args)
+    glyph = _find_glyph(package, args, name_key="glyph")
+    name = _text(glyph.name)
+    remove = _bool_arg(args, "remove_references")
+    users = _component_users(package, name)
+    if users:
+        raise FreeLabError("glyph_in_use", u"Glyph '%s' is a component of %s: delete or decompose %s first. Nothing was "
+                           u"deleted." % (name, u", ".join(users[:20]) + (u", ..." if len(users) > 20 else u""),
+                                          u"that glyph" if len(users) == 1 else u"those glyphs"))
+    used = _references(package, name)
+    refs = None
+    if used:
+        if not remove:
+            raise FreeLabError("glyph_in_use", u"Glyph '%s' is used by %s, so nothing was deleted. remove_references (a "
+                               u"risky action) takes it out of kerning pairs and kerning classes in the same step." % (
+                                   name, u"; ".join(used)))
+        _require_risky(args, "delete_glyph.remove_references")
+        refs = _References(package, name, None)
+    write = _Write(listener, package, u"delete %s" % name, [glyph])
+    write.begin(force=True)  # (the font, with its glyph list, and the glyph's own name and code points)
+    write.glyphs = []  # (a deleted glyph is not recorded again: the step records the font)
+
+    def change():
+        if refs is not None:
+            refs.remove_pairs()
+            refs.rewrite()
+            problems = refs.problems()
+            if problems:
+                raise _NotKept(u"FontLab did not keep the references as removed (%s)" % u"; ".join(problems))
+        deleted = package.deleteGlyph(glyph)
+        package.fgPackage.rebuildMaps()
+        if glyph_named(package, name) is not None:
+            raise _NotKept(u"FontLab did not delete '%s' (deleteGlyph returned %r)" % (name, deleted))
+
+    def restore():
+        if glyph_named(package, name) is None:
+            return False  # (gone: only Undo brings it back)
+        if refs is not None:
+            refs.put_back()
+            refs.put_back_pairs()
+            return not refs.problems(restored=True)
+        return True
+
+    write.run(change, restore, added=True)
+    extra = {"references": refs.summary()} if refs is not None else {}
+    return _write_reply(package, write.finish(added=True), glyph=name, deleted=True, **extra)
 
 
 @op("set_unicodes")
@@ -1509,6 +1979,169 @@ def op_add_component_glyph(listener, args):
             u", ".join(moved))
     return _write_reply(package, write.finish([glyph], added=True), glyph=name, unicodes=unicodes,
                         components=placed, masters=built, skipped_masters=skipped, **extra)
+
+
+MAX_OUTLINE_CONTOURS = 2000
+MAX_OUTLINE_NODES = 50000
+NODE_TYPES = ("on", "off", "curve")  # as get_glyph_outline reads them
+
+
+def _contours_arg(args):
+    """[(closed, [(x, y, type, smooth)])] of args["contours"], checked."""
+    contours = args.get("contours")
+    if not isinstance(contours, list) or len(contours) > MAX_OUTLINE_CONTOURS:
+        raise FreeLabError("bad_args", "contours must be a list of at most %d {closed, nodes} objects ([] clears the "
+                                       "shape)." % MAX_OUTLINE_CONTOURS)
+    out, total = [], 0
+    for c_index, contour in enumerate(contours):
+        if not isinstance(contour, dict) or set(contour) - set(["closed", "nodes"]):
+            raise FreeLabError("bad_args", "contours[%d] must be an object with nodes, and closed (true when left "
+                                           "out), and nothing else." % c_index)
+        closed = contour.get("closed", True)
+        nodes = contour.get("nodes")
+        if not isinstance(closed, bool) or not isinstance(nodes, list) or len(nodes) < 2:
+            raise FreeLabError("bad_args", "contours[%d] needs closed (true or false) and at least 2 nodes." % c_index)
+        total += len(nodes)
+        if total > MAX_OUTLINE_NODES:
+            raise FreeLabError("bad_args", "At most %d nodes in all." % MAX_OUTLINE_NODES)
+        made = []
+        for n_index, node in enumerate(nodes):
+            where = "contours[%d].nodes[%d]" % (c_index, n_index)
+            if not isinstance(node, dict) or set(node) - set(["x", "y", "type", "smooth"]):
+                raise FreeLabError("bad_args", "%s must be an object with x and y, and type and smooth when needed, and "
+                                               "nothing else." % where)
+            x = float(_number(node, "x", -MAX_COORD, MAX_COORD))
+            y = float(_number(node, "y", -MAX_COORD, MAX_COORD))
+            kind = node.get("type", "on")
+            smooth = node.get("smooth", False)
+            if kind not in NODE_TYPES or not isinstance(smooth, bool):
+                raise FreeLabError("bad_args", "%s: type must be on, off, or curve (as get_glyph_outline reads them), and "
+                                               "smooth true or false." % where)
+            made.append((x, y, _text(kind), smooth))
+        if made[0][2] == "off" and not closed or made[-1][2] == "off" and not closed:
+            raise FreeLabError("bad_args", "contours[%d] is open: it must start and end on an on-curve node." % c_index)
+        out.append((closed, made))
+    return out
+
+
+def _shape_contours(shape):
+    """[(closed, [(x, y, type, smooth)])] of a shape as FontLab reads it."""
+    return [(bool(c.closed), [(float(n.x), float(n.y), _text(n.type), bool(n.smooth))
+                              for n in _real_list(c.nodes(), "contour.nodes()")])
+            for c in _real_list(shape.contours, "shape.contours")]
+
+
+def _same_contours(read, wanted, tolerance=0.5):
+    if len(read) != len(wanted):
+        return False
+    for (closed_a, nodes_a), (closed_b, nodes_b) in zip(read, wanted):
+        if closed_a != closed_b or len(nodes_a) != len(nodes_b):
+            return False
+        for a, b in zip(nodes_a, nodes_b):
+            if abs(a[0] - b[0]) > tolerance or abs(a[1] - b[1]) > tolerance or a[2] != b[2] or a[3] != b[3]:
+                return False
+    return True
+
+
+@op("set_outline")
+def op_set_outline(listener, args):
+    """Replaces the contours of one shape of a glyph's layer (not a component), or gives a layer with no
+    shape of its own a new one: contours made from QPointF lists (flContour([QPointF...]), every node on
+    the curve), then each node's type and smoothness set, and the shape's contours replaced at once
+    (clearContours, addContours), as FreeLab Script Suite does live. One History step; read back."""
+    fl = _fontlab()
+    package = write_target(args)
+    glyph = _find_glyph(package, args, name_key="glyph")
+    layer = _layer_arg(glyph, package, args)
+    wanted = _contours_arg(args)
+    shapes = _real_list(layer.shapes, "layer.shapes")
+    own = [(index, shape) for index, shape in enumerate(shapes) if _component_glyph(shape) is None and
+           not bool(shape.isComponent)]
+    index = args.get("shape")
+    if index is not None:
+        if isinstance(index, bool) or not isinstance(index, integer_types) or index not in [i for i, _s in own]:
+            raise FreeLabError("bad_args", u"shape must be the index of one of the layer's own shapes (not a component), "
+                               u"as get_glyph_outline numbers them: %s." % (u", ".join(str(i) for i, _s in own) or u"none"))
+        target = dict(own)[index]
+    elif len(own) > 1:
+        raise FreeLabError("bad_args", u"Layer '%s' of '%s' has %d shapes of its own: give shape, the index of the one "
+                           u"to replace (%s)." % (_text(layer.name), _text(glyph.name), len(own),
+                                                  u", ".join(str(i) for i, _s in own)))
+    else:
+        target = own[0][1] if own else None
+    before = _shape_contours(target) if target is not None else []
+    if target is not None and _same_contours(before, wanted, 0.0):
+        return _unchanged(package, glyph=_text(glyph.name), layer=_text(layer.name), contours=len(before))
+    if target is None and not wanted:
+        return _unchanged(package, glyph=_text(glyph.name), layer=_text(layer.name), contours=0)
+    from PythonQt.QtCore import QPointF  # only inside FontLab
+    saved = [c.clone() for c in _real_list(target.contours, "shape.contours")] if target is not None else []
+
+    def made(contours):
+        out = []
+        for closed, nodes in contours:
+            contour = fl.flContour([QPointF(x, y) for x, y, _k, _s in nodes])
+            contour.closed = closed
+            for node, (_x, _y, kind, smooth) in zip(_real_list(contour.nodes(), "contour.nodes()"), nodes):
+                if kind != "on":
+                    node.type = kind
+                if smooth:
+                    node.smooth = True
+            out.append(contour)
+        return out
+
+    write = _Write(listener, package, u"outline of %s" % _text(glyph.name), [glyph])
+    write.begin()
+    added = []
+
+    def redraw(shape):
+        for item in (shape, layer):
+            try:
+                item.update()  # (a layer keeps its old box until update(), live 2026-11-14)
+            except Exception:
+                pass
+
+    def change():
+        shape = target
+        if shape is None:
+            shape = fl.flShape()
+            shape.addContours(made(wanted), True)
+            layer.addShape(shape)
+            added.append(shape)
+        else:
+            shape.clearContours()
+            shape.addContours(made(wanted), True)
+        redraw(shape)
+        read = _shape_contours(shape)
+        if not _same_contours(read, wanted):
+            raise _NotKept(u"FontLab did not keep the contours as given (read back %d contour%s, %d node%s)" % (
+                len(read), "" if len(read) == 1 else "s", sum(len(n) for _c, n in read),
+                "" if sum(len(n) for _c, n in read) == 1 else "s"))
+        return read
+
+    def restore():
+        if target is None:
+            for shape in added:
+                try:
+                    layer.removeShape(shape)
+                except Exception:
+                    shape.clearContours()
+            left = [s for s in _real_list(layer.shapes, "layer.shapes") if _component_glyph(s) is None and
+                    not bool(s.isComponent) and _shape_contours(s)]
+            return not left
+        target.clearContours()
+        target.addContours(saved, True)
+        redraw(target)
+        return _same_contours(_shape_contours(target), before, 0.0)
+
+    read = write.run(change, restore)
+    reply = _write_reply(package, write.finish(), glyph=_text(glyph.name), layer=_text(layer.name),
+                         shape=index if index is not None else (own[0][0] if own else len(shapes)),
+                         new_shape=target is None, contours_before=len(before), contours=len(read),
+                         nodes=sum(len(n) for _c, n in read))
+    if not _same_contours(read, wanted, 0.0):
+        reply["rounded"] = u"FontLab rounded some coordinates to whole units (as the font rounds coordinates)."
+    return reply
 
 
 def _anchor_at(layer, name):
@@ -1719,17 +2352,60 @@ def op_undo(listener, args):
     expected_title (a write's history.history_state and history.title), only while the font's History
     is still at that state and the step Undo would take back is that write's."""
     package = write_target(args)
-    fl = _fontlab()
-    current = fl.flWorkspace.instance().currentPackage
-    if _is_null(current, "the current font") or _font_id(current) != _font_id(package):
-        raise FreeLabError("not_in_front", u"FontLab's Undo acts on the font in front, and that is not %s: bring it to "
-                           u"the front in FontLab first (click its tab)." % _font_label(package))
+    keep = _bool_arg(args, "keep_in_front")
     expected = args.get("expected_state")
     if expected is not None and (isinstance(expected, bool) or not isinstance(expected, integer_types)):
         raise FreeLabError("bad_args", "expected_state must be an integer: a history_state a write reported.")
     expected_title = args.get("expected_title")
     if expected_title is not None and (not isinstance(expected_title, string_types) or not expected_title.strip()):
         raise FreeLabError("bad_args", "expected_title must be the history.title a write reported.")
+    _check_deadline(listener)
+    with _InFront(package, keep) as front:
+        reply = _undo_in_front(listener, args, package)
+    reply.update(front.reply())
+    return reply
+
+
+class _InFront(object):
+    """Brings a font to the front for an action FontLab takes on the font in front (Edit > Undo, the Features
+    panel's Compile, File > Save), and puts the font that was in front back afterward unless keep is
+    given, whatever the action did."""
+
+    def __init__(self, package, keep=False):
+        self.package, self.keep = package, keep
+        self.previous, self.moved, self.restore = None, False, None
+
+    def __enter__(self):
+        current = _fontlab().flWorkspace.instance().currentPackage
+        try:
+            self.previous = None if _is_null(current, "the current font") else current
+        except FreeLabError:
+            self.previous = None
+        self.moved = bring_to_front(self.package)
+        if _current_id() != _font_id(self.package):
+            raise FreeLabError("not_in_front", u"%s could not be brought to the front; nothing was done." %
+                               _font_label(self.package))
+        return self
+
+    def __exit__(self, kind, value, trace):
+        if self.moved and not self.keep and self.previous is not None:
+            try:
+                bring_to_front(self.previous)
+                self.restore = {"font": _font_ref(self.previous)}
+            except Exception as exc:
+                self.restore = {"warning": u"The font that was in front could not be put back (%s): %s is in front "
+                                           u"now." % (_exc_text(exc), _font_label(self.package))}
+        return False
+
+    def reply(self):
+        reply = {"brought_forward": self.moved}
+        if self.restore is not None:
+            reply["front_restored"] = self.restore
+        return reply
+
+
+def _undo_in_front(listener, args, package):
+    expected, expected_title = args.get("expected_state"), args.get("expected_title")
     state = package.currentHistoryState()
     if expected is not None and state != expected:
         raise FreeLabError("history_moved", u"The font's History is at state %s, not %s: something else changed it "
@@ -1893,6 +2569,11 @@ def op_open_font(listener, args):
         raise FreeLabError("bad_args", u"path must be a full path, not '%s'." % path)
     if not os.path.exists(path):
         raise FreeLabError("not_found", u"There is no file at %s." % path)
+    answer = args.get("answer")
+    if answer is not None:
+        if not isinstance(answer, string_types) or not answer.strip():
+            raise FreeLabError("bad_args", "answer must be the text of the button to click on FontLab's question.")
+        _require_risky(args, "open_font.answer")
     fl = _fontlab()
     before = []
     for package in open_packages():
@@ -1904,9 +2585,26 @@ def op_open_font(listener, args):
             return {"already_open": True, "font": _font_ref(package)}
         before.append(_font_id(package))
     _check_deadline(listener)
+    if answer is not None:  # (first: requestLoadingFont returns only once its question is answered)
+        def not_open_yet():
+            for package in open_packages():
+                try:
+                    if _same_path(package.path, path):
+                        return False
+                except Exception:
+                    pass
+            return True
+        _keep_answering(listener, "open_font", _text(answer), time.time() + OPEN_ANSWER_S,
+                        lambda dialog: dialog.metaObject().className() != SAVE_PROMPT, keep_going=not_open_yet)
     listener.later(OPEN_DELAY_MS, lambda: fl.flItems.requestLoadingFont(path), "open_font")
     listener.opened_paths.append(path)  # (close_font discards changes only in a font opened here)
-    return {"queued": True, "path": path, "fonts_before": before}
+    reply = {"queued": True, "path": path, "fonts_before": before}
+    if not listener.save_opened():
+        reply["warning"] = (u"The path could not be written to the listener's state folder: close_font forgets that "
+                            u"open_font opened it if the listener is started again.")
+    if answer is not None:
+        reply["answer"] = _text(answer)
+    return reply
 
 
 def _edited(package):
@@ -1930,18 +2628,21 @@ def _opened_here(listener, package):
 @op("close_font")
 def op_close_font(listener, args):
     """Close a font as File > Close Font does, a moment after the reply. A font with changes is refused,
-    unless discard_changes is given for a font open_font opened in this session: FontLab's Save question
-    for that font is then answered Don't Save."""
+    unless discard_changes is given for a font open_font opened in this FontLab process, or for any font in
+    risky mode: FontLab's Save question for that font is then answered Don't Save. FontLab 7 does not report
+    a change made outside its History and left unmarked, so such a font closes without a question."""
     package = write_target(args)
-    discard = args.get("discard_changes", False)
-    if not isinstance(discard, bool):
-        raise FreeLabError("bad_args", "discard_changes must be true or false.")
+    discard = _bool_arg(args, "discard_changes")
     label = _font_label(package)
     opened_here = _opened_here(listener, package)
     edited = _edited(package)
     if discard and not opened_here:
-        raise FreeLabError("not_opened_here", u"%s was not opened with open_font in this session: FreeLab MCP never throws "
-                           u"away changes to a font it did not open. Save it or close it in FontLab." % label)
+        try:
+            _require_risky(args, "close_font.discard_changes")
+        except FreeLabError as exc:
+            exc.message = u"%s was not opened with open_font in this FontLab session, and throwing away changes to a font " \
+                          u"FreeLab MCP did not open is risky. %s" % (label, exc.message)
+            raise
     if edited and not discard:
         raise FreeLabError("unsaved_changes", u"%s has changes that are not saved: save it in FontLab first%s. Nothing was "
                            u"closed." % (label, u", or close it with discard_changes" if opened_here else u""))
@@ -1950,7 +2651,9 @@ def op_close_font(listener, args):
     _check_deadline(listener)
     bring_to_front(package)
     target = _font_id(package)
-    names = [n for n in (_text(getattr(package, key, u"") or u"").strip() for key in ("ffn", "psn")) if n]
+    # (FontLab's question names the font in quotes: by its full name, or by its family name alone for a font
+    # of several masters, live: Save changes to  "Rubik" before closing? for Rubik Light)
+    names = [n for n in (_text(getattr(package, key, u"") or u"").strip() for key in ("ffn", "psn", "tfn")) if n]
     try:
         path = _text(package.path)
         names.append(os.path.basename(path.replace(u"/", os.sep)))
@@ -1963,6 +2666,7 @@ def op_close_font(listener, args):
         _main_window_action("actionClose_Fonts").trigger()  # returns once FontLab's question, if any, is answered
         if path and not any(_font_id(p) == target for p in open_packages()):
             listener.opened_paths[:] = [p for p in listener.opened_paths if not _same_path(p, path)]
+            listener.save_opened()
 
     if discard:
         for delay in DONT_SAVE_MS:
@@ -2042,30 +2746,130 @@ def op_compile_features(listener, args):
     returned with the compiler's messages in place); FontLab clears the Output panel first, and prints
     nothing for code that compiles."""
     package = write_target(args)
+    keep = _bool_arg(args, "keep_in_front")
     QtGui = _qt()[1]
     main = _main_window(QtGui)
-    buttons = [b for b in main.findChildren(QtGui.QAbstractButton) if _text(_prop(b, "objectName")) == "buttonCompile"
-               and _text(_prop(b, "toolTip") or u"").startswith(COMPILE_TOOLTIP)]
+    opened = []
+
+    def compile_buttons():
+        return [b for b in main.findChildren(QtGui.QAbstractButton) if _text(_prop(b, "objectName")) == "buttonCompile"
+                and _text(_prop(b, "toolTip") or u"").startswith(COMPILE_TOOLTIP)]
+    buttons = compile_buttons()
+    if not buttons and _open_panel(FEATURES_PANEL_ACTION):
+        opened.append(u"Features")
+        buttons = compile_buttons()
     if not buttons:
-        raise FreeLabError("not_found", "FontLab's Features panel was not found: open it once (Window > Panels > "
-                           "Features), then compile again. Nothing was compiled.")
+        raise FreeLabError("not_found", u"FontLab's Features panel was not found%s: open it (Window > Panels > Features), "
+                           u"then compile again. Nothing was compiled." % (
+                               u", though Window > Panels > Features was chosen" if opened else u""), {"opened_panels": opened})
     if not _prop(buttons[0], "enabled"):
         raise FreeLabError("unavailable", "The Features panel's Compile button is disabled; nothing was compiled.")
     view = _output_view(main, QtGui)
+    if view is None and _open_panel(OUTPUT_PANEL_ACTION):
+        opened.append(u"Output")
+        view = _output_view(main, QtGui)
     if view is None:
-        raise FreeLabError("not_found", "FontLab's Output panel, where its compiler writes, was not found: open it "
-                           "(Window > Panels > Output). Nothing was compiled.")
+        raise FreeLabError("not_found", u"FontLab's Output panel, where its compiler writes, was not found%s: open it "
+                           u"(Window > Panels > Output). Nothing was compiled." % (
+                               u", though Window > Panels > Output was chosen" if u"Output" in opened else u""),
+                           {"opened_panels": opened})
     _check_deadline(listener)
-    moved = bring_to_front(package)
-    if _current_id() != _font_id(package):
-        raise FreeLabError("not_in_front", u"%s could not be brought to the front; nothing was compiled." % _font_label(package))
-    started = time.time()
-    buttons[0].click()
-    text = _text(view.toPlainText())
-    reply = {"font": _font_ref(package), "brought_forward": moved, "seconds": round(time.time() - started, 3),
-             "output": text, "output_length": len(text)}
+    with _InFront(package, keep) as front:
+        started = time.time()
+        buttons[0].click()
+        text = _text(view.toPlainText())
+        seconds = round(time.time() - started, 3)
+    reply = {"font": _font_ref(package), "seconds": seconds, "output": text, "output_length": len(text),
+             "opened_panels": opened}
+    reply.update(front.reply())
     reply.update(compile_report(text))
+    located = _locate_errors(package, reply["errors"])
+    if located:
+        reply["located"] = located[0]
+        reply["located_all"] = located
     return reply
+
+
+FEATURES_PANEL_ACTION = "actionFeaturesPanel"  # Window > Panels > Features (seen live in the menu, 2026-11-19)
+OUTPUT_PANEL_ACTION = "actionOutputPanel"  # Window > Panels > Output
+
+
+def _open_panel(name):
+    """Chooses Window > Panels > the panel (its QAction), unless the action is checked already (choosing it
+    then would close the panel); whether it was chosen."""
+    action = _main_window_action(name)
+    if action is None:
+        return False
+    try:
+        if _prop(action, "checked"):
+            return False
+    except Exception:
+        pass
+    action.trigger()
+    return True
+
+
+FEATURES_FILE_LINE = re.compile(r'in file "features" at line (\d+)')
+
+
+def _feature_parts(package, with_classes):
+    """[(part, text ending with a line break)] of a font's feature code in the order FontLab is taken to put
+    it together for its compiler: the Classes panel's classes (as FreeLab Script Suite's Feature Check
+    writes them), the prefix, then each feature in keys() order."""
+    features = package.fgPackage.features
+    parts = []
+    if with_classes:
+        classes = [(_text(entry[1]), [_text(n) for n in entry[4]])
+                   for entry in _real_list(package.getAllGroups(), "getAllGroups()") if not entry[0]]
+        parts.append((u"classes", u"".join(u"@%s = [%s];\n" % (name, u" ".join(glyphs)) for name, glyphs in classes)))
+    parts.append((u"prefix", _text(features.get_prefix())))
+    for tag in _real_list(features.keys(), "features.keys()"):
+        parts.append((_text(tag), _text(features.get_feature(tag))))
+    return [(key, text if not text or text.endswith(u"\n") else text + u"\n") for key, text in parts]
+
+
+def _locate_line(parts, line):
+    first = 1
+    for key, text in parts:
+        count = text.count(u"\n")
+        if first <= line < first + count:
+            return {"tag": key, "line_in_feature": line - first + 1}
+        first += count
+    return {"tag": None, "line_in_feature": None, "lines_rebuilt": first - 1}
+
+
+def _locate_errors(package, errors):
+    """Each compiler error that names a line of FontLab's combined "features" file, mapped to a part of the
+    font's code (a feature tag, prefix, or classes) and a line within it. An estimate until proven live: the
+    combined file is rebuilt from the parts, which FontLab may put together otherwise (with its own code
+    added), so each mapping says certain: false and gives the reading without the Classes panel too."""
+    found = []
+    for error in errors:
+        match = FEATURES_FILE_LINE.search(error)
+        if match is None:
+            continue
+        line = int(match.group(1))
+        try:
+            entry = {"line": line, "certain": False}
+            entry.update(_locate_line(_feature_parts(package, True), line))
+            entry["without_classes"] = _locate_line(_feature_parts(package, False), line)
+            entry["note"] = (u"Estimated: the line was mapped onto the Classes panel's classes, the prefix, and each "
+                             u"feature in order, rebuilt here; FontLab's own combined file is not proven to match.")
+        except Exception as exc:
+            entry = {"line": line, "certain": False, "tag": None, "line_in_feature": None,
+                     "note": u"Could not rebuild the feature code to locate it (%s)." % _exc_text(exc)}
+        found.append(entry)
+    return found
+
+
+@op("locate_feature_line")
+def op_locate_feature_line(listener, args):
+    """A line of FontLab's combined "features" file (as a compiler error names it), mapped as compile_features
+    maps it: an estimate."""
+    package, count = target_package(args)
+    line = _int_arg(args, "line", None, 1, 10 ** 7)
+    located = _locate_errors(package, [u'in file "features" at line %d' % line])
+    return {"font": _font_ref(package), "located": located[0]}
 
 
 MAX_SCREENSHOT_WIDTH = 16384
@@ -2108,6 +2912,134 @@ def op_screenshot(listener, args):
     return {"window": _text(_prop(window, "windowTitle") or u""), "class": window.metaObject().className(),
             "width": picture.width(), "height": picture.height(),
             "png_base64": binascii.b2a_base64(png).decode("ascii").strip()}
+
+
+# ---------------------------------------------------------------------------
+# Saving and exporting: risky actions (RISKY_ACTIONS), each run from a timer after the reply
+# ---------------------------------------------------------------------------
+
+SAVE_DELAY_MS = 300
+EXPORT_DELAY_MS = 300
+EXPORT_ANSWER_S = 600.0  # an export of a large font may take minutes before its message shows
+SAVE_ACTIONS = ("actionSave", "actionSave_Font", "actionSave_Fonts")  # File > Save: the objectName is not proven
+SAVE_TEXTS = (u"save", u"save font")
+SAVE_FORMATS = (".ufo", ".vfb")  # fgFont.save writes these (FontLab 7's reference); not proven live
+EXPORT_DONE = "DlgSavePackage"  # FontLab 7.2's Font Exported message after a script's export (live, 2026-11-14 and -18)
+EXPORT_BUTTONS = (u"OK", u"Close")
+
+
+def _save_action():
+    """File > Save, the main window's QAction: by objectName, else by its text (neither proven live)."""
+    from PythonQt.QtGui import QAction  # only inside FontLab
+    actions = _main_window(_qt()[1]).findChildren(QAction)
+    for name in SAVE_ACTIONS:
+        for action in actions:
+            if _text(_prop(action, "objectName")) == name:
+                return action
+    for action in actions:
+        if _button_words(_prop(action, "text")) in SAVE_TEXTS:
+            return action
+    return None
+
+
+@op("save_font")
+def op_save_font(listener, args):
+    """[risky] Saves a font, a moment after the reply: with no path, as File > Save does (the font brought to
+    the front; FontLab may ask where, for a font opened from a file it does not save to); with a path, a
+    UFO or VFB file written by fgFont.save, refused over an existing file unless overwrite is given."""
+    _require_risky(args, "save_font")
+    package = write_target(args)
+    keep = _bool_arg(args, "keep_in_front")
+    overwrite = _bool_arg(args, "overwrite")
+    path = args.get("path") or u""
+    if not isinstance(path, string_types):
+        raise FreeLabError("bad_args", "path must be a full path, or left out to save to the font's own file.")
+    path = _text(path).strip()
+    target = _font_id(package)
+    if path:
+        if not os.path.isabs(path):
+            raise FreeLabError("bad_args", u"path must be a full path, not '%s'." % path)
+        extension = os.path.splitext(path)[1].lower()
+        if extension not in SAVE_FORMATS:
+            raise FreeLabError("bad_args", u"FontLab's scripting writes a font to a path only as UFO or VFB (fgFont.save); "
+                               u"File > Save As asks for its file on screen. Give a .ufo or .vfb path, or no path to "
+                               u"save to the font's own file.")
+        if not os.path.isdir(os.path.dirname(path)):
+            raise FreeLabError("not_found", u"There is no folder %s." % os.path.dirname(path))
+        if os.path.exists(path) and not overwrite:
+            raise FreeLabError("file_exists", u"%s exists: give overwrite to replace it. Nothing was saved." % path)
+        _check_deadline(listener)
+        listener.later(SAVE_DELAY_MS, lambda: package.fgPackage.save(path, extension == ".vfb"), "save_font")
+        return {"saving": True, "font": _font_ref(package), "path": path, "how": "fgFont.save"}
+    action = _save_action()
+    if action is None:
+        raise FreeLabError("not_found", "FontLab's File > Save was not found; nothing was saved.")
+    try:
+        own = _text(package.path)
+    except Exception:
+        own = None
+    _check_deadline(listener)
+    current = _fontlab().flWorkspace.instance().currentPackage
+    previous = None if _is_null(current, "the current font") else current
+    moved = bring_to_front(package)
+
+    def save():
+        if _current_id() != target:
+            return  # something else came to the front meanwhile: not saved (the server says so)
+        action.trigger()  # returns once any question FontLab asks on the way is answered
+        if moved and not keep and previous is not None:
+            bring_to_front(previous)
+    listener.later(SAVE_DELAY_MS, save, "save_font")
+    return {"saving": True, "font": _font_ref(package), "path": own, "how": u"File > Save (%s)" % _text(
+        _prop(action, "objectName")), "brought_forward": moved}
+
+
+@op("export_font")
+def op_export_font(listener, args):
+    """[risky] Exports a font into a folder through FontLab's export (flWorkspace.exportFont with an
+    ExportControl holding the user's last export settings, the profile and folder set, never stored
+    back), a moment after the reply; FontLab names the file. Its Font Exported message is closed."""
+    _require_risky(args, "export_font")
+    package = write_target(args)
+    folder = args.get("folder")
+    if not isinstance(folder, string_types) or not folder.strip() or not os.path.isabs(_text(folder).strip()):
+        raise FreeLabError("bad_args", "folder must be the full path of an existing folder.")
+    folder = _text(folder).strip()
+    if not os.path.isdir(folder):
+        raise FreeLabError("not_found", u"There is no folder %s." % folder)
+    profile = args.get("format") or u""
+    if not isinstance(profile, string_types) or len(profile) > 200:
+        raise FreeLabError("bad_args", "format must be an export profile's name, such as OpenType TT or OpenType PS.")
+    fl = _fontlab()
+    control = fl.ExportControl()
+    control.load()  # (the user's last export settings; store() would change them, and is never called)
+    if profile.strip():
+        control.profileName = _text(profile).strip()
+    control.destinationMode = 3  # (a folder, as proven live)
+    control.destinationFolder = folder.replace(u"\\", u"/").rstrip(u"/") + u"/"
+    workspace = fl.flWorkspace.instance()
+    _check_deadline(listener)
+    progress = {"returned": False}
+
+    def export():
+        try:
+            workspace.exportFont(package, control)  # (returns once its message is closed)
+        finally:
+            progress["returned"] = True
+
+    def exporting():  # (once the export returned, only its own message still shown is closed)
+        if not progress["returned"]:
+            return True
+        dialog = _modal_dialog()
+        return dialog is not None and dialog.metaObject().className() == EXPORT_DONE
+    _keep_answering(listener, "export_font", EXPORT_BUTTONS, time.time() + EXPORT_ANSWER_S,
+                    lambda dialog: dialog.metaObject().className() == EXPORT_DONE, keep_going=exporting)
+    listener.later(EXPORT_DELAY_MS, export, "export_font")
+    try:
+        used = _text(control.profileName)
+    except Exception:
+        used = None
+    return {"exporting": True, "font": _font_ref(package), "folder": folder, "format": used}
 
 
 class _Capture(object):
@@ -2232,6 +3164,70 @@ def _no_inherit(sock):
         pass
 
 
+def _owner_only(path):
+    """Gives a file a protected access list with one entry: full access for the user this process runs as,
+    so no other account (administrators included) can read it, and nothing is inherited from its folder.
+    True when done, the reason as text when not (the file keeps its inherited access then); None outside
+    Windows, where the file's 0600 mode does it."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.LocalFree.argtypes = [ctypes.c_void_p]
+        advapi.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+        advapi.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                                               ctypes.POINTER(wintypes.DWORD)]
+        advapi.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+            ctypes.c_wchar_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+        advapi.SetFileSecurityW.argtypes = [ctypes.c_wchar_p, wintypes.DWORD, ctypes.c_void_p]
+        token = wintypes.HANDLE()
+        if not advapi.OpenProcessToken(kernel.GetCurrentProcess(), 0x0008, ctypes.byref(token)):  # TOKEN_QUERY
+            return u"OpenProcessToken failed (error %d)" % ctypes.get_last_error()
+        try:
+            size = wintypes.DWORD()
+            advapi.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))  # TokenUser
+            buffer = ctypes.create_string_buffer(max(size.value, 1))
+            if not advapi.GetTokenInformation(token, 1, buffer, size, ctypes.byref(size)):
+                return u"GetTokenInformation failed (error %d)" % ctypes.get_last_error()
+            sid = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]  # (TOKEN_USER starts with the SID's pointer)
+            text = ctypes.c_void_p()
+            if not advapi.ConvertSidToStringSidW(sid, ctypes.byref(text)):
+                return u"ConvertSidToStringSidW failed (error %d)" % ctypes.get_last_error()
+            try:
+                user = ctypes.wstring_at(text.value)
+            finally:
+                kernel.LocalFree(text)
+        finally:
+            kernel.CloseHandle(token)
+        descriptor = ctypes.c_void_p()
+        if not advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(u"D:P(A;;FA;;;%s)" % user, 1,
+                                                                          ctypes.byref(descriptor), None):
+            return u"ConvertStringSecurityDescriptorToSecurityDescriptorW failed (error %d)" % ctypes.get_last_error()
+        try:
+            # DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+            if not advapi.SetFileSecurityW(_text(path), 0x00000004 | 0x80000000, descriptor):
+                return u"SetFileSecurityW failed (error %d)" % ctypes.get_last_error()
+        finally:
+            kernel.LocalFree(descriptor)
+        return True
+    except Exception as exc:
+        return _exc_text(exc)
+
+
+def _loopback(address):
+    try:
+        host = _text(address[0])
+    except Exception:
+        return False
+    return host in LOOPBACK or host.startswith(u"127.")
+
+
 class _Client(object):
     def __init__(self, sock):
         self.sock = sock
@@ -2260,7 +3256,54 @@ class Listener(object):
         self.closing = False  # inside the main window's close(), which may wait on FontLab's save question
         self.deadline = None  # the request being handled: its deadline (seconds since the epoch), or None
         self.pending = []  # callbacks waiting on a timer (later): held, since PythonQt drops a slot nothing holds
-        self.opened_paths = []  # paths open_font opened (close_font may discard changes only in those)
+        # paths open_font opened in this FontLab process (close_font may discard changes in those without risky
+        # mode), kept in a file beside the state file so that a restarted listener still knows them
+        self.opened_paths = self._load_opened()
+        self.state_private = None  # True once the state file is readable by this user only; else why not
+        self.bad_tokens = []  # when requests with a wrong token came (BAD_TOKEN_LIMIT)
+        self.throttled_until = 0.0
+        self.refused_peers = 0  # connections from outside the loopback, closed unanswered
+
+    # -- paths open_font opened --------------------------------------------------
+    def opened_file(self):
+        return os.path.join(os.path.dirname(self.state_file), "opened.json")
+
+    def _load_opened(self):
+        """The paths open_font opened, when the file was written by this FontLab process (its pid): another
+        process's are of fonts this FontLab never opened."""
+        try:
+            with open(self.opened_file()) as handle:
+                data = json.load(handle)
+            if not isinstance(data, dict) or data.get("pid") != os.getpid() or not isinstance(data.get("paths"), list):
+                return []
+            return [_text(path) for path in data["paths"] if isinstance(path, string_types)]
+        except Exception:
+            return []
+
+    def save_opened(self):
+        """Writes opened_paths with this process's pid; whether it was written."""
+        target = self.opened_file()
+        temp = "%s.%d.tmp" % (target, os.getpid())
+        try:
+            folder = os.path.dirname(target)
+            if folder and not os.path.isdir(folder):
+                os.makedirs(folder, 0o700)
+            if os.path.exists(temp):
+                os.remove(temp)
+            with os.fdopen(os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as handle:
+                json.dump({"pid": os.getpid(), "paths": self.opened_paths}, handle)
+            _owner_only(temp)
+            if os.path.exists(target):
+                os.remove(target)
+            os.rename(temp, target)
+            return True
+        except Exception:
+            try:
+                if os.path.exists(temp):
+                    os.remove(temp)
+            except Exception:
+                pass
+            return False
 
     # -- work after the reply ------------------------------------------------
     def later(self, delay_ms, func, key):
@@ -2390,6 +3433,9 @@ class Listener(object):
         if os.path.exists(temp):  # left by this process's earlier, interrupted write
             os.remove(temp)
         with os.fdopen(os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as handle:
+            # closed to other accounts before the token is in it (Windows ignores the mode: an access list)
+            private = _owner_only(temp)
+            self.state_private = True if private is None else private  # (None: not Windows, the 0600 mode)
             json.dump(data, handle)
         for attempt in range(20):  # a reader may hold the file for a moment
             try:
@@ -2481,12 +3527,22 @@ class Listener(object):
             if len(self.clients) >= MAX_CLIENTS:
                 break
             try:
-                sock, _addr = self.server.accept()
+                sock, address = self.server.accept()
             except socket.error as exc:
                 if not (exc.args and exc.args[0] in _WOULD_BLOCK):
                     self._record("accept", exc)  # e.g. a peer that reset before accept
                 break
             _no_inherit(sock)
+            # (the socket listens on 127.0.0.1 only; a peer from elsewhere is refused all the same, and while
+            # wrong tokens keep coming every connection is closed unanswered for a moment)
+            if not _loopback(address) or time.time() < self.throttled_until:
+                if not _loopback(address):
+                    self.refused_peers += 1
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                continue
             sock.setblocking(False)
             self.clients.append(_Client(sock))
         for client in list(self.clients):
@@ -2576,6 +3632,15 @@ class Listener(object):
             self.clients.remove(client)
 
     # -- requests ------------------------------------------------------------
+    def _bad_token(self):
+        """Counts a request with a wrong token; past BAD_TOKEN_LIMIT within BAD_TOKEN_WINDOW_S, connections are
+        closed unanswered for THROTTLE_S (a guesser gets no answers, FontLab no stream of requests)."""
+        now = time.time()
+        self.bad_tokens = [t for t in self.bad_tokens if now - t < BAD_TOKEN_WINDOW_S] + [now]
+        if len(self.bad_tokens) >= BAD_TOKEN_LIMIT:
+            self.throttled_until = now + THROTTLE_S
+            self.bad_tokens = []
+
     def handle_line(self, line):
         request_id = None
         try:
@@ -2587,6 +3652,7 @@ class Listener(object):
                 raise FreeLabError("bad_request", "The request must be a JSON object.")
             token = request.get("token")
             if not isinstance(token, string_types) or not hmac.compare_digest(_bytes(token), _bytes(self.token)):
+                self._bad_token()
                 raise FreeLabError("bad_token", "The token does not match this listener; reread the state file.")
             request_id = request.get("id")  # echoed only once the caller is authenticated
             protocol = request.get("protocol")
@@ -2637,6 +3703,8 @@ def main(port=None):
     # globals set to None, which would break every later tick. Keep this one referenced.
     sys._freelab_listener_module = sys.modules.get(MODULE_NAME)
     print("FreeLab listener %s on %s:%d (Python %s)" % (VERSION, HOST, listener.port, sys.version.split()[0]))
+    if listener.state_private is not True:
+        print(u"FreeLab listener: its state file keeps its folder's access (%s)." % _text(listener.state_private))
     return listener
 
 
