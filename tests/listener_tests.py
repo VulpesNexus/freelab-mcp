@@ -92,6 +92,9 @@ class CloseMainWindowTests(ListenerCase):
             def close(self):
                 test.closed.append(self.meta.name)
 
+            def isVisible(self):
+                return True
+
         class App(object):
             windows = []
 
@@ -122,6 +125,13 @@ class CloseMainWindowTests(ListenerCase):
         self.App.windows = [self.Window("QDialog"), self.Window("MainWindow")]
         self.listener._close_main_window()
         self.assertEqual((self.closed, self.quit), (["MainWindow"], []))
+
+    def test_the_welcome_window_is_closed_first(self):
+        """Live, 2026-11-19: FontLab's Welcome window, modal since a launch with no font, kept FontLab running
+        once its main window had closed."""
+        self.App.windows = [self.Window("MainWindow"), self.Window("DlgInitialize")]
+        self.listener._close_main_window()
+        self.assertEqual(self.closed, ["DlgInitialize", "MainWindow"])
 
     def test_without_a_main_window_nothing_is_ended(self):
         self.App.windows = [self.Window("QDialog")]
@@ -1135,16 +1145,26 @@ class KerningWriteTests(FontCase):
         self.assertIsNone(self.font.kerning("Regular").get(("B", "A")))
         self.assertEqual(self.font._f_flags, [])
 
-    def test_a_step_the_history_did_not_record_is_said(self):
+    def test_a_write_whose_step_the_history_refuses_is_put_back(self):
+        """Codex, 2026-11-19: a write whose History step failed was reported as a success, Undo unable to take
+        it back."""
         self.write("set_kerning", {"left": "B", "right": "A", "value": -9})  # (the font recorded)
         self.state.fail_history = "step"
-        reply = self.write("set_kerning", {"left": "B", "right": "A", "value": -8})
-        self.assertFalse(reply["history"]["recorded"])
-        self.assertIn("Undo cannot take it back", reply["history"]["warning"])
-        self.assertEqual(self.font._f_flags[-1], (2, True), "still marked modified")
+        error = self.fails("set_kerning", {"font": 7, "left": "B", "right": "A", "value": -8}, code="history_failed")
+        self.assertIn("it was put back", error["message"])
+        self.assertIn("Nothing was changed", error["message"])
+        self.assertEqual(self.font.kerning("Regular").get(("B", "A")), -9)
         self.state.fail_history = None
         self.write("set_kerning", {"left": "B", "right": "A", "value": -7})
         self.assertTrue(self.state.steps[-2][0].endswith("(before)"), "the font is recorded again after a failed step")
+
+    def test_a_change_that_cannot_be_put_back_after_a_refused_step_is_an_error(self):
+        self.state.fail_history = "step"
+        error = self.fails("delete_glyph", {"font": 7, "glyph": "space"}, code="history_failed")
+        self.assertIn("could not be put back", error["message"])
+        self.assertFalse(error["data"]["history"]["recorded"])
+        self.assertIsNone(self.font.findName("space"), "a deleted glyph comes back only through Undo")
+        self.assertEqual(self.font._f_flags[-1], (2, True), "marked modified")
 
     def test_the_client_giving_up_changes_nothing(self):
         saved = fl._check_deadline
@@ -1399,9 +1419,30 @@ class UndoTests(FontCase):
         reply = self.write("undo", {"expected_state": first})
         self.assertEqual(reply["undone"][0], "Freelab Mcp: Anchor Top Of B")
 
+    def test_a_write_to_a_font_behind_is_recorded_in_front(self):
+        """Live, 2026-11-19: FontLab gives a step no title when its font is behind another (blank in the History
+        panel and in Edit > Undo), so undo could not match a write made behind by its title."""
+        self.state.current = self.sample
+        reply = self.write("set_kerning", {"left": "B", "right": "A", "value": -5})
+        self.assertEqual([title for title, _o in self.state.steps], [u"FreeLab MCP: kerning B A (before)",
+                                                                    u"FreeLab MCP: kerning B A"])
+        self.assertIs(self.state.current, self.sample, "the font that was in front is put back")
+        undone = self.write("undo", {"expected_state": reply["history"]["history_state"],
+                                     "expected_title": reply["history"]["title"]})
+        self.assertEqual(undone["undone"][0], u"Freelab Mcp: Kerning B A")
+        self.assertIs(self.state.current, self.sample)
+
+    def test_a_font_without_a_window_tab_writes_an_untitled_step_and_says_so(self):
+        self.state.current = self.sample
+        self.state.tabs = [(u"Sketchboard", None), (u" Free Sans Regular ", self.sample)]
+        reply = self.write("set_kerning", {"left": "B", "right": "A", "value": -5})
+        self.assertIn("no title", reply["history"]["warning"])
+        self.assertEqual(self.state.steps[-1][0], u"")
+
     def test_a_before_step_left_alone_is_undone_alone_and_said(self):
         self.state.fail_history = "step"
-        self.write("set_kerning", {"left": "B", "right": "A", "value": -5})  # (its step refused: only (before) is left)
+        self.fails("set_kerning", {"font": 7, "left": "B", "right": "A", "value": -5},
+                   code="history_failed")  # (its step refused, the pair put back: only (before) is left)
         self.state.fail_history = None
         reply = self.write("undo")
         self.assertEqual(reply["undone"], ["Freelab Mcp: Kerning B A (Before)"])
@@ -1760,14 +1801,14 @@ class WindowTests(FontCase):
         self.state.fire_timers()
         self.assertEqual(self.state.loads, [path])
         self.assertEqual(self.ids(), [1, 7, 101])
-        self.assertEqual(self.listener.opened_paths, [path])
+        self.assertEqual(self.listener.opened, [{"id": 101, "path": path}], "recorded once it opened, by its id")
 
     def test_open_font_names_a_font_already_open(self):
         path = self.font_file()
         object.__setattr__(self.font, "path", path.replace(os.sep, "/"))  # (FontLab mixes separators: live)
         self.assertEqual(self.ok("open_font", {"path": path}), {"already_open": True,
                                                                 "font": {"id": 7, "name": "Write Sans Regular"}})
-        self.assertEqual((self.state.timers, self.listener.opened_paths), ([], []))
+        self.assertEqual((self.state.timers, self.listener.opened), ([], []))
 
     def test_open_font_refuses_a_path_it_cannot_open(self):
         self.fails("open_font", {"path": "Open.ttf"}, code="bad_args")
@@ -1818,10 +1859,36 @@ class WindowTests(FontCase):
         self.state.current = self.sample
         self.assertIn("close it with discard_changes", self.fails("close_font", {"font": 101}, code="unsaved_changes")["message"])
         self.assertTrue(self.ok("close_font", {"font": 101, "discard_changes": True})["edited"])
-        self.state.fire_timers(fl.CLOSE_DELAY_MS)
-        self.assertIs(self.state.prompt, opened, "FontLab asked")
-        self.state.fire_timers()
+        asked = []
+        self.state.on_modal = lambda: asked.append(self.state.prompt)
+        self.state.fire_timers(fl.CLOSE_DELAY_MS)  # (the question is answered inside File > Close Font: live)
+        self.assertEqual(asked, [opened], "FontLab asked")
         self.assertEqual((self.state.answers, self.ids()), ([u"&Don\u2019t Save"], [1, 7]))
+
+    def test_a_canceled_close_leaves_no_answer_for_a_later_close(self):
+        """Codex, 2026-11-19: the Don't Save answers of a close the user canceled stayed armed, and answered
+        the user's own close of the same font a moment later."""
+        self.font._f_states.append(3)
+        self.state.asks_to_save.add(7)
+        self.ok("close_font", {"font": 7, "discard_changes": True, "risky": True})
+        self.state.on_modal = lambda: fl._click_modal_button("Cancel")  # (the user cancels the question)
+        self.state.fire_timers(fl.CLOSE_DELAY_MS)
+        self.assertEqual((self.state.answers, self.ids()), (["Cancel"], [1, 7]))
+        self.state.close_current()  # (then closes the font in FontLab themselves)
+        self.state.fire_timers()
+        self.assertIs(self.state.prompt, self.font, "the user's own question is left to them")
+        self.assertEqual(self.state.answers, ["Cancel"])
+
+    def test_a_close_skipped_leaves_no_answer(self):
+        self.font._f_states.append(3)
+        self.state.asks_to_save.add(7)
+        self.ok("close_font", {"font": 7, "discard_changes": True, "risky": True})
+        self.state.current = self.sample  # (another font came to the front: the close is skipped)
+        self.state.fire_timers(fl.CLOSE_DELAY_MS)
+        self.state.current = self.font
+        self.state.close_current()
+        self.state.fire_timers()
+        self.assertEqual((self.state.answers, self.state.prompt), ([], self.font))
 
     def test_the_save_question_is_left_without_discard_changes(self):
         self.state.asks_to_save.add(7)  # (FontLab asked about a font no flag said was changed: live, at a quit)
@@ -1899,19 +1966,28 @@ class WindowTests(FontCase):
         self.assertEqual((self.state.compiled, self.state.current), ([], self.sample))
 
     def test_compile_errors_are_located_in_the_fonts_code(self):
-        """Live, 2026-11-19: FontLab names a line of its combined "features" file. Rebuilt here: the Classes
-        panel's classes (1 line: caps), the prefix (2 lines), liga (3 lines), ss01 (3 lines)."""
+        """Live, 2026-11-19: FontLab names a line of its combined "features" file: the prefix without the
+        Classes panel's lines get_prefix() starts with, then each feature (Varela Round, Bellefair, Tinos: the
+        line was the rebuilt one less exactly their 16, 5, and 10 panel classes). Here: the prefix (2 lines,
+        after caps's line), liga (3 lines), ss01 (3 lines)."""
         self.state.compiler = lambda font: u'[F] glyph class not defined\n[F] Fatal error in font "W" in file "features" at line 8\n'
         reply = self.ok("compile_features", {"font": 7})
         located = reply["located"]
         self.assertEqual((located["line"], located["tag"], located["line_in_feature"], located["certain"]),
-                         (8, u"ss01", 2, False))
-        self.assertEqual(located["without_classes"], {"tag": u"ss01", "line_in_feature": 3})
+                         (8, u"ss01", 3, False))
+        self.assertNotIn("without_classes", located)
         self.assertEqual(len(reply["located_all"]), 1)
         far = self.ok("locate_feature_line", {"font": 7, "line": 7703})["located"]
-        self.assertEqual((far["tag"], far["lines_rebuilt"]), (None, 9))
-        self.assertEqual(self.ok("locate_feature_line", {"font": 7, "line": 1})["located"]["tag"], u"classes")
+        self.assertEqual((far["tag"], far["lines_rebuilt"]), (None, 8))
+        self.assertEqual(self.ok("locate_feature_line", {"font": 7, "line": 1})["located"]["tag"], u"prefix")
         self.fails("locate_feature_line", {"font": 7}, code="bad_args")
+
+    def test_the_prefix_keeps_the_classes_panels_lines_out_of_the_count(self):
+        """A prefix that does not start with the panel's lines (FontLab's own, or a font of none) counts whole."""
+        self.assertEqual(fl._own_prefix(self.font), u"languagesystem DFLT dflt;\n@round = [O Q];\n"[:0] +
+                         self.font.fgPackage.features._f_prefix)
+        object.__setattr__(self.font, "_f_classes", [])
+        self.assertEqual(fl._own_prefix(self.font), self.font.fgPackage.features.get_prefix())
 
     # -- the Output panel
     def test_output_reads_from_an_offset(self):
@@ -2029,10 +2105,57 @@ class AnswerDialogTests(FontCase):
 
     def test_a_dialog_replaced_meanwhile_is_not_answered(self):
         self.state.ask(u"Coordinates Rounding", buttons=[u"OK"])
-        self.ok("answer_dialog", {"button": "OK", "risky": True})
+        reply = self.ok("answer_dialog", {"button": "OK", "risky": True})
+        self.assertIsNone(self.ok("answer_result", {"answer_id": reply["answer_id"]})["outcome"], "still to come")
         self.state.ask(u"Font Exported", u"DlgSavePackage", [u"OK"])
         self.state.fire_timers()
         self.assertEqual((self.state.answers, self.state.question), ([], u"Font Exported"))
+        self.assertEqual(self.ok("answer_result", {"answer_id": reply["answer_id"]})["outcome"], u"dialog_changed")
+
+    def test_another_fonts_save_question_is_not_answered(self):
+        """Codex, 2026-11-19: two Save questions share class and title; the one about font 7 was described,
+        and font 1's, shown by the time of the click, was answered Don't Save."""
+        self.state.current = self.state.prompt = self.font
+        reply = self.ok("answer_dialog", {"button": "Don't Save", "risky": True})
+        self.state.current = self.state.prompt = self.sample
+        self.state.fire_timers()
+        self.assertEqual((self.state.answers, self.ids()), ([], [1, 7]))
+        self.assertEqual(self.ok("answer_result", {"answer_id": reply["answer_id"]})["outcome"], u"dialog_changed")
+        self.fails("answer_result", {"answer_id": 999}, code="not_found")
+
+    def test_a_clicked_answer_is_said(self):
+        self.state.ask(u"Coordinates Rounding", buttons=[u"OK"])
+        reply = self.ok("answer_dialog", {"button": "OK", "risky": True})
+        self.state.fire_timers()
+        self.assertEqual(self.ok("answer_result", {"answer_id": reply["answer_id"]})["outcome"], u"clicked")
+
+    def test_an_open_canceled_stops_its_answer(self):
+        """Codex, 2026-11-19: once the open's question was canceled, its answer kept looking for 120 s and
+        clicked a later question of the user's own."""
+        path = os.path.join(self.tmp, "Round.ttf")
+        with open(path, "wb") as handle:
+            handle.write(b"font")
+        self.state.hold_open = True
+        self.ok("open_font", {"path": path, "answer": "OK", "risky": True})
+        self.state.on_modal = lambda: fl._click_modal_button("Cancel")  # (the user cancels before the answer)
+        self.state.fire_timers(fl.OPEN_DELAY_MS)
+        self.assertEqual((self.state.answers, self.state.loads), (["Cancel"], [path]))
+        manual = []
+        self.state.ask(u"Coordinates Rounding", buttons=[u"OK"], then=manual.append)  # (the user's own, later)
+        for _ in range(3):
+            self.state.fire_timers()
+        self.assertEqual((manual, self.state.question), ([], u"Coordinates Rounding"))
+
+    def test_an_open_answers_only_while_its_font_loads(self):
+        path = os.path.join(self.tmp, "Round.ttf")
+        with open(path, "wb") as handle:
+            handle.write(b"font")
+        self.ok("open_font", {"path": path, "answer": "OK", "risky": True})
+        self.state.ask(u"Font Info", buttons=[u"OK"])  # (a question already up, before the open runs)
+        self.state.fire_timers(fl.ANSWER_POLL_MS - 1)  # (the open itself, at once: no question of its own)
+        for _ in range(3):
+            self.state.fire_timers()
+        self.assertEqual((self.state.answers, self.state.question), ([], u"Font Info"))
 
     def test_open_font_answers_fontlabs_question(self):
         path = os.path.join(self.tmp, "Round.ttf")
@@ -2065,7 +2188,7 @@ class AnswerDialogTests(FontCase):
         finally:
             self.listener.closing = False
 
-    def test_a_quit_cancelled_on_screen_answers_nothing_after(self):
+    def test_a_quit_canceled_on_screen_answers_nothing_after(self):
         """A Save question the user meets later, closing a font by hand, is never answered for them."""
         self.listener.request_quit = lambda delay_ms=0: None
         self.ok("quit", {"discard_changes": True, "risky": True})  # (then Cancel: the quit is over)
@@ -2099,6 +2222,51 @@ class ReferenceTests(FontCase):
     def classes(self, master="Regular"):
         return self.font.kerning(master).groups.asDict()
 
+    def add_glyph(self, name):
+        self.font._f_glyphs.append(fakes.flGlyph(name, []))
+        self.font.fgPackage.rebuildMaps()
+
+    def test_a_feature_named_like_the_glyph_is_left_alone(self):
+        """Codex, 2026-11-19: renaming a glyph named liga rewrote feature liga { } liga; as liga.new."""
+        self.add_glyph("liga")
+        before = self.features.get_feature("liga")
+        self.write("rename_glyph", {"glyph": "liga", "new_name": "liga.new", "update_references": True, "risky": True})
+        self.assertEqual(self.features.get_feature("liga"), before)
+        self.assertIsNone(fl._feature_block("liga", self.features.get_feature("liga")))
+
+    def test_only_glyph_names_are_rewritten(self):
+        self.add_glyph("sub")
+        code = (u"feature ss02 {\n  # sub stays a word here\n  featureNames { name \"sub\"; };\n"
+                u"  lookup sub {\n    sub \\sub by B;\n  } sub;\n} ss02;\n")
+        self.features.set_feature("ss02", code)
+        reply = self.write("rename_glyph", {"glyph": "sub", "new_name": "sub.alt", "update_references": True,
+                                            "risky": True})
+        self.assertEqual(reply["references"]["features"], [u"ss02"])
+        self.assertEqual(self.features.get_feature("ss02"), code.replace(u"\\sub by", u"\\sub.alt by"))
+
+    def test_a_glyph_range_that_may_hold_the_glyph_is_refused(self):
+        """Codex, 2026-11-19: [A-B] was not seen as naming A or B, so B could be deleted under it."""
+        for name in ("x1", "x2", "x3"):
+            self.add_glyph(name)
+        for prefix, glyph in ((u"@xs = [x1-x2];\n", "x2"), (u"@xs = [x1 - x2];\n", "x1"), (u"@xs = [x1-x3];\n", "x2")):
+            self.features.set_prefix(prefix)
+            error = self.refused("delete_glyph", {"glyph": glyph}, "glyph_in_use")
+            self.assertIn("glyph range", error["message"], prefix)
+            error = self.refused("delete_glyph", {"glyph": glyph, "remove_references": True, "risky": True},
+                                 "glyph_in_use")
+            self.assertIn("glyph range", error["message"], prefix)
+            error = self.refused("rename_glyph", {"glyph": glyph, "new_name": glyph + ".x", "update_references": True,
+                                                  "risky": True}, "glyph_in_use")
+            self.assertIn("range", error["message"], prefix)
+        self.sample.fgPackage.features.set_prefix(u"@letters = [A-B];\n")  # (Codex's case, as written)
+        self.assertIn(u"a glyph range that may hold it in feature code (prefix)", fl._references(self.sample, "B"))
+
+    def test_a_hyphenated_glyph_is_a_glyph_not_a_range(self):
+        code, glyphs = u"@pair = [A-B];\n", set([u"A-B", u"A", u"B"])
+        self.assertEqual(fl._fea_uses(code, u"A-B", glyphs), (1, False))
+        self.assertEqual(fl._fea_uses(code, u"B", glyphs), (0, False))
+        self.assertEqual(fl._fea_uses(code, u"B", set([u"A", u"B"])), (0, True), "without that glyph: a range")
+
     def test_rename_rewrites_kerning_classes_and_feature_code_and_undoes_in_one_step(self):
         self.features.set_prefix(u"languagesystem DFLT dflt;\n@round = [O Q];\n# Q.alt and Qx stay\n")
         error = self.refused("rename_glyph", {"glyph": "Q", "new_name": "Qalt"}, "glyph_in_use")
@@ -2110,7 +2278,8 @@ class ReferenceTests(FontCase):
         self.assertNotIn((("Q", "glyphMode"), ("A", "glyphMode"), -7.0), self.font.kerning("Bold")._f_pairs)
         self.assertEqual((self.classes()["round"][0], self.classes("Bold")["round"][0]), (["O", "Qalt"], ["O", "Qalt"]))
         self.assertIn(u"sub Qalt by O", self.features.get_feature("ss01"))
-        self.assertEqual(self.features.get_prefix(), u"languagesystem DFLT dflt;\n@round = [O Qalt];\n# Q.alt and Qx stay\n")
+        self.assertEqual(self.features.get_prefix(),  # (the Classes panel's class first, as FontLab gives it: live)
+                         u"@caps = [A B];\nlanguagesystem DFLT dflt;\n@round = [O Qalt];\n# Q.alt and Qx stay\n")
         self.assertIs(self.state.steps[0][1][0], self.font, "the font recorded before the rename, whatever its state")
         self.assertEqual(len(self.state.steps), 2)
         undone = self.write("undo", {"expected_state": reply["history"]["history_state"]})
@@ -2192,8 +2361,14 @@ class OutlineWriteTests(FontCase):
         self.state.current = self.font
 
     TRIANGLE = [{"nodes": [{"x": 0, "y": 0}, {"x": 300, "y": 0}, {"x": 150, "y": 400}]}]
-    CURVE = [{"closed": True, "nodes": [{"x": 0, "y": 0}, {"x": 0, "y": 100, "type": "off"}, {"x": 50, "y": 150, "type": "off"},
-                                        {"x": 100, "y": 150, "type": "curve", "smooth": True}, {"x": 100, "y": 0}]}]
+    # (live, 2026-11-19: "curve" is a cubic handle, "off" a TrueType off-curve point, "on" every node on the outline;
+    # smooth holds on an on node beside a handle, and only when set after every node's type)
+    CURVE = [{"closed": True, "nodes": [{"x": 0, "y": 0, "smooth": True}, {"x": 0, "y": 100, "type": "curve"},
+                                        {"x": 50, "y": 150, "type": "curve"}, {"x": 100, "y": 150, "smooth": True},
+                                        {"x": 100, "y": 0}]}]
+    QUADRATIC = [{"closed": True, "nodes": [{"x": 0, "y": 0}, {"x": 0, "y": 100, "type": "off"},
+                                            {"x": 100, "y": 100, "smooth": True}, {"x": 200, "y": 100, "type": "off"},
+                                            {"x": 200, "y": 0}]}]
 
     def nodes(self, glyph, layer="Regular", shape=0):
         out = self.ok("outline", {"font": 7, "name": glyph, "layer": layer})
@@ -2212,11 +2387,45 @@ class OutlineWriteTests(FontCase):
                                                      (50, 400, "on", False)]], "the other master is left alone")
 
     def test_node_types_and_smoothness(self):
+        """Live, 2026-11-19: smooth set in the same pass as the types was lost on a node whose next neighbor
+        was not yet a handle (the first node here)."""
         self.write("set_outline", {"glyph": "B", "contours": self.CURVE, "layer": "Bold"})
-        self.assertEqual(self.nodes("B", "Bold"), [[(0.0, 0.0, "on", False), (0.0, 100.0, "off", False),
-                                                     (50.0, 150.0, "off", False), (100.0, 150.0, "curve", True),
+        self.assertEqual(self.nodes("B", "Bold"), [[(0.0, 0.0, "on", True), (0.0, 100.0, "curve", False),
+                                                     (50.0, 150.0, "curve", False), (100.0, 150.0, "on", True),
                                                      (100.0, 0.0, "on", False)]])
         self.assertFalse(self.write("set_outline", {"glyph": "B", "contours": self.CURVE, "layer": "Bold"})["changed"])
+        self.write("set_outline", {"glyph": "B", "contours": self.QUADRATIC})
+        self.assertEqual([n[2:] for n in self.nodes("B")[0]], [("on", False), ("off", False), ("on", True),
+                                                                ("off", False), ("on", False)])
+
+    def test_smoothness_fontlab_refuses_is_named(self):
+        corner = [{"nodes": [{"x": 0, "y": 0}, {"x": 100, "y": 0, "smooth": True}, {"x": 100, "y": 100}]}]
+        error = self.fails("set_outline", {"font": 7, "glyph": "B", "contours": corner}, code="not_kept")
+        self.assertIn("contour 0 node 1 reads 100 0 on, not 100 0 on smooth", error["message"])
+        self.assertEqual(len(self.nodes("B")[0]), 4, "put back")
+
+    def test_a_new_shape_the_layer_did_not_take_is_not_kept(self):
+        """Codex, 2026-11-19: the new shape was read back from the shape made, not from the layer."""
+        saved = fakes.flLayer.addShape
+        fakes.flLayer.addShape = lambda layer, shape: None  # (FontLab keeps nothing, and says nothing)
+        try:
+            error = self.fails("set_outline", {"font": 7, "glyph": "Aacute", "contours": self.TRIANGLE}, code="not_kept")
+        finally:
+            fakes.flLayer.addShape = saved
+        self.assertIn("0 shapes of its own", error["message"])
+        self.assertEqual(len(self.layer("Aacute").shapes), 2)
+
+    def test_a_changed_copy_the_layer_took_is_not_kept(self):
+        saved = fakes.flLayer.addShape
+
+        def altered(layer, shape):
+            saved(layer, fakes.flShape([fakes.square(0, 0, 10)]))  # (a shape, but not the one given)
+        fakes.flLayer.addShape = altered
+        try:
+            error = self.fails("set_outline", {"font": 7, "glyph": "Aacute", "contours": self.TRIANGLE}, code="not_kept")
+        finally:
+            fakes.flLayer.addShape = saved
+        self.assertIn("did not keep the contours", error["message"])
 
     def test_a_layer_without_a_shape_of_its_own_gets_one(self):
         reply = self.write("set_outline", {"glyph": "Aacute", "contours": self.TRIANGLE})
@@ -2307,6 +2516,21 @@ class ResolvedKerningTests(FontCase):
         self.assertEqual((reply["value"], reply["resolved_by"], reply["fontlab"]), (-50.0, "computed", None))
         self.assertIn("getPlainPairsDict failed", reply["fontlab_error"])
 
+    def test_a_large_flattening_is_not_asked_for(self):
+        """Codex, 2026-11-19: one pair asked FontLab to flatten the whole master's class kerning, on its main
+        thread, however large."""
+        kerning = self.font.kerning("Regular")
+        object.__setattr__(kerning, "_f_plain", "raise")  # (asked for, it would say so)
+        saved = fl.MAX_PLAIN_PAIRS
+        fl.MAX_PLAIN_PAIRS = 2
+        try:
+            reply = self.resolved("V", "A")
+        finally:
+            fl.MAX_PLAIN_PAIRS = saved
+        self.assertEqual((reply["value"], reply["resolved_by"], reply["fontlab"]), (-50.0, "computed", None))
+        self.assertIn("was not asked for", reply["fontlab_skipped"])
+        self.assertNotIn("fontlab_error", reply)
+
     def test_refusals(self):
         self.fails("kerning", {"font": 7, "left": "@V", "right": "A", "resolved": True}, code="bad_args")
         self.fails("kerning", {"font": 7, "resolved": True}, code="bad_args")
@@ -2318,7 +2542,7 @@ class SaveExportTests(FontCase):
     def test_save_to_the_fonts_own_file(self):
         reply = self.ok("save_font", {"font": 7, "risky": True})
         self.assertEqual((reply["path"], reply["how"], reply["brought_forward"]),
-                         ("fixtures/Write.vfc", u"File > Save (actionSave)", True))
+                         ("fixtures/Write.vfc", u"File > Save (actionSaveFont)", True))  # (its name, live 2026-11-19)
         self.assertEqual(self.state.saved, [], "after the reply")
         self.state.fire_timers()
         self.assertEqual(self.state.saved, [self.font])
@@ -2374,24 +2598,64 @@ class OpenedPathsTests(FontCase):
         self.ok("open_font", {"path": path})
         self.state.fire_timers()
         with open(self.listener.opened_file()) as handle:
-            self.assertEqual(json.load(handle), {"pid": os.getpid(), "paths": [path]})
+            self.assertEqual(json.load(handle), {"pid": os.getpid(), "fonts": [{"id": 101, "path": path}]})
         again = fl.Listener(port=0, state_file=self.listener.state_file)
-        self.assertEqual(again.opened_paths, [path], "the same FontLab process")
+        self.assertEqual(again.opened, [{"id": 101, "path": path}], "the same FontLab process")
         self.state.fonts[-1]._f_states.append(4)
         self.listener = again
         self.ok("close_font", {"font": 101, "discard_changes": True})
         self.state.fire_timers()
-        self.assertEqual(again.opened_paths, [])
+        self.assertEqual(again.opened, [])
         with open(again.opened_file()) as handle:
-            self.assertEqual(json.load(handle)["paths"], [])
+            self.assertEqual(json.load(handle)["fonts"], [])
 
     def test_another_processs_paths_are_ignored(self):
         with open(self.listener.opened_file(), "w") as handle:
-            json.dump({"pid": os.getpid() + 1, "paths": ["elsewhere.ttf"]}, handle)
-        self.assertEqual(fl.Listener(port=0, state_file=self.listener.state_file).opened_paths, [])
+            json.dump({"pid": os.getpid() + 1, "fonts": [{"id": 7, "path": "elsewhere.ttf"}]}, handle)
+        self.assertEqual(fl.Listener(port=0, state_file=self.listener.state_file).opened, [])
         with open(self.listener.opened_file(), "w") as handle:
             handle.write("{broken")
-        self.assertEqual(fl.Listener(port=0, state_file=self.listener.state_file).opened_paths, [])
+        self.assertEqual(fl.Listener(port=0, state_file=self.listener.state_file).opened, [])
+        with open(self.listener.opened_file(), "w") as handle:  # (1.2.0's paths alone grant nothing)
+            json.dump({"pid": os.getpid(), "paths": ["elsewhere.ttf"]}, handle)
+        self.assertEqual(fl.Listener(port=0, state_file=self.listener.state_file).opened, [])
+
+    def font_file(self):
+        path = os.path.join(self.tmp, "Open.ttf")
+        with open(path, "wb") as handle:
+            handle.write(b"font")
+        return path
+
+    def test_the_same_file_opened_again_by_hand_is_not_exempt(self):
+        """Codex, 2026-11-19: the path alone stood for the font, so a font the user closed and opened again
+        by hand could have its changes thrown away without risky mode."""
+        path = self.font_file()
+        self.ok("open_font", {"path": path})
+        self.state.fire_timers()
+        self.state.drop(self.state.fonts[-1])  # (the user closes it)
+        manual = fakes.sample_font(path=path, font_id=202)  # (and opens the file again)
+        manual._f_states.append(5)
+        self.state.fonts.append(manual)
+        self.state.current = manual
+        self.state.asks_to_save.add(202)
+        self.fails("close_font", {"font": 202, "discard_changes": True}, code="risky_mode_off")
+        self.state.fire_timers()
+        self.assertIn(manual, self.state.fonts)
+        self.assertEqual(self.listener.opened, [], "the closed font forgotten")
+
+    def test_an_open_that_did_not_happen_grants_nothing(self):
+        self.state.hold_open = True
+        path = self.font_file()
+        self.state.on_modal = lambda: fl._click_modal_button("Cancel")  # (the user cancels Coordinates Rounding)
+        self.ok("open_font", {"path": path})
+        self.state.fire_timers()
+        self.assertEqual((self.state.loads, self.listener.opened), ([path], []))
+        self.state.hold_open = False
+        manual = fakes.sample_font(path=path, font_id=303)  # (then opens the file by hand)
+        manual._f_states.append(5)
+        self.state.fonts.append(manual)
+        self.state.current = manual
+        self.fails("close_font", {"font": 303, "discard_changes": True}, code="risky_mode_off")
 
 
 def _file_sddl(path):
@@ -2432,14 +2696,38 @@ class HardeningTests(ListenerCase):
             self.assertEqual(json.load(handle)["token"], self.listener.token, "still readable by its own user")
 
     def test_a_failure_to_close_it_is_reported_not_fatal(self):
-        saved = fl._owner_only
+        if os.name != "nt":
+            return
+        saved = (fl._Win32Security.descriptor, fl._owner_only)
+        fl._Win32Security.descriptor = lambda win: u"ConvertSidToStringSidW failed (error 5)"
         fl._owner_only = lambda path: u"SetFileSecurityW failed (error 5)"
         try:
             self.listener.bind()
         finally:
-            fl._owner_only = saved
-        self.assertEqual(self.ok("ping")["state_file_private"], u"SetFileSecurityW failed (error 5)")
+            fl._Win32Security.descriptor, fl._owner_only = saved
+        private = self.ok("ping")["state_file_private"]
+        self.assertIn(u"ConvertSidToStringSidW failed (error 5)", private)
+        self.assertIn(u"SetFileSecurityW failed (error 5)", private)
         self.assertTrue(os.path.isfile(self.listener.state_file))
+
+    def test_the_file_is_born_closed_to_other_accounts(self):
+        """Codex, 2026-11-19: the file was made with inherited access, and closed only afterward."""
+        if os.name != "nt":
+            return
+        path = os.path.join(self.tmp, "born.json")
+        handle, private = fl._create_private(path)
+        try:
+            self.assertIs(private, True)
+            sddl = _file_sddl(path)  # (read while nothing is written yet, the file still held open)
+            self.assertTrue(sddl.startswith(u"D:P(A;;FA;;;S-1-"), sddl)
+            self.assertEqual(sddl.count(u"(A;"), 1)
+            handle.write("{}")
+        finally:
+            handle.close()
+        with open(path) as reading:
+            self.assertEqual(reading.read(), "{}")
+        with self.assertRaises(OSError):
+            fl._create_private(path)
 
     class Peer(object):
         def __init__(self):

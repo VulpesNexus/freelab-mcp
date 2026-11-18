@@ -14,9 +14,9 @@ Some actions are worth having but can lose or overwrite the user's work, or deci
 
 | Action | Tool | Why it is risky |
 |---|---|---|
-| `close_font.discard_changes` | `close_font` | Throws away the unsaved changes of a font that `open_font` did not open. A font `open_font` opened in the same FontLab process can be closed with `discard_changes` without risky mode, as in 1.1.0. |
-| `answer_dialog` | `answer_dialog` | Clicks a button of a question FontLab is asking the user: *Coordinates Rounding*, a *Save changes* question, and so on. |
-| `open_font.answer` | `open_font` | Answers the question FontLab asks while it opens the font, such as *Coordinates Rounding*, instead of leaving it on screen. |
+| `close_font.discard_changes` | `close_font` | Throws away the unsaved changes of a font that `open_font` did not open. A font `open_font` opened in the same FontLab process (that very font, known by its id and path, and forgotten once it is closed by any means) can be closed with `discard_changes` without risky mode, as in 1.1.0. The *Don't Save* answer acts only while that close runs: a close the user cancels leaves none behind. |
+| `answer_dialog` | `answer_dialog` | Clicks a button of a question FontLab is asking the user: *Coordinates Rounding*, a *Save changes* question, and so on; only while FontLab still shows the very question described (another font's Save question is not it), else nothing is clicked. |
+| `open_font.answer` | `open_font` | Answers the question FontLab asks while it opens the font, such as *Coordinates Rounding*, instead of leaving it on screen; only while that open runs. |
 | `quit_fontlab.discard_changes` | `quit_fontlab`, `restart_fontlab` | Closes FontLab over unsaved changes and answers *Don't Save* to every *Save changes* question about a font: that work is lost. |
 | `rename_glyph.update_references` | `rename_glyph` | Rewrites kerning pairs, kerning classes, and feature code along with the name, in one History step. |
 | `delete_glyph.remove_references` | `delete_glyph` | Removes the glyph's kerning pairs and kerning class memberships along with the glyph. |

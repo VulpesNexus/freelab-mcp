@@ -39,9 +39,10 @@ mcp = FastMCP(
         "list_fonts gives each open font's id. Read tools act on the font named by font (its id, path, "
         "PostScript name, or full name), or on the font in front when none is named. Write tools need font: "
         "they never guess which font to change, and font_name (its path or name) confirms an id. Each write is one step of FontLab's History (Edit > Undo, or "
-        "the undo tool, takes it back), marks the font modified, and returns what changed; nothing is ever "
-        "saved or exported. Make a write only when the user asked for that change, and open or close a font "
-        "only when asked; close_font throws changes away only with discard_changes, in a font open_font opened. "
+        "the undo tool, takes it back), marks the font modified, and returns what changed; a write never saves "
+        "or exports (save_font and export_font do, in risky mode only). Make a write only when the user asked "
+        "for that change, and open or close a font only when asked; close_font throws changes away only with "
+        "discard_changes: in a font open_font opened, or in risky mode in any other. "
         "compile_features reports what FontLab's compiler says of a font's feature code; screenshot shows a "
         "FontLab window; read_output reads its Output panel. Reads that FontLab "
         "could not answer are listed under 'unreadable' and must not be reported as empty or zero. Outline "
@@ -199,7 +200,8 @@ async def get_glyph_outline(
     font: FontRef | None = None,
     apply_transforms: bool = False,
 ) -> dict[str, Any]:
-    """Return a glyph's shapes, contours, and nodes (x, y, type, smooth) on one layer.
+    """Return a glyph's shapes, contours, and nodes (x, y, type, smooth) on one layer. Node types: "on" for a
+    node on the outline, "curve" for a cubic (PostScript) handle, "off" for a quadratic (TrueType) point.
 
     Coordinates are shape-local; each shape's transform [m11, m12, m21, m22, dx, dy] is reported
     but not applied, unless apply_transforms=True: then each node is placed by its shape's transform (a
@@ -380,8 +382,10 @@ async def set_glyph_outline(
     master by default), one History step that Undo takes back.
 
     contours: [{"closed": true, "nodes": [{"x": 0, "y": 0, "type": "on", "smooth": false}, ...]}, ...], with
-    node types as get_glyph_outline reads them (on, off, curve; on when left out) and the coordinates of the
-    shape ([] clears it). The layer's components are left alone. A layer with no shape of its own gets a new
+    node types as get_glyph_outline reads them (on when left out): "on" is every node on the outline, "curve"
+    a cubic (PostScript) handle, two between on nodes, and "off" a quadratic (TrueType) off-curve point. smooth
+    holds only on an on node FontLab can make smooth (next to a handle), and the coordinates are the shape's
+    ([] clears it). The layer's components are left alone. A layer with no shape of its own gets a new
     one; a layer with several needs shape, the index get_glyph_outline gives the one to replace. The reply
     reads the outline back; a font that rounds coordinates rounds them (said in "rounded").
     """
@@ -407,8 +411,8 @@ async def set_feature_code(font: FontRef, tag: str, code: str, font_name: str = 
     """Set an OpenType feature's code, adding the feature when the font has none of that tag.
 
     code is the whole block as FontLab keeps it: feature liga { ... } liga; (get_features shows the current
-    one). It is stored, not compiled: FontLab compiles feature code when the font is exported, and only
-    then reports errors in it.
+    one). It is stored, not compiled: compile_features compiles it and returns the compiler's errors (FontLab
+    also compiles it when the font is exported).
     """
     return await _write("set_feature", _named(font_name, {"tag": tag, "code": code}, font))
 
@@ -433,7 +437,6 @@ async def undo(font: FontRef, expected_state: Int | None = None, expected_title:
 # -- Fonts and windows: open, close, bring to the front, compile, the Output panel, pictures ----------------
 
 POLL_S = 0.5  # how often open_font and close_font look whether FontLab has done it
-COMPILE_REREAD_S = 0.5  # compile_features reads the Output panel once more after this, in case FontLab still wrote
 
 
 def _wait_arg(wait_s: float) -> None:
@@ -560,15 +563,6 @@ async def bring_font_to_front(font: FontRef, font_name: str = "") -> dict[str, A
     return await _write("front", _named(font_name, {}, font))
 
 
-def _compile_lines(text: str) -> dict[str, Any]:
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    errors = [line for line in lines if line.startswith(("[F]", "[E]"))]
-    return {"compiled": not errors, "errors": errors, "warnings": [line for line in lines if line.startswith("[W]")]}
-
-
-FEATURES_LINE = re.compile(r'in file "features" at line (\d+)')
-
-
 @mcp.tool()
 async def compile_features(font: FontRef, font_name: str = "", keep_in_front: bool = False) -> dict[str, Any]:
     """Compile a font's OpenType feature code as the Features panel's Compile button does, and return what
@@ -578,30 +572,14 @@ async def compile_features(font: FontRef, font_name: str = "", keep_in_front: bo
     panel was never opened, it is opened through Window > Panels (opened_panels). FontLab clears its Output
     panel when it compiles.
 
-    An error that names a line of FontLab's combined "features" file is mapped to a feature (or the prefix,
-    or the Classes panel's classes) and a line within it under "located": an estimate, rebuilt from the
-    font's code, so it says certain: false.
+    An error that names a line of FontLab's combined "features" file is mapped to a feature (or the prefix)
+    and a line within it under "located", rebuilt from the font's code as FontLab was seen to put it
+    together (the prefix without the Classes panel's classes, then each feature): it says certain: false.
     """
-    reply = await _write("compile_features", _named(font_name, {"keep_in_front": keep_in_front}, font))
-    await anyio.sleep(COMPILE_REREAD_S)
-    try:
-        again = await _call("output", {"offset": 0}, timeout=10.0)
-    except RuntimeError:
-        return reply
-    if again.get("text") != reply.get("output") and not again.get("truncated"):
-        reply.update(output=again["text"], output_length=again["length"], **_compile_lines(again["text"]))
-        reply.pop("located", None)
-        reply.pop("located_all", None)
-        lines = [int(match.group(1)) for match in (FEATURES_LINE.search(e) for e in reply["errors"]) if match]
-        located = []
-        for line in lines:
-            try:
-                located.append((await _call("locate_feature_line", {"font": reply["font"]["id"], "line": line}))["located"])
-            except RuntimeError:
-                break
-        if located:
-            reply.update(located=located[0], located_all=located)
-    return reply
+    # The listener's reply is what the compiler wrote within the click (live: it compiles inside it), read before
+    # the font in front was put back. The Output panel is shared, so it is not read again here (Codex, 2026-11-19:
+    # a reread could report another compile's output as this font's).
+    return await _write("compile_features", _named(font_name, {"keep_in_front": keep_in_front}, font))
 
 
 @mcp.tool()
@@ -663,17 +641,26 @@ async def answer_dialog(button: str, expected_title: str = "", wait_s: float = 1
     asked for that answer): Coordinates Rounding on opening a font, a Save question, and so on.
 
     button is the button's text as the dialog shows it (fontlab_status and the [dialog_open] and
-    [save_prompt] errors list them); expected_title, when given, must be the dialog's title, so another
-    question that came meanwhile is not answered. The button is clicked a moment after the call, only while
-    it is still that dialog; the reply says whether it went away and what FontLab asks next, if anything.
+    [save_prompt] errors list them); expected_title, when given, must be the dialog's title. The button is
+    clicked a moment after the call, only while FontLab still shows that very question (its title, texts,
+    and buttons: a Save question about another font is not it); otherwise nothing is clicked
+    ([dialog_changed]). The reply says what FontLab asks next, if anything.
     """
     _wait_arg(wait_s)
     args = risky.require("answer_dialog", {"button": button, "expected_title": expected_title})
     reply = await _call("answer_dialog", {k: v for k, v in args.items() if v != ""})
     asked = _dialog_seen(reply["dialog"])
     deadline = time.monotonic() + wait_s
+    outcome = None
     while time.monotonic() < deadline:
         await anyio.sleep(POLL_S)
+        if outcome is None and reply.get("answer_id") is not None:
+            outcome = (await _call("answer_result", {"answer_id": reply["answer_id"]}, timeout=10.0))["outcome"]
+            if outcome is None:
+                continue
+            if outcome != "clicked":
+                raise RuntimeError(f"[dialog_changed] Nothing was clicked: by the time of the click FontLab no longer "
+                                   f"showed {_question(reply['dialog'])} ({outcome.replace('_', ' ')}).")
         now = await _open_dialog()
         if _dialog_seen(now) != asked:
             return {"answered": True, "button": reply["answering"], "dialog": reply["dialog"], "next_dialog": now}
@@ -845,6 +832,8 @@ async def quit_fontlab(wait_s: float = 60.0, discard_changes: DiscardAll = False
         await anyio.sleep(1.0)
         question = await _open_dialog()
         if question is not None:
+            if question.get("class") == WELCOME_CLASS:
+                continue  # (the listener closes FontLab's Welcome window with the main window: it holds no work)
             if discard_changes and question.get("class") == SAVE_PROMPT_CLASS:
                 continue  # (the listener answers it Don't Save)
             code = "save_prompt" if question.get("class") == SAVE_PROMPT_CLASS else "dialog_open"
@@ -861,6 +850,7 @@ async def quit_fontlab(wait_s: float = 60.0, discard_changes: DiscardAll = False
 
 
 SAVE_PROMPT_CLASS = "DlgClosePackage"  # FontLab 7.2's "Save changes to ... before closing?"
+WELCOME_CLASS = "DlgInitialize"  # FontLab 7.2's Welcome window, modal from a launch with no font (live)
 
 
 async def _windows_left() -> dict[str, Any] | None:

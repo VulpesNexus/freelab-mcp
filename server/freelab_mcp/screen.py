@@ -4,7 +4,7 @@ FontLab's own Qt picture (screenshot source="qt", QWidget.grab) shows what Qt dr
 for the window through user32's PrintWindow with PW_RENDERFULLCONTENT, so it shows what Qt's picture may
 not (native title bars, a window FontLab's main thread is too busy to draw for a grab). FontLab is found by
 the process id its listener records in its state file. Windows only; the PNG is written with zlib and struct.
-Not yet proven live (docs/FONTLAB7-API.md).
+Proven live at 100 % display scaling (docs/FONTLAB7-API.md); above it, not yet.
 """
 
 from __future__ import annotations
@@ -182,15 +182,22 @@ class _Win32:
         screen = user32.GetDC(None)
         if not screen:
             raise CaptureError("failed", "Windows gave no device context for the screen.")
-        made: list[tuple[Callable[[Any], Any], Any]] = []
+        # Each object is registered as soon as it exists; at the end every bitmap is selected out of its DC
+        # before anything is deleted (a bitmap still selected cannot be deleted, and leaked when PrintWindow
+        # failed: Codex, 2026-11-19), then the bitmaps, then the DCs.
+        bitmaps: list[Any] = []
+        dcs: list[Any] = []
+        selected: list[tuple[Any, Any]] = []  # (dc, the object it held before)
         try:
             full_dc = gdi32.CreateCompatibleDC(screen)
-            made.append((gdi32.DeleteDC, full_dc))
+            if full_dc:
+                dcs.append(full_dc)
             full = gdi32.CreateCompatibleBitmap(screen, width, height)
+            if full:
+                bitmaps.append(full)
             if not full_dc or not full:
                 raise CaptureError("failed", "Windows could not make a bitmap of the window's size.")
-            made.append((gdi32.DeleteObject, full))
-            old_full = gdi32.SelectObject(full_dc, full)
+            selected.append((full_dc, gdi32.SelectObject(full_dc, full)))
             if not user32.PrintWindow(hwnd, full_dc, PW_RENDERFULLCONTENT):
                 raise CaptureError("failed", "Windows did not draw the window (PrintWindow failed, error %d)." %
                                    ctypes.get_last_error())
@@ -198,24 +205,27 @@ class _Win32:
             info = ctypes.create_string_buffer(header, 40 + 16)  # (BITMAPINFO: the header, then room for colors)
             bits = ctypes.c_void_p()
             out_dc = gdi32.CreateCompatibleDC(screen)
-            made.append((gdi32.DeleteDC, out_dc))
-            out = gdi32.CreateDIBSection(out_dc, info, DIB_RGB_COLORS, ctypes.byref(bits), None, 0)
+            if out_dc:
+                dcs.append(out_dc)
+            out = gdi32.CreateDIBSection(out_dc, info, DIB_RGB_COLORS, ctypes.byref(bits), None, 0) if out_dc else None
+            if out:
+                bitmaps.append(out)
             if not out_dc or not out or not bits.value:
                 raise CaptureError("failed", "Windows could not make the picture's bitmap.")
-            made.append((gdi32.DeleteObject, out))
-            old_out = gdi32.SelectObject(out_dc, out)
+            selected.append((out_dc, gdi32.SelectObject(out_dc, out)))
             gdi32.SetStretchBltMode(out_dc, HALFTONE)
             gdi32.SetBrushOrgEx(out_dc, 0, 0, None)
             ok = gdi32.StretchBlt(out_dc, 0, 0, out_width, out_height, full_dc, 0, 0, width, height, SRCCOPY)
             gdi32.GdiFlush()
-            data = ctypes.string_at(bits.value, out_width * out_height * 4) if ok else None
-            gdi32.SelectObject(out_dc, old_out)
-            gdi32.SelectObject(full_dc, old_full)
-            if data is None:
+            if not ok:
                 raise CaptureError("failed", "Windows could not copy the window's picture (StretchBlt failed).")
-            return data
+            return ctypes.string_at(bits.value, out_width * out_height * 4)
         finally:
-            for release, handle in reversed(made):
-                if handle:
-                    release(handle)
+            for dc, previous in reversed(selected):
+                if previous:
+                    gdi32.SelectObject(dc, previous)
+            for bitmap in reversed(bitmaps):
+                gdi32.DeleteObject(bitmap)
+            for dc in reversed(dcs):
+                gdi32.DeleteDC(dc)
             user32.ReleaseDC(None, screen)

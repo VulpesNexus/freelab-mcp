@@ -1,6 +1,7 @@
 """MCP server tests: the real server and client against the real listener on spy fakes (Python 3)."""
 
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -495,7 +496,45 @@ class RiskyToolTests(WindowCase):
     def test_compile_errors_are_located(self):
         self.state.compiler = lambda font: u'[F] Fatal error in font "W" in file "features" at line 8\n'
         reply = asyncio.run(server.compile_features(7))
-        self.assertEqual((reply["located"]["tag"], reply["located"]["line_in_feature"]), ("ss01", 2))
+        self.assertEqual((reply["located"]["tag"], reply["located"]["line_in_feature"]), ("ss01", 3))
+
+    def test_compile_keeps_what_the_listener_read(self):
+        """Codex, 2026-11-19: the server read the shared Output panel again after the compile, and could report
+        another compile's output (the user's, of the font put back in front) as this font's."""
+        self.state.compiler = lambda font: u"[F] original compile failed\n" if font is self.font else u""
+        ops = []
+        saved = server._call
+
+        async def watching(op, args=None, timeout=server.DEFAULT_TIMEOUT_S):
+            ops.append(op)
+            reply = await saved(op, args, timeout)
+            if op == "compile_features":
+                self.state.output = u""  # (the user compiles the restored font meanwhile)
+            return reply
+        server._call = watching
+        try:
+            reply = asyncio.run(server.compile_features(7))
+        finally:
+            server._call = saved
+        self.assertEqual((reply["compiled"], reply["errors"], reply["font"]["id"]),
+                         (False, ["[F] original compile failed"], 7))
+        self.assertEqual(ops, ["compile_features"], "the Output panel is not read again")
+
+    def test_an_answer_to_a_question_gone_meanwhile_clicks_nothing(self):
+        asyncio.run(server.set_risky_mode(True))
+        self.state.ask(u"Coordinates Rounding", buttons=[u"OK", u"Cancel"], text=u"Round the coordinates?")
+        saved, seen = fl._modal_dialog, []
+
+        def first_only():
+            seen.append(1)
+            return saved() if len(seen) == 1 else None  # (gone by the time of the click)
+        fl._modal_dialog = first_only
+        try:
+            with self.assertRaisesRegex(RuntimeError, r"\[dialog_changed\] Nothing was clicked.*dialog gone"):
+                asyncio.run(server.answer_dialog("OK", wait_s=5))
+        finally:
+            fl._modal_dialog = saved
+        self.assertEqual(self.state.answers, [])
 
     def test_screenshot_from_the_screen(self):
         seen = []
@@ -573,6 +612,52 @@ class ScreenTests(unittest.TestCase):
         self.assertEqual((about["width"], about["height"]), (100, 50))
         self.assertEqual(calls, ["aware", (400, 200, 100, 50), ("restore", 17)])
         self.assertEqual(data[:8], b"\x89PNG\r\n\x1a\n")
+
+    def gdi(self, fail):
+        """_Win32.print_window over a fake user32 and gdi32 that log each call; fail names the call that fails."""
+        import ctypes
+        log = []
+        handles = iter(range(100, 200))
+
+        class Dll(object):
+            def __getattr__(self, name):
+                def call(*args):
+                    log.append((name,) + tuple(a for a in args if isinstance(a, int)))
+                    if name == fail:
+                        return 0
+                    if name in ("GetDC", "CreateCompatibleDC", "CreateCompatibleBitmap", "SelectObject"):
+                        return next(handles)
+                    if name == "CreateDIBSection":
+                        args[3]._obj.value = 1
+                        return next(handles)
+                    return 1
+                return call
+        api = object.__new__(server.screen._Win32)
+        api.ctypes, api.user32, api.gdi32 = ctypes, Dll(), Dll()
+        saved = ctypes.string_at
+        ctypes.string_at = lambda address, size: b"\x00" * size
+        try:
+            with self.assertRaises(server.screen.CaptureError) if fail else contextlib.nullcontext():
+                api.print_window(5, 4, 4, 2, 2)
+        finally:
+            ctypes.string_at = saved
+        return log
+
+    def test_every_gdi_object_is_released_after_its_bitmap_is_selected_out(self):
+        """Codex, 2026-11-19: a failed PrintWindow left the full-size bitmap selected in its DC when it was
+        deleted, so it leaked."""
+        for fail in ("PrintWindow", "CreateDIBSection", "StretchBlt", "CreateCompatibleDC", None):
+            log = self.gdi(fail)
+            names = [entry[0] for entry in log]
+            made = [entry for entry in log if entry[0] in ("CreateCompatibleDC", "CreateCompatibleBitmap",
+                                                           "CreateDIBSection")]
+            deleted = [entry for entry in log if entry[0] in ("DeleteObject", "DeleteDC")]
+            self.assertEqual(len(deleted), len([m for m in made if m[0] != fail]), (fail, log))
+            if "SelectObject" in names:
+                selects = [i for i, n in enumerate(names) if n == "SelectObject"]
+                self.assertLess(max(selects), names.index("DeleteObject"), (fail, "selected out before deleted"))
+                self.assertEqual(len(selects) % 2, 0, (fail, "each selection undone"))
+            self.assertEqual(names[-1], "ReleaseDC", fail)
 
 
 class ClientLimitTests(unittest.TestCase):

@@ -108,6 +108,19 @@ class flNode(Native):
         object.__setattr__(self, "y", y)
         object.__setattr__(self, "type", kind)
         object.__setattr__(self, "smooth", smooth)
+        object.__setattr__(self, "_f_contour", None)
+
+    def __setattr__(self, name, value):
+        """FontLab keeps smooth only on a node on the outline with a handle beside it (live, 2026-11-19:
+        canBeSmooth false, and smooth read back false, on a node between two lines, even a straight one)."""
+        contour = object.__getattribute__(self, "_f_contour")
+        if name == "smooth" and value and contour is not None:
+            nodes = contour._f_nodes
+            i = nodes.index(self)
+            neighbors = [nodes[j % len(nodes)] for j in (i - 1, i + 1) if contour.closed or 0 <= j < len(nodes)]
+            if self.type != "on" or all(n.type == "on" for n in neighbors):
+                return
+        Native.__setattr__(self, name, value)
 
 
 class flContour(Native):
@@ -117,6 +130,8 @@ class flContour(Native):
     def __init__(self, nodes, closed=True):
         object.__setattr__(self, "_f_nodes", list(nodes))
         object.__setattr__(self, "closed", closed)
+        for node in self._f_nodes:
+            object.__setattr__(node, "_f_contour", self)
 
     def nodes(self):
         return list(self._f_nodes)
@@ -405,10 +420,22 @@ class fgFeatures(Native):
                 return
         self._f_features.append((tag, code))
 
+    def _f_class_lines(self):
+        owner = getattr(self, "_f_owner", None)
+        return [u"@%s = [%s];" % (name, u" ".join(glyphs)) for name, glyphs in (owner._f_classes if owner else [])]
+
     def get_prefix(self):
-        return self._f_prefix
+        """The prefix after one line per class of the Classes panel (live, 2026-11-19)."""
+        lines = self._f_class_lines()
+        return u"".join(line + u"\n" for line in lines) + self._f_prefix
 
     def set_prefix(self, code):
+        """Given back with the Classes panel's lines at its start, or without them, the prefix is the same
+        (live): FontLab writes those lines from the panel."""
+        lines = self._f_class_lines()
+        head = u"".join(line + u"\n" for line in lines)
+        if lines and code.startswith(head):
+            code = code[len(head):]
         object.__setattr__(self, "_f_prefix", code)
 
     def remove(self, tag):
@@ -577,6 +604,7 @@ class flPackage(Native):
         object.__setattr__(self, "versionMinor", 0)
         object.__setattr__(self, "hasChanges", False)
         object.__setattr__(self, "fgPackage", fgFont([g.name for g in glyphs], self, font_id, features))
+        object.__setattr__(self.fgPackage.features, "_f_owner", self)
         object.__setattr__(self, "isNull", False)
         object.__setattr__(self, "_f_kerning", dict(kerning or {}))
         object.__setattr__(self, "_f_classes", list(classes))  # feature classes: (name, glyph names)
@@ -775,6 +803,7 @@ class FontLabState(object):
         self.exports = []  # (package, the ExportControl's values) of every exportFont
         self.export_writes = True  # False: an export writes no file
         self.saved = []  # the fonts File > Save saved (the font in front)
+        self.on_modal = None  # what the user does once a modal question shows (modal), then None
 
     def ask(self, title, kind=u"QDialog", buttons=(u"OK",), text=u"", then=None):
         """FontLab shows a question (a modal dialog other than the Save one)."""
@@ -782,12 +811,28 @@ class FontLabState(object):
         self.question_text, self.question_then = text, then
 
     def fire_timers(self, up_to_ms=None):
-        """Run the QTimer.singleShot callbacks due by up_to_ms (all, when None), in the order they are due."""
+        """Run the QTimer.singleShot callbacks due by up_to_ms (all, when None), in the order they are due. One
+        that a modal loop inside an earlier one ran already (modal) is not run again; one added meanwhile waits
+        for the next call."""
         due = sorted([t for t in self.timers if up_to_ms is None or t[0] <= up_to_ms], key=lambda t: t[0])
         for timer in due:
+            if timer in self.timers:
+                self.timers.remove(timer)
+                timer[1]()
+
+    def modal(self, showing):
+        """FontLab's modal question loop (live: the call that shows it returns once it is answered, and timers
+        fire inside it): on_modal (the user's doing, once), then the timers waiting, in the order they are
+        due, while showing() holds. The fake cannot wait for a user: it returns when no timer is left."""
+        if self.on_modal is not None and showing():
+            hook, self.on_modal = self.on_modal, None
+            hook()
+        for _turn in range(200):
+            if not showing() or not self.timers:
+                return
+            timer = sorted(self.timers, key=lambda t: t[0])[0]
             self.timers.remove(timer)
-        for _delay, callback in due:
-            callback()
+            timer[1]()
 
     def window_tabs(self):
         if self.tabs is not None:
@@ -839,6 +884,8 @@ def _notify(state, title, objects, recursive):
     if state.fail_history == "always" or state.fail_history == ("before" if before else "step"):
         raise RuntimeError("History refused")
     items = objects if isinstance(objects, list) else [objects]
+    if isinstance(items[0], flPackage) and items[0] is not state.current:
+        title = u""  # (FontLab titles a step only for the font in front: live, 2026-11-19)
     state.steps.append((title, list(items)))
     state.history.append((title, list(items)))
     state.redo = []
@@ -932,9 +979,10 @@ def install(state):
                 font = sample_font(path=path, font_id=font_id)
                 state.fonts.append(font)
                 state.current = font
-            if state.hold_open:  # (Coordinates Rounding: the font opens once it is answered)
+            if state.hold_open:  # (Coordinates Rounding: the font opens once it is answered, inside this call)
                 state.ask(u"Coordinates Rounding", buttons=[u"OK", u"Cancel"], text=u"Round the coordinates to whole units?",
                           then=lambda button: load() if button == u"OK" else None)
+                state.modal(lambda: state.question is not None)
                 return
             load()
 
@@ -1024,8 +1072,9 @@ def install_qt(state):
     class CloseFonts(QAction):
         objectName = "actionClose_Fonts"
 
-        def trigger(self):
+        def trigger(self):  # (returns once FontLab's Save question is answered: live)
             state.close_current()
+            state.modal(lambda: state.prompt is not None)
 
     class Panel(QAction):
         """Window > Panels > a panel: checked while it is shown; choosing it makes it."""
@@ -1041,9 +1090,9 @@ def install_qt(state):
             state.panels_chosen.append(self.objectName)
             setattr(state, self.flag, not getattr(state, self.flag))
 
-    class Save(QAction):
-        objectName = "actionSave"
-        text = u"&Save"
+    class Save(QAction):  # (File > Save Font, live 2026-11-19)
+        objectName = "actionSaveFont"
+        text = u"&Save Font..."
 
         def trigger(self):
             state.saved.append(state.current)
