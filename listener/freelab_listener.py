@@ -756,6 +756,7 @@ def _top_windows(app):
 
 
 _MNEMONIC = re.compile(r"&(.)")
+_LINE_TAGS = re.compile(r"<br\s*/?>|</?p(?:\s[^>]*)?>|</?div(?:\s[^>]*)?>|</li\s*>", re.I)
 _RICH = re.compile(r"^[^\n]*<[A-Za-z!/][^>]*>")  # a tag before the first line break: Qt's mightBeRichText, roughly
 _ENTITIES = ((u"&lt;", u"<"), (u"&gt;", u">"), (u"&quot;", u'"'), (u"&#39;", u"'"), (u"&nbsp;", u" "), (u"&amp;", u"&"))
 
@@ -768,7 +769,9 @@ def _label_text(label):
     except Exception:
         text_format = 2
     if text_format == 1 or (text_format == 2 and _RICH.search(text)):
-        text = _TAGS.sub(u"", text)
+        # (a line break, or a paragraph's end, is a line of its own: lines ran together, live, 2026-11-19)
+        text = _TAGS.sub(u"", _LINE_TAGS.sub(u"\n", text))
+        text = u"\n".join(line.strip() for line in text.split(u"\n") if line.strip())
         for entity, character in _ENTITIES:
             text = text.replace(entity, character)
     return text.strip()
@@ -3338,9 +3341,10 @@ def _entry_words(text):
     """A menu entry's or a choice's text as compared: no mnemonic, no shortcut after a tab, no closing
     ellipsis, a curly apostrophe as a straight one, case ignored."""
     text = _MNEMONIC.sub(r"\1", _text(text or u"")).split(u"\t")[0].replace(u"\u2019", u"'").strip()
-    for tail in (u"\u2026", u"..."):
+    for tail in (u"\u2026", u"...", u"."):  # (a caption that is a sentence ends with its period: found without it)
         if text.endswith(tail):
             text = text[:-len(tail)].rstrip()
+            break
     return u" ".join(text.split()).lower()
 
 
@@ -3633,6 +3637,13 @@ def _walk_controls(window):
             if kind is not None:
                 if not _object_name(child).startswith(u"qt_"):  # (Qt's own parts: a tab widget's bar)
                     found.append(_Control(child, kind, context))
+                if kind in ROW_KINDS and depth < MAX_DEPTH:
+                    # A list's cells may hold controls of their own (setItemWidget: a dropdown in each row, as
+                    # FreeLab's Feature Code has): they are the viewport's children, named after the list
+                    segment = _object_name(child) or kind
+                    for inner in _try(lambda: _real_list(child.children(), "children()"), []):
+                        if _try(lambda: _object_name(inner) == u"qt_scrollarea_viewport", False):
+                            visit(inner, context + [segment], depth + 1)
                 continue
             segment = None
             if holder == "group":

@@ -92,7 +92,7 @@ The rows below are new in 1.2.0, proven live on 2026-11-19 in FontLab 7.2.0 on t
 
 ## The window tools (1.3.0)
 
-New in 1.3.0 ([WINDOW-TOOLS.md](WINDOW-TOOLS.md)), and **stub-tested only**: the spy fakes of *tests/widgetfakes.py* allow these members and no other, but none has run in FontLab yet. Several are already used live by FreeLab Script Suite (the suite column), which makes them likely, not proven.
+New in 1.3.0 ([WINDOW-TOOLS.md](WINDOW-TOOLS.md)). The spy fakes of *tests/widgetfakes.py* allow these members and no other; **live** since 2026-11-19, driving a whole FreeLab Script Suite workflow (below, *The window tools, found live*), but for the rows marked otherwise there.
 
 | Object | Member | Used by | Suite |
 |---|---|---|---|
@@ -215,6 +215,22 @@ FontLab 7.2.0, test fonts from the corpus, never saved over their files; the che
 - **The fonts `open_font` opened are held by id** (Codex's finding, fixed): Cardo was recorded once it had opened and forgotten once closed; Tinos, opened by `requestLoadingFont` alone, was refused `discard_changes` outside risky mode. A copy saved under another path (a UFO saved as `.vfc`) is no longer the font recorded, and needs risky mode too.
 - **FontLab's own buttons** read their text with `text()` and pad it (*" Cancel "*); labels are rich text, with `&quot;` for the quotes around a font's name.
 
+## The window tools, found live (2026-11-19)
+
+FontLab 7.2.0, the listener 1.3.0 with Codex's review fixes, FreeLab Script Suite following every convention of [WINDOW-TOOLS.md](WINDOW-TOOLS.md), test fonts from the corpus (Bellefair; IBM Plex Sans JP for CJK Spacing; Tinos and BIZ UDPGothic), never saved over their files. Every action went through the window tools; `run_python` only read diagnostics. The workflow: *Scripts > FreeLab > Font Check* (`run_menu_command`), its *Check*, its findings (`read_list`, 152 rows) and log (`read_text`, with links), its *Glyph Compose* link (`click_link`), Glyph Compose's *Diacritics* tab (`set_value` on a tab bar), four rows ticked (`set_value` with `row`) and built, *Edit > Undo Freelab Glyph Compose* (`run_menu_command`), the tools button's *Feature Code* (`click` with `entry`), a form feature ticked and written, the *Next tool* arrow to Feature Check and its *Check*, Auto Spacing (analyzed, a glyph spaced), its log's *Auto Kerning* link, Auto Kerning (a dropdown set, analyzed, two pairs written), Kerning Check, Proof (a page chosen, its preview drawn), and Font Builder; Proof's *Save PDF…* and Font Builder's *Save template...* were refused outside risky mode (`risky_command`, marked `mcpRisky`).
+
+- **Emitting a signal by calling it** reaches the script's slots: `anchorClicked(QUrl)` (Font Check's and Auto Spacing's log links opened Glyph Compose and Auto Kerning), a view's `clicked(QModelIndex)` with `setCurrentIndex` (Proof drew the page chosen; Auto Spacing selected its row), `QComboBox.activated(int)` with `setCurrentIndex` (Proof's page size, Auto Kerning's pair set), and `setData(index, 2, CheckStateRole)` the tree's `itemChanged` (Glyph Compose, Feature Code, Auto Spacing, and Auto Kerning counted the ticks and enabled their writes). `editingFinished()`, `textEdited`, `QLabel.linkActivated`, and `doubleClicked` were not exercised.
+- **`QAbstractButton.click()` from a timer** runs the slot, toggles a check box (Font Builder's *lacking*, CJK Spacing's *halt_box*), and the suite's tools button (`InstantPopup`) lists `click_needs_entry`; its entries opened each tool in the window's place. The arrows (*Next tool*) were clicked by their accessible names.
+- **One wrapper per Qt object**: `topLevelWidgets()` gave the same Python object for the main window at two calls (`is`), and `property` of an unset dynamic property is `None`.
+- **`mcpBusy`** reads back as the step's text (*Listing*, Font Check's) while the work runs and `False` after; `wait_idle` waited on it, answering while the work let its events through.
+- **A modal dialog during an action**: *Scripts > FreeLab > Dark Mode Settings* left its `run_menu_command` running while *FreeLab Dark Mode* (marked `mcpScriptWindow`) waited; `wait_idle` returned it as a script's dialog (`question: false`), and a click on its *Cancel* ran inside its loop and let the first action end. FontLab's *Welcome to FontLab 7!* (`DlgInitialize`) and *Restore Autosaved Fonts* (`DlgWarning`, after a crash) are questions: risky mode, and `answer_dialog`, closed them.
+- **Menus**: *Scripts > FreeLab* listed the suite's 17 commands without being opened; `trigger()` from the listener's timer ran each script as the menu does. *Edit*'s first entry carries the step's title (*Undo Freelab Glyph Compose*), so its path changes with the History.
+- **The main window's walk**: 203 shown controls in 0.2 s, addresses such as *Bellefair Regular > Font window sidebar > button*.
+- **The model calls**: `QModelIndex()` as the root, `flags()` as an int (61), `QPersistentModelIndex` exists in PythonQt's QtCore and follows a row (a row taken out and put back is a new row: the persistent index goes invalid, so an action on it is refused).
+- **FontLab's own windows**: no floating window of FontLab's showed a progress bar while idle.
+- **A clipboard another program holds makes FontLab stall without working**: `OpenClipboard` refused (error 5) in FontLab and outside it, one `QClipboard.mimeData()` took 4.35 s, and FontLab stopped answering for 20 to 60 s at a time with no CPU used (opening a font, opening a tool window, each History step: 8.7 s an *Undo*). The listener then refuses connections once its queue of 8 is full; `wait_idle` now waits through that while FontLab runs.
+- **`requestLoadingFont` of *NotoSansJP[wght].ttf* crashed FontLab** twice, and once that morning (an access violation in *FontLab 7.exe* at +0x191A03E to +0x191A158, with the listener's `load` the only Python frame): FontLab's own load, not a script's read during it.
+
 ## Not yet proven live
 
 - **`screenshot` with `source="screen"` above 100 % display scaling**: the display was at 100 %, and the owner's display settings are not changed for a test.
@@ -224,21 +240,11 @@ FontLab 7.2.0, test fonts from the corpus, never saved over their files; the che
 - **`set_prefix` inside a rename**: no test font named a candidate glyph in its prefix outside the *Classes* panel's lines.
 - **The state file against another account**: born with one entry (`icacls`); a second account holding it open was not tried.
 
-### The window tools (1.3.0), to prove live
+### The window tools (1.3.0), still to prove live
 
-Each to be proven by driving a whole FreeLab Script Suite workflow through the tools, on a disposable test font:
-
-- **Emitting a signal by calling it**, as PythonQt's documentation says: `QComboBox.activated(i)` (with its two overloads, `int` and `QString`), `editingFinished()`, `textEdited(text)`, `QTextBrowser.anchorClicked(QUrl)`, `QLabel.linkActivated(href)`, and a view's `clicked`, `doubleClicked`, and `activated(QModelIndex)`, each reaching the script's slot (the suite connects them by signature: `activated(int)`, `anchorClicked(QUrl)`, `itemDoubleClicked(QTreeWidgetItem*,int)` through the tree's own `doubleClicked`).
-- **`QAbstractButton.click()`** from a timer: the slot runs, a check box toggles (`toggled(bool)` too), and a tool button whose menu shows at the press (`InstantPopup`) is never clicked; a push button with a menu is never clicked either.
-- **One wrapper per Qt object**: `activeModalWidget()` and `topLevelWidgets()` give the same Python object for a window (`is` or `==`), as do a label's `buddy()` and a layout's `itemAt(i).widget()` for a control; the re-check when a timer fires depends on it.
-- **`property(name)` of an unset dynamic property is `None`**, and a property set from Python (`setProperty("mcpBusy", True)`, a text) reads back as a `bool` or a text.
-- **`isWindow()`** of a dialog a window parents is true, so the walk leaves it out; a floating panel is a top-level window that inherits `QDockWidget`.
-- **A walk of FontLab's main window** (`list_window_controls("main")`, thousands of widgets) stays under a second or so, and under `MAX_WALK`; the panels' addresses read well (*Features > Compile features … > button*).
-- **The model calls** on the suite's `QTreeWidget`s and `QTableView`s: `QtCore.QModelIndex()` as the root, `data()` giving text or `None`, `flags()` convertible with `int()`, `setData(index, 2, Qt.CheckStateRole)` emitting `itemChanged`, and `setCurrentIndex(index)` selecting the row (`itemSelectionChanged`).
-- **Busy and idle**: the suite's busy bar (`freelabBusyBar`, a `QProgressBar` shown only while it works) is seen as busy and then idle; its input guard does not stop the listener's sockets and timers, so `wait_idle` gets answers while the work runs; a click whose work pumps events leaves the action `running` until the work is over.
-- **A modal dialog during an action**: a suite question (`QMessageBox.exec_()`) shown by a click is the active modal widget; `wait_idle` returns it, and a `click` on it (with `mcpScriptWindow` set on it) runs inside its loop and lets the first action end.
-- **Menus**: the main window's `QMenuBar` is found by `findChildren`; *Scripts > FreeLab* lists the suite's commands without being opened first (FontLab may build it as it opens: then `list_menu` says so), and `trigger()` on one, from the listener's timer, runs the script as the menu does (FontLab's script runner with the listener's frames on the stack: its module globals keep `__builtins__`).
-- **FontLab's own windows**: whether a floating window of FontLab's (not a panel) shows a progress bar while idle (it would be taken for busy), and what classes FontLab's questions have (`DlgClosePackage` and *Coordinates Rounding* are questions whatever their class: any modal dialog is).
+- **The signals not yet emitted live**: `editingFinished()` (a spin box or field set), `textEdited(text)`, `QLabel.linkActivated(href)`, and a view's `doubleClicked` and `activated`.
+- **A floating panel**: a top-level window that inherits `QDockWidget`, and whether `isWindow()` of a dialog a window parents keeps it out of the walk.
+- **The controls in a list's cells** (`setItemWidget`: Feature Code's ligature dropdowns), walked since the live run, on fakes only.
 
 ### A font with no window tab (candidates)
 

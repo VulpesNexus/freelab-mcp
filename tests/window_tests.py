@@ -658,5 +658,32 @@ class ReviewRoundTwoTests(WindowCase):
         self.assertLessEqual(reads[1], 4 * reads[0] + 10, "linear: %r" % reads)
 
 
+class LiveRunTests(WindowCase):
+    """Found driving FreeLab Script Suite live (2026-11-19)."""
+
+    def test_a_rich_labels_lines_stay_lines(self):
+        self.tool.top._f_set(text=u"<b>1,002 languages</b> covered.<br>3 languages count marks.<p>No script</p>is whole.")
+        self.assertEqual(self.ok("read_text", {"window": TITLE, "control": "label#1"})["text"],
+                         u"1,002 languages covered.\n3 languages count marks.\nNo script\nis whole.")
+
+    def test_a_caption_that_is_a_sentence_is_found_without_its_period(self):
+        box = W.Widget("QCheckBox", name=u"lacking", text=u"Leave out the glyphs the font has drawn.")
+        self.tool.page1._f_add(box)
+        self.assertEqual(self.act("set_value", {"window": TITLE, "control": u"Leave out the glyphs the font has drawn",
+                                                "value": True})["result"], {"before": False, "after": True})
+
+    def test_the_controls_in_a_lists_cells(self):
+        combos = [W.Widget("QComboBox", items=[u"Standard", u"Discretionary", u"Off"], currentIndex=0) for _ in range(2)]
+        viewport = W.Widget("QWidget", combos, name=u"qt_scrollarea_viewport")
+        tree = W.view("QTreeWidget", [W.Row(u"fi"), W.Row(u"fl")], name=u"ligature_tree")
+        tree._f_add(viewport)
+        self.tool.page1._f_add(tree)
+        controls = self.controls()
+        self.assertIn(u"ligature_tree > combo#2", controls)
+        self.assertEqual(self.act("set_value", {"window": TITLE, "control": u"ligature_tree > combo#2", "value": u"Off"})["result"],
+                         {"before": u"Standard", "after": u"Off"})
+        self.assertEqual(combos[1]._f_emitted, [("currentIndexChanged", 2), ("activated", 2)])
+
+
 if __name__ == "__main__":
     unittest.main()

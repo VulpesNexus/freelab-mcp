@@ -935,6 +935,14 @@ async def run_menu_command(path: str, wait_s: float = 2.0) -> dict[str, Any]:
     return await _act("run_menu_command", {"path": path}, wait_s)
 
 
+def _fontlab_still_runs() -> bool:
+    """Whether FontLab's process still runs (a refused connection is then FontLab's work, not its end)."""
+    try:
+        return launcher.fontlab_running()
+    except Exception:
+        return False
+
+
 @mcp.tool()
 async def wait_idle(window: str = "", timeout_s: float = 60.0, settle_s: float = 0.5) -> dict[str, Any]:
     """Wait until FontLab's windows are idle: no action of these tools queued or running, no window busy (its
@@ -958,7 +966,10 @@ async def wait_idle(window: str = "", timeout_s: float = 60.0, settle_s: float =
             state = await _call("window_state", {"window": bound} if bound else {}, timeout=5.0)
             silent = False
         except RuntimeError as exc:
-            if not str(exc).startswith("[timeout]"):
+            # A listener held by FontLab's work stops accepting connections once its queue is full (each poll that
+            # timed out left one there): refused while FontLab still runs is the same silence (live, 2026-11-19)
+            if not str(exc).startswith("[timeout]") and not (
+                    str(exc).startswith("[not_running]") and await anyio.to_thread.run_sync(_fontlab_still_runs)):
                 raise
             state, silent = None, True  # (FontLab works without letting its events through: not idle)
             idle_since = None  # (idle must be seen again, held for settle_s, once FontLab answers)

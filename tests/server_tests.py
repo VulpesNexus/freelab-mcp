@@ -1025,9 +1025,12 @@ class WaitIdleReviewTests(unittest.TestCase):
 
         async def sleep(seconds):
             clock.now += seconds
+
+        async def run_sync(func):
+            return func()
         with mock.patch.object(server, "_call", call), \
                 mock.patch.object(server, "time", SimpleNamespace(monotonic=lambda: clock.now)), \
-                mock.patch.object(server, "anyio", SimpleNamespace(sleep=sleep)):
+                mock.patch.object(server, "anyio", SimpleNamespace(sleep=sleep, to_thread=SimpleNamespace(run_sync=run_sync))):
             return asyncio.run(server.wait_idle(**kwargs)), clock
 
     @staticmethod
@@ -1057,6 +1060,22 @@ class WaitIdleReviewTests(unittest.TestCase):
         result, clock = self.run_wait(answer, window="A", timeout_s=20, settle_s=0.5)
         self.assertTrue(result["idle"])
         self.assertGreaterEqual(clock.calls, 4, "the idle seen before the silence did not count")
+
+    def test_a_refused_connection_while_fontlab_runs_is_silence(self):
+        # (live, 2026-11-19: FontLab held by a locked clipboard; each poll that timed out stayed in the listener's
+        # queue until it refused connections, and wait_idle gave up although FontLab came back)
+        from unittest import mock
+
+        def answer(clock, args):
+            if clock.calls <= 3:
+                clock.now += 5
+                raise RuntimeError("[not_running] The FreeLab listener refused the connection: ...")
+            return self.idle()
+        with mock.patch.object(server, "_fontlab_still_runs", lambda: True):
+            result, clock = self.run_wait(answer, window="A", timeout_s=60, settle_s=0)
+        self.assertTrue(result["idle"])
+        with mock.patch.object(server, "_fontlab_still_runs", lambda: False), self.assertRaises(RuntimeError):
+            self.run_wait(answer, window="A", timeout_s=60, settle_s=0)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 An MCP server that lets an AI app such as Claude Code read the fonts open in FontLab 7, make a small set of undoable edits to them, and start and close FontLab when asked.
 
-**Status: 1.3.0.** Every tool of 1.2.0 was proven live in FontLab 7.2 on test fonts (TrueType and CFF, multiple masters, Japanese, Arabic, and Hebrew); the window tools, new in 1.3.0, are tested on fakes only so far. [docs/FONTLAB7-API.md](docs/FONTLAB7-API.md) tracks each FontLab call, how far it is proven, and what is not yet.
+**Status: 1.3.0.** Every tool of 1.2.0 was proven live in FontLab 7.2 on test fonts (TrueType and CFF, multiple masters, Japanese, Arabic, and Hebrew); the window tools, new in 1.3.0, drove a whole FreeLab Script Suite workflow live on 2026-11-19, a few calls still proven on fakes only. [docs/FONTLAB7-API.md](docs/FONTLAB7-API.md) tracks each FontLab call, how far it is proven, and what is not yet.
 
 FreeLab Script Suite, the separate `freelab-script-suite` repository, holds tools that run inside FontLab, starting with a dark mode. Neither needs the other; installed together, they share FontLab's *Scripts > FreeLab* menu, and the window tools drive the suite's tool windows as a user would.
 
