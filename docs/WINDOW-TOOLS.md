@@ -76,5 +76,5 @@ FreeLab Script Suite follows every one of these, as an example of a script made 
 - Closing a window by its title bar's close button.
 - Windows' own file dialogs (*Open*, *Save As*): they are not Qt's widgets, so there is nothing to drive.
 - Menus FontLab fills only as they open may list nothing until they have been opened once on screen.
-- FontLab's *Welcome to FontLab 7!* window, shown modal at a launch with no font while *Open this dialog at startup* is on, is a question like any other: until it is closed (by the user, or its *Close* in risky mode), only it can be driven.
+- FontLab's *Welcome to FontLab 7!* window, shown modal at a launch with no font while *Open this dialog at startup* is on, is a question: until it is closed, only it can be driven. Its *Close* (`buttonClose`) needs no risky mode, since that window holds no work; its other controls do, since its recent fonts open a file without `open_font`'s crash check.
 - A `QTextBrowser` that follows its links itself (`openLinks`) is not made to: `click_link` emits `anchorClicked`, as a click does, and leaves the rest to the script.

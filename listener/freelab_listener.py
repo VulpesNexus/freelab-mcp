@@ -2744,6 +2744,7 @@ MAX_OUTPUT_CHARS = 4 * 1024 * 1024
 DEFAULT_OUTPUT_CHARS = 100000
 SAVE_PROMPT = "DlgClosePackage"  # FontLab 7.2's "Save changes to ... before closing?"
 WELCOME = "DlgInitialize"  # FontLab 7.2's Welcome window, modal from the launch when no font is opened (live)
+WELCOME_CLOSE = "buttonClose"  # its Close button (live)
 
 
 def _qt():
@@ -4520,7 +4521,10 @@ def _control_risk(control, question, script, click=False, chain=None):
     a control a script marks mcpRisky (or a widget holding it), a button whose default action is marked, a menu
     entry marked or in a menu marked (chain: the entry's action and its menus'); and, outside a script's window,
     a click on a button, its default action, or a menu entry or a menu it is in, named like Save, Export, Close,
-    Quit, Exit, Revert, or Discard (in its text, tooltip, accessible name, or objectName, mnemonics out)."""
+    Quit, Exit, Revert, or Discard (in its text, tooltip, accessible name, or objectName, mnemonics out). The
+    Close button of FontLab's Welcome window is none: that window holds no work."""
+    if _welcome_close(control):
+        return None
     if question:
         return "question_control"
     widget = control.widget
@@ -4534,6 +4538,22 @@ def _control_risk(control, question, script, click=False, chain=None):
     named = [_try(lambda: _prop(widget, "text")), _try(lambda: _prop(widget, "toolTip")),
              _try(lambda: _prop(widget, "accessibleName")), control.name]
     return "risky_command" if _risky_named(*named) or _actions_risky(actions) else None
+
+
+def _welcome_close(control):
+    """Whether a control is the Close button of FontLab's Welcome window. Closing that window loses nothing, so
+    it needs no risky mode; its other controls stay a question's, since its list of recent fonts opens a file
+    without open_font's crash check."""
+    if control.kind != "button" or control.name != WELCOME_CLOSE:
+        return False
+    widget = control.widget
+    for _depth in range(64):
+        if _try(lambda: widget.isWindow(), False):
+            return _class_name(widget) == WELCOME
+        widget = _try(lambda: widget.parentWidget(), None)
+        if widget is None:
+            return False
+    return False
 
 
 @op("window_controls")

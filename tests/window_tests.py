@@ -409,6 +409,26 @@ class DialogTests(WindowCase):
         self.assertEqual(self.act("click", {"window": "dialog", "control": "OK", "risky": True})["state"], "done")
         self.assertEqual((self.state.answers, self.state.question), ([u"OK"], None))
 
+    def test_the_welcome_window_closes_outside_risky_mode(self):
+        """The owner, 2026-11-20: closing FontLab's Welcome window loses nothing. Its other controls stay a
+        question's (its recent fonts open a file without open_font's check), and a Close elsewhere is risky."""
+        closed = []
+        welcome = W.window("DlgInitialize", u"Welcome to FontLab 7!", [
+            W.Widget("QPushButton", name=u"buttonNewFont", text=u"Create New Font"),
+            W.Widget("QPushButton", name=u"buttonClose", text=u"Close", on={"clicked": lambda: closed.append(1)})],
+            base="QDialog", modal=True)
+        self.state.qt_windows.append(welcome)
+        self.state.qt_modal = welcome
+        risky = dict((c["address"], c.get("risky", False)) for c in self.ok("window_controls", {"window": "dialog"})["controls"])
+        self.assertEqual(risky, {u"buttonNewFont": True, u"buttonClose": False})
+        self.fails("click", {"window": "dialog", "control": u"buttonNewFont"}, code="risky_mode_off")
+        self.assertEqual(self.act("click", {"window": "dialog", "control": u"buttonClose"})["state"], "done")
+        self.assertEqual(closed, [1])
+        other = W.window("QMessageBox", u"Close?", [W.Widget("QPushButton", name=u"buttonClose", text=u"Close")], modal=True)
+        self.state.qt_windows.append(other)
+        self.state.qt_modal = other
+        self.fails("click", {"window": "dialog", "control": u"buttonClose"}, code="risky_mode_off")
+
     def test_a_running_action_lets_its_own_dialog_be_driven(self):
         """A click whose work asks a question: the click runs until the question is answered, and only that
         question can be driven meanwhile (the listener answers inside the dialog's loop, as live)."""
