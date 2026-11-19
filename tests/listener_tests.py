@@ -21,6 +21,7 @@ sys.path.insert(0, LISTENER_DIR)
 os.environ["FREELAB_NO_AUTOSTART"] = "1"
 
 import fakes  # noqa: E402
+import fontbytes  # noqa: E402
 import freelab_listener as fl  # noqa: E402
 
 CP932_BYTES = b"\x83e\x83X\x83g"  # the cp932 encoding of a Japanese word: not valid UTF-8
@@ -1815,6 +1816,87 @@ class WindowTests(FontCase):
         self.fails("open_font", {"path": ""}, code="bad_args")
         self.fails("open_font", {"path": os.path.join(self.tmp, "missing.ttf")}, code="not_found")
         self.assertEqual(self.state.timers, [])
+
+    # -- a font FontLab 7.2 crashes on
+    def crasher_file(self, name="NotoSansJP[wght].ttf", data=None):
+        path = os.path.join(self.tmp, name)
+        if data is None:
+            gpos = fontbytes.gpos([fontbytes.lookup(1, [fontbytes.single(2, 0, 0)]),
+                                   fontbytes.lookup(9, [fontbytes.extension(fontbytes.single(2, 0, 0))])])
+            data = fontbytes.sfnt({b"head": fontbytes.head(), b"GPOS": gpos})
+        with open(path, "wb") as handle:
+            handle.write(data)
+        return path
+
+    def test_open_font_refuses_a_font_fontlab_crashes_on(self):
+        path = self.crasher_file()
+        error = self.fails("open_font", {"path": path}, code="known_crasher")
+        self.assertIn(u"FontLab 7.2 crashes on opening NotoSansJP[wght].ttf", error["message"])
+        self.assertIn(u"loses the unsaved work in every open font", error["message"])
+        self.assertIn(u"2 single adjustment subtables of format 2 with no values (lookups 0 and 1)", error["message"])
+        self.assertIn(u"safe_copy=True", error["message"])
+        self.assertEqual((error["data"]["count"], [s["lookup"] for s in error["data"]["fonts"][0]["subtables"]]),
+                         (2, [0, 1]))
+        self.assertNotIn("at", error["data"]["fonts"][0]["subtables"][0], "no file offsets")
+        self.assertEqual((self.state.timers, self.state.loads), ([], []), "nothing opened")
+
+    def test_open_font_opens_a_fixed_copy_with_safe_copy(self):
+        path = self.crasher_file()
+        with open(path, "rb") as handle:
+            original = handle.read()
+        reply = self.ok("open_font", {"path": path, "safe_copy": True})
+        copy = reply["safe_copy"]
+        folder = os.path.join(self.tmp, fl.SAFE_COPIES)
+        self.assertEqual((copy["original"], copy["changed"], os.path.dirname(os.path.dirname(copy["path"]))),
+                         (path, 2, folder), "beside the state file")
+        self.assertEqual((reply["path"], os.path.basename(copy["path"])), (copy["path"], "NotoSansJP[wght].ttf"))
+        self.assertIn(u"Opened a fixed copy of NotoSansJP[wght].ttf, written to %s" % copy["path"], copy["note"])
+        self.assertIn(u"The file itself is not changed.", copy["note"])
+        self.state.fire_timers()
+        self.assertEqual(self.state.loads, [copy["path"]], "the copy opened, not the file")
+        self.assertEqual(fl.scan_font_file(copy["path"])["count"], 0)
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), original, "the file itself is not changed")
+        self.assertEqual(self.listener.opened, [{"id": 101, "path": copy["path"]}])
+        again = self.ok("open_font", {"path": path, "safe_copy": True})
+        self.assertEqual((again["already_open"], again["font"]["id"], again["safe_copy"]["path"]),
+                         (True, 101, copy["path"]), "the copy open already: named, not written again")
+        self.assertIn(u"open already", again["safe_copy"]["note"])
+
+    def test_safe_copy_of_a_font_that_needs_none_opens_the_file(self):
+        path = self.crasher_file("Clean.ttf", fontbytes.sfnt({b"head": fontbytes.head(), b"GPOS": fontbytes.gpos([])}))
+        reply = self.ok("open_font", {"path": path, "safe_copy": True})
+        self.assertEqual((reply["path"], reply["safe_copy"]["path"]), (path, None))
+        self.assertIn(u"No copy was needed", reply["safe_copy"]["note"])
+        self.assertNotIn("crash_check", reply)
+        self.assertEqual(self.ok("open_font", {"path": self.font_file("Plain.ttf")})["path"],
+                         os.path.join(self.tmp, "Plain.ttf"))
+        self.fails("open_font", {"path": path, "safe_copy": "yes"}, code="bad_args")
+
+    def test_open_font_says_a_check_it_could_not_make(self):
+        real = fl._brotli_decompress
+        fl._brotli_decompress = lambda: None
+        try:
+            path = self.crasher_file("Web.woff2", b"wOF2" + b"\0" * 60)
+            reply = self.ok("open_font", {"path": path})
+        finally:
+            fl._brotli_decompress = real
+        self.assertIn(u"Not made: WOFF2 needs brotli", reply["crash_check"])
+        self.state.fire_timers()
+        self.assertEqual(self.state.loads, [path], "opened all the same, as the user asked")
+
+    def test_a_copy_that_cannot_be_made_opens_nothing(self):
+        real = fl._brotli_decompress
+        fl._brotli_decompress = lambda: (lambda data: data)
+        try:
+            path = self.crasher_file("Web.woff2", fontbytes.woff2({b"head": fontbytes.head(), b"GPOS": fontbytes.gpos(
+                [fontbytes.lookup(1, [fontbytes.single(2, 0, 0)])])}))
+            self.fails("open_font", {"path": path}, code="known_crasher")
+            error = self.fails("open_font", {"path": path, "safe_copy": True}, code="cannot_copy")
+        finally:
+            fl._brotli_decompress = real
+        self.assertIn(u"convert it to TTF or OTF first", error["message"])
+        self.assertEqual((self.state.timers, self.state.loads), ([], []))
 
     # -- closing
     def test_close_font_closes_an_unchanged_font_after_the_reply(self):

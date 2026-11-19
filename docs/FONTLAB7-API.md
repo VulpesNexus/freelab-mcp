@@ -261,7 +261,18 @@ FontLab 7.2 can crash as it opens a font whose `GPOS` holds a single adjustment 
 | Bellefair with a format 2 subtable of three value records, empty (`ValueFormat` 0) or not | 0 | opened |
 | Bellefair with a format 1 subtable of `ValueFormat` 0 | 0 | opened |
 
-- **The way around it**: such a subtable moves nothing, so a copy of the file without it is the same font to FontLab (fontTools: take the subtables of `LookupType` 1, `Format` 2, and no `Value` out of their lookups), and opens whatever the heap holds. `open_font` does not look for them: it opens what it is given, as *File > Open Fonts* does.
+- **The way around it**: such a subtable moves nothing, so a copy of the file without it is the same font to FontLab, and opens whatever the heap holds.
+
+### What `open_font` does about it
+
+- **The check.** Before FontLab is asked, the listener reads the file's own bytes (`scan_font_file`): the table directory, then the `GPOS` table's `LookupList`, each lookup of type 1, and each of type 9 whose extension is of type 1, looking for a subtable of format 2 whose `ValueCount` is 0. No fontTools: it is plain `struct`, so it runs in FontLab's Python 2.7 and in Python 3 alike, and covers every client of the listener, not only the server. TrueType and OpenType files (*.ttf*, *.otf*), every font of a collection (*.ttc*, *.otc*), and WOFF (each table zlib-compressed, decompressed here) are checked; WOFF2 only where Python has `brotli` (FontLab's has not), else the reply's `crash_check` says the check could not be made, and the font is opened as asked. FontLab and source formats (*.vfc*, *.vfj*, *.ufo*, *.glyphs*) hold no binary `GPOS` and are not checked. A file whose tables cannot be read that far is opened, with `crash_check` saying why it was not checked.
+- **Refused.** A file that holds such a subtable is refused with `known_crasher`, naming how many and in which lookups (counted from 0, as fontTools counts them; in a collection, which font's), and saying that the crash loses the unsaved work in every open font. Nothing is opened.
+- **`safe_copy`.** With `safe_copy=True`, the listener writes a fixed copy and opens that instead, saying so in the reply's `safe_copy` (the copy's path, the original's, how many subtables were changed, and a note to pass on). The copy goes in *safe-copies* beside the state file (*%LOCALAPPDATA%\FreeLab\safe-copies*, or the system's temporary folder if that cannot be made), in a folder named after a hash of the original's full path, under the original's file name. The user's file is only read. A copy already open in FontLab is named, not written again.
+- **The copy.** Each such subtable is made a format 1 subtable with a `ValueFormat` of 0, over the same coverage, written in place: its format becomes 1, its `ValueFormat` 0, and its `ValueCount`, already 0, is left as two unused bytes, so nothing moves and no offset changes. A format 1 subtable with no values positions nothing either, and FontLab opened it whatever the heap held (Bellefair, in the bisect above); taking the subtables out instead would have renumbered or emptied lookups. Then the `GPOS` checksum in the table directory and `head.checkSumAdjustment` are computed again (for a collection, each font's, its offset table, directory, and tables summed as a font of its own). Every other table is byte-identical. A WOFF's copy is its sfnt, decompressed, as *.ttf* or *.otf* by its flavor. A WOFF2 is not copied (`cannot_copy`): rebuilding its transformed `glyf` and `loca` is not done here; convert it to TTF or OTF first.
+- **Why the listener makes the copy.** The check has to run there anyway, the listener's Python has everything a copy needs (`struct`, `zlib`), and a copy made there covers every client. The server needs no fontTools.
+- **Not risky.** `safe_copy` changes no file of the user's; it writes only in FreeLab's own folder, and the reply says what it did.
+- **Checked offline on the corpus**: of the 911 font files under *%LOCALAPPDATA%\FreeLab\corpus* (the 188 test fonts and their sources), the check flagged 7, and fontTools 4.65 found exactly the same subtables in every file: *NotoSansJP[wght].ttf* (lookups 10 and 11), *NotoSansKR[wght].ttf* (lookups 11 and 12), and the source copies of those two and of *NotoSansSC*, *NotoSansTC*, and *NotoSansHK*. The copy of *NotoSansJP[wght].ttf* read back with every checksum right (fontTools' `checkChecksums=2`), both subtables of format 1 with `ValueFormat` 0 and their coverage of 24 and 17 glyphs, and every other table byte-identical.
+- **FreeLab Script Suite** makes the same check where it opens font files (Family Audit's *Add files...*, Font Compare's *Open a font...*), with its own copy of this code.
 
 ## Not yet proven live
 
@@ -271,6 +282,14 @@ FontLab 7.2 can crash as it opens a font whose `GPOS` holds a single adjustment 
 - **`getPlainPairsDict` withheld for a large font**: no test font came near 500,000 flattened pairs.
 - **`set_prefix` inside a rename**: no test font named a candidate glyph in its prefix outside the *Classes* panel's lines.
 - **The state file against another account**: born with one entry (`icacls`); a second account holding it open was not tried.
+
+### The crash guard, still to prove live
+
+- `open_font` of *NotoSansJP[wght].ttf* answers `known_crasher` and FontLab opens nothing.
+- `open_font` with `safe_copy=True` opens the copy from *safe-copies*: the font is the one in front, its `path` the copy's, its `GPOS` read back through FontLab (its feature code shows the two lookups, with no rule or a rule of no value), and FontLab does not crash after the heap fill of the bisect (the million 64-byte blocks of 0x41).
+- The same copy opened a second time is named (`already_open`), not written again.
+- A clean font with `safe_copy=True` opens from its own file.
+- A path under the workspace's en dash folder and a *.woff* of a crasher (its copy a *.ttf*) open as above.
 
 ### The window tools (1.3.0), still to prove live
 

@@ -26,6 +26,10 @@ Some actions are worth having but can lose or overwrite the user's work, or deci
 | `risky_command` | `click`, `set_value`, `click_link`, `run_menu_command` | Runs a command of FontLab's *File* menu, a button or menu command named Save, Export, Close, Quit, Exit, Revert, or Discard (in its text, tooltip, accessible name, or objectName, mnemonics left out; a tool button's action and the menus a command is in count too) outside a script's own window, or a control, action, or menu a script marks `mcpRisky`: it may write files or throw work away. Which controls these are is known only inside FontLab, so the server sends risky mode with every action while it is on, and the listener decides ([WINDOW-TOOLS.md](WINDOW-TOOLS.md#safety)). |
 | `run_python` | `run_python` | Always available and not gated: it runs any code inside FontLab, with FontLab's access to the user's files and the network. It is listed so that nobody takes risky mode for a sandbox. |
 
+## Not risky
+
+- `open_font`'s `safe_copy` writes a fixed copy of a font file FontLab 7.2 crashes on into FreeLab's own *safe-copies* folder and opens it; it changes no file of the user's, and its reply says where the copy is and what was changed in it ([FONTLAB7-API.md](FONTLAB7-API.md#what-open_font-does-about-it)).
+
 ## Limits that stay in risky mode
 
 - `rename_glyph` with `update_references` and `delete_glyph` with `remove_references` still refuse a glyph in a class of FontLab's *Classes* panel (FontLab's scripting has no proven call to change one), a kerning pair side named like a kerning class (FontLab reads such a name as the class), and, for a delete, a glyph named in feature code (taking a name out of code can break it; edit the code first with `set_feature_code`). `delete_glyph` always refuses a glyph other glyphs use as a component.

@@ -554,7 +554,7 @@ def _words(text: str) -> str:
 
 
 @mcp.tool()
-async def open_font(path: str, wait_s: float = 120.0, answer: Answer = "") -> dict[str, Any]:
+async def open_font(path: str, wait_s: float = 120.0, answer: Answer = "", safe_copy: bool = False) -> dict[str, Any]:
     """Open a font file in FontLab, as File > Open Fonts does (only when the user asked to open it).
 
     path is the file's full path (.vfc, .vfj, .ufo, .otf, .ttf, ... : whatever FontLab opens). A font already
@@ -564,16 +564,25 @@ async def open_font(path: str, wait_s: float = 120.0, answer: Answer = "") -> di
     on the way (Coordinates Rounding, for a font with fractional coordinates), the question is left on
     screen for the user and the tool stops ([dialog_open]); the font opens once it is answered. [risky]
     answer (risky mode only) is the button to click on that question instead.
+
+    A font file FontLab 7.2 is known to crash on (a GPOS single adjustment of format 2 with no values, as in
+    Noto Sans JP's variable font) is refused ([known_crasher]), since a crash loses the unsaved work in every
+    open font. safe_copy=True opens a fixed copy of it instead, written to a temporary folder, the same font to
+    FontLab; the user's file is not changed, and the reply's safe_copy says where the copy is: tell the user.
+    A check that could not be made (a WOFF2 without brotli) is said in crash_check.
     """
     _wait_arg(wait_s)
     args: dict[str, Any] = {"path": path}
     if answer:
         risky.require("open_font.answer", args)
         args["answer"] = answer
+    if safe_copy:
+        args["safe_copy"] = True
     shown_before = _dialog_key(await _open_dialog())  # (FontLab's welcome window, for one, is not a question about this)
     reply = await _call("open_font", args)
+    told = {key: reply[key] for key in ("safe_copy", "crash_check") if key in reply}
     if reply.get("already_open"):
-        return {"opened": False, "already_open": True, "font": reply["font"]}
+        return {"opened": False, "already_open": True, "font": reply["font"], **told}
     before = set(reply.get("fonts_before") or [])
     asked = None
     wait = _Wait(wait_s)
@@ -585,6 +594,7 @@ async def open_font(path: str, wait_s: float = 120.0, answer: Answer = "") -> di
         new = [font for font in fonts if font.get("id") not in before]
         same = [font for font in new if _same_path(font.get("path"), reply["path"])]
         extra = {"answered": {"question": _question(asked), "button": answer}} if asked else {}
+        extra.update(told)
         if same:
             return {"opened": True, "font": same[0], **extra}
         if len(new) == 1:
@@ -596,12 +606,18 @@ async def open_font(path: str, wait_s: float = 120.0, answer: Answer = "") -> di
                 asked = dialog  # (the listener clicks it from a timer)
                 continue
             raise RuntimeError(f"[dialog_open] FontLab is asking: {_question(dialog)}. It was left on screen for the "
-                               "user to answer; the font opens once it is answered.")
+                               f"user to answer; the font opens once it is answered.{_copy_said(reply)}")
     if wait.silent:
-        raise RuntimeError(f"[not_opened] {path} was not seen open: FontLab was asked to open it and stopped "
-                           f"answering.{wait.about()} list_fonts shows it once it is open.")
-    raise RuntimeError(f"[not_opened] FontLab did not open {path} within {wait_s:g} s; it may still be loading it "
-                       f"(list_fonts shows it once it is open).{wait.about()}")
+        raise RuntimeError(f"[not_opened] {reply['path']} was not seen open: FontLab was asked to open it and stopped "
+                           f"answering.{wait.about()} list_fonts shows it once it is open.{_copy_said(reply)}")
+    raise RuntimeError(f"[not_opened] FontLab did not open {reply['path']} within {wait_s:g} s; it may still be loading "
+                       f"it (list_fonts shows it once it is open).{wait.about()}{_copy_said(reply)}")
+
+
+def _copy_said(reply: dict[str, Any]) -> str:
+    """open_font's word on the fixed copy it asked FontLab to open, for a message that ends without the font."""
+    copy = reply.get("safe_copy") or {}
+    return f" {copy['note']}" if copy.get("path") else ""
 
 
 @mcp.tool()

@@ -23,9 +23,9 @@ PY27 = PY27_DIR / "tools" / "python.exe"
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 PY27_FILES = (
     "listener/freelab_listener.py", "tests/fakes.py", "tests/widgetfakes.py", "tests/listener_tests.py",
-    "tests/window_tests.py",
+    "tests/window_tests.py", "tests/fontbytes.py", "tests/crasher_tests.py",
 )
-PY27_SUITES = ("tests/listener_tests.py", "tests/window_tests.py")
+PY27_SUITES = ("tests/listener_tests.py", "tests/window_tests.py", "tests/crasher_tests.py")
 
 
 def run_py3() -> tuple[bool, list[str]]:

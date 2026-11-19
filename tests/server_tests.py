@@ -379,6 +379,24 @@ class WindowToolTests(WindowCase):
                                                                "changes_discarded": False})
         self.assertEqual(self.ids(), [1, 7])
 
+    def test_a_font_fontlab_crashes_on_is_refused_or_opened_as_a_fixed_copy(self):
+        import fontbytes
+        gpos = fontbytes.gpos([fontbytes.lookup(1, [fontbytes.single(2, 0, 0)])])
+        path = os.path.join(self.tmp, "Crash.ttf")
+        Path(path).write_bytes(fontbytes.sfnt({b"head": fontbytes.head(), b"GPOS": gpos}))
+        with self.assertRaisesRegex(RuntimeError, r"\[known_crasher\] FontLab 7\.2 crashes on opening Crash\.ttf .*1 single "
+                                                  r"adjustment subtable of format 2 with no values \(lookup 0\).*safe_copy=True"):
+            asyncio.run(server.open_font(path))
+        self.assertEqual(self.ids(), [1, 7])
+        opened = asyncio.run(server.open_font(path, safe_copy=True))
+        copy = opened["safe_copy"]
+        self.assertEqual((opened["opened"], opened["font"]["id"], opened["font"]["path"]), (True, 101, copy["path"]))
+        self.assertEqual((copy["original"], copy["changed"]), (path, 1))
+        self.assertTrue(copy["path"].startswith(os.path.join(self.tmp, "safe-copies")))
+        self.assertIn("The file itself is not changed.", copy["note"])
+        again = asyncio.run(server.open_font(path, safe_copy=True))
+        self.assertEqual((again["already_open"], again["font"]["id"], again["safe_copy"]["path"]), (True, 101, copy["path"]))
+
     def test_open_stops_at_fontlabs_question(self):
         self.state.hold_open = True
         with self.assertRaisesRegex(RuntimeError, r"\[dialog_open\] FontLab is asking: Round the coordinates"):
