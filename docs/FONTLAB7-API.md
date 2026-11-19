@@ -219,7 +219,7 @@ FontLab 7.2.0, test fonts from the corpus, never saved over their files; the che
 
 FontLab 7.2.0, the listener 1.3.0 with Codex's review fixes, FreeLab Script Suite following every convention of [WINDOW-TOOLS.md](WINDOW-TOOLS.md), test fonts from the corpus (Bellefair; IBM Plex Sans JP for CJK Spacing; Tinos and BIZ UDPGothic), never saved over their files. Every action went through the window tools; `run_python` only read diagnostics. The workflow: *Scripts > FreeLab > Font Check* (`run_menu_command`), its *Check*, its findings (`read_list`, 152 rows) and log (`read_text`, with links), its *Glyph Compose* link (`click_link`), Glyph Compose's *Diacritics* tab (`set_value` on a tab bar), four rows ticked (`set_value` with `row`) and built, *Edit > Undo Freelab Glyph Compose* (`run_menu_command`), the tools button's *Feature Code* (`click` with `entry`), a form feature ticked and written, the *Next tool* arrow to Feature Check and its *Check*, Auto Spacing (analyzed, a glyph spaced), its log's *Auto Kerning* link, Auto Kerning (a dropdown set, analyzed, two pairs written), Kerning Check, Proof (a page chosen, its preview drawn), and Font Builder; Proof's *Save PDF…* and Font Builder's *Save template...* were refused outside risky mode (`risky_command`, marked `mcpRisky`).
 
-- **Emitting a signal by calling it** reaches the script's slots: `anchorClicked(QUrl)` (Font Check's and Auto Spacing's log links opened Glyph Compose and Auto Kerning), a view's `clicked(QModelIndex)` with `setCurrentIndex` (Proof drew the page chosen; Auto Spacing selected its row), `QComboBox.activated(int)` with `setCurrentIndex` (Proof's page size, Auto Kerning's pair set), and `setData(index, 2, CheckStateRole)` the tree's `itemChanged` (Glyph Compose, Feature Code, Auto Spacing, and Auto Kerning counted the ticks and enabled their writes). `editingFinished()`, `textEdited`, `QLabel.linkActivated`, and `doubleClicked` were not exercised.
+- **Emitting a signal by calling it** reaches the script's slots: `anchorClicked(QUrl)` (Font Check's and Auto Spacing's log links opened Glyph Compose and Auto Kerning), a view's `clicked(QModelIndex)` with `setCurrentIndex` (Proof drew the page chosen; Auto Spacing selected its row), `QComboBox.activated(int)` with `setCurrentIndex` (Proof's page size, Auto Kerning's pair set), and `setData(index, 2, CheckStateRole)` the tree's `itemChanged` (Glyph Compose, Feature Code, Auto Spacing, and Auto Kerning counted the ticks and enabled their writes). `editingFinished()`, `textEdited`, `QLabel.linkActivated`, and `doubleClicked` were not exercised in that run (they were in a second one, below).
 - **`QAbstractButton.click()` from a timer** runs the slot, toggles a check box (Font Builder's *lacking*, CJK Spacing's *halt_box*), and the suite's tools button (`InstantPopup`) lists `click_needs_entry`; its entries opened each tool in the window's place. The arrows (*Next tool*) were clicked by their accessible names.
 - **One wrapper per Qt object**: `topLevelWidgets()` gave the same Python object for the main window at two calls (`is`), and `property` of an unset dynamic property is `None`.
 - **`mcpBusy`** reads back as the step's text (*Listing*, Font Check's) while the work runs and `False` after; `wait_idle` waited on it, answering while the work let its events through.
@@ -229,7 +229,39 @@ FontLab 7.2.0, the listener 1.3.0 with Codex's review fixes, FreeLab Script Suit
 - **The model calls**: `QModelIndex()` as the root, `flags()` as an int (61), `QPersistentModelIndex` exists in PythonQt's QtCore and follows a row (a row taken out and put back is a new row: the persistent index goes invalid, so an action on it is refused).
 - **FontLab's own windows**: no floating window of FontLab's showed a progress bar while idle.
 - **A clipboard another program holds makes FontLab stall without working**: `OpenClipboard` refused (error 5) in FontLab and outside it, one `QClipboard.mimeData()` took 4.35 s, and FontLab stopped answering for 20 to 60 s at a time with no CPU used (opening a font, opening a tool window, each History step: 8.7 s an *Undo*). The listener then refuses connections once its queue of 8 is full; `wait_idle`, and the tools that wait for an outcome (`close_font` reported a font still open after its 30 s, and the font closed), now wait through that while FontLab runs ([ARCHITECTURE.md](ARCHITECTURE.md)).
-- **`requestLoadingFont` of *NotoSansJP[wght].ttf* crashed FontLab** twice, and once that morning (an access violation in *FontLab 7.exe* at +0x191A03E to +0x191A158, with the listener's `load` the only Python frame): FontLab's own load, not a script's read during it.
+- **`requestLoadingFont` of *NotoSansJP[wght].ttf* crashed FontLab** twice, and once that morning (an access violation in *FontLab 7.exe* at +0x191A03E to +0x191A158, with the listener's `load` the only Python frame): FontLab's own load, not a script's read during it. The cause was found the same day (below).
+- **The signals not emitted in the first run** (a second run the same day: Feature Code, Proof, and Auto Kerning on Bellefair, Sarabun, and Poppins). `set_value` on a spin box (`setValue`, `editingFinished()`): Feature Code's *Variants each* went from 2 to 3 and its button read *Build 6 variants*; a value out of its range, or not whole, was refused. On a field (`setText`, `textEdited`, `editingFinished()`): Proof's *Waterfall sizes* rebuilt its pages, which only `editingFinished()` asks for there; a stylistic set's name, in a cell of Feature Code's forms, reached the slot of its `textEdited`; a read-only one was refused. `click_link` on a label (`linkActivated`): Feature Code's *Stylistic alternates* link chose that tab. `click` with `double` on a row (`doubleClicked`, `activated`): a ligature's row opened a Glyph tab once; in Auto Kerning's list, a double click in the *halfkern* column took that value for the pair, one in *Suggested* reset it, and one on the pair's name opened it in a Glyph tab.
+- **The controls in a list's cells**: Feature Code's five ligature dropdowns were listed as *ligature_tree > combo#1* to *#5*, in the rows' order (*combo#2* was the second row's, read back from the tree), and setting one moved its ligature to `dlig`; the set names' fields were *forms_tree > field#1* to *#4*. `read_list` gives a row's texts, not what the widgets in its cells hold.
+- **A dialog a window parents** (*FreeLab Kerning Classes*, parented to Auto Kerning's window, not modal) is a window of its own in `list_windows`, and its controls are not in its parent's walk.
+- **FontLab 7's panels are not `QDockWidget`s**: the main window has none (`findChildren(QDockWidget)` is empty, and its `saveState()` is 42 bytes), so no panel floats as one. FontLab docks its panels with a framework of its own, and nothing but a drag was found to undock one: a floating panel was not driven.
+
+## A font FontLab 7.2 crashes on: a single adjustment with no values (2026-11-19)
+
+FontLab 7.2 can crash as it opens a font whose `GPOS` holds a single adjustment subtable (lookup type 1, or 9 around it) of format 2 with a `ValueCount` of 0, whatever its `ValueFormat` and its coverage. *NotoSansJP[wght].ttf* has two (in lookups 10 and 11, the ones its `FeatureVariations` put in for the heavier weights; 24 and 17 glyphs covered, `ValueFormat` 0), and *NotoSansKR[wght].ttf* two; no other font of the 188 in the test corpus has one.
+
+- **The fault**: as FontLab turns the table into feature code, it asks whether a subtable's values are all alike (to write one rule for them), and copies the first value of a list that is empty (`otl::LpSingle`, by the RTTI names in the dump: a `std::list` of `otl::GPosValue`, whose end node holds no value and is never initialized). It then follows the four device table pointers of that value: an access violation in *FontLab 7.exe* at +0x191A03E to +0x191A158, in the function at +0x1919FB0 called from +0x1B8C022, whenever those 32 bytes are not zeros. In the dump of the morning the node was a 64-byte block left by a text (0x00530012 where a pointer is read); FontLab's own memory was not short (919 MB of private memory).
+- **Why it comes and goes**: the bytes are whatever the block held before. The font opened in FontLab just started, and crashed after other work (a script's windows, other fonts opened and closed) had left freed blocks of that size behind.
+- **No script is in it**: FontLab started with the file on its command line, with no request to the listener, crashed in the same place, through the same twelve callers in *FontLab 7.exe* and with no Python frame on the stack.
+- **Proven by filling the heap**: with a million 64-byte blocks of FontLab's heap filled with 0x41 and every other one freed before each open (`run_python`: `ucrtbase`'s `malloc` and `free` through `ctypes.PyDLL`), every file with such a subtable crashed, and every file without one opened:
+
+| File opened after the fill | Subtables with no values | FontLab |
+|---|---|---|
+| *NotoSansJP[wght].ttf* | 2 | crashed |
+| The same, after a fill of zeros | 2 | opened |
+| The two subtables taken out, nothing else changed | 0 | opened |
+| `GPOS` taken out | 0 | opened |
+| A static instance at `wght` 400 (fontTools' instancer drops the two lookups) | 0 | opened |
+| A subset of half the glyphs (fontTools' subsetter drops the subtables) | 0 | opened |
+| A static instance at `wght` 900 | 2 | crashed |
+| `FeatureVariations` taken out, the lookups left | 2 | crashed |
+| `fvar`, `gvar`, `avar`, `HVAR`, and `STAT` taken out | 2 | crashed |
+| *NotoSansKR[wght].ttf* | 2 | crashed |
+| *NotoSerifJP[wght].ttf*, *Rubik[wght].ttf*, *IBMPlexSansJP-Regular.ttf*, *Bellefair-Regular.ttf* | 0 | opened |
+| Bellefair with one such subtable added (three glyphs covered), in a feature's lookup or in a lookup no feature names, with `ValueFormat` 0 or 4 | 1 | crashed |
+| Bellefair with a format 2 subtable of three value records, empty (`ValueFormat` 0) or not | 0 | opened |
+| Bellefair with a format 1 subtable of `ValueFormat` 0 | 0 | opened |
+
+- **The way around it**: such a subtable moves nothing, so a copy of the file without it is the same font to FontLab (fontTools: take the subtables of `LookupType` 1, `Format` 2, and no `Value` out of their lookups), and opens whatever the heap holds. `open_font` does not look for them: it opens what it is given, as *File > Open Fonts* does.
 
 ## Not yet proven live
 
@@ -242,10 +274,7 @@ FontLab 7.2.0, the listener 1.3.0 with Codex's review fixes, FreeLab Script Suit
 
 ### The window tools (1.3.0), still to prove live
 
-- **The signals not yet emitted live**: `editingFinished()` (a spin box or field set), `textEdited(text)`, `QLabel.linkActivated(href)`, and a view's `doubleClicked` and `activated`.
-- **A floating panel**: a top-level window that inherits `QDockWidget`, and whether `isWindow()` of a dialog a window parents keeps it out of the walk.
-- **The controls in a list's cells** (`setItemWidget`: Feature Code's ligature dropdowns), walked since the live run, on fakes only.
-
+- **A floating panel of FontLab's**: FontLab 7 has no `QDockWidget` (above), and a panel is undocked by a drag only, which these tools do not do; whether a panel floating so is listed as a window, and walked, is not proven.
 ### A font with no window tab (candidates)
 
 `bring_font_to_front`, `undo`, `compile_features`, `save_font`, and `close_font` choose a font's window tab, and refuse a font that has none (`not_found`). *Window > New Font Tab* (`actionOpen_Font_Window` in FreeLab Script Suite's notes) opens a tab of the current font only, so it cannot reach another. Calls to probe, one at a time, on a disposable font opened with no window: `flWorkspace.instance().closePackage(package)` and `flPackage.close(False)` (documented: *close(save=False)*) for closing; `fontlab.flItems.requestLoadingFont(path)` with the path of the font already open, to see whether FontLab brings it forward, opens a window of it, or opens it a second time. None is used yet.
