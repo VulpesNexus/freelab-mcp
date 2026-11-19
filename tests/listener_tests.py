@@ -1835,8 +1835,14 @@ class WindowTests(FontCase):
         self.assertIn(u"loses the unsaved work in every open font", error["message"])
         self.assertIn(u"2 single adjustment subtables of format 2 with no values (lookups 0 and 1)", error["message"])
         self.assertIn(u"safe_copy=True", error["message"])
+        # (live, 2026-11-19: it read "such subtables positions nothing")
+        self.assertIn(u"such subtables position nothing, so each is made", error["message"])
         self.assertEqual((error["data"]["count"], [s["lookup"] for s in error["data"]["fonts"][0]["subtables"]]),
                          (2, [0, 1]))
+        one = self.crasher_file("One.ttf", fontbytes.sfnt({b"head": fontbytes.head(), b"GPOS": fontbytes.gpos(
+            [fontbytes.lookup(1, [fontbytes.single(2, 0, 0)])])}))
+        self.assertIn(u"such a subtable positions nothing, so it is made",
+                      self.fails("open_font", {"path": one}, code="known_crasher")["message"])
         self.assertNotIn("at", error["data"]["fonts"][0]["subtables"][0], "no file offsets")
         self.assertEqual((self.state.timers, self.state.loads), ([], []), "nothing opened")
 

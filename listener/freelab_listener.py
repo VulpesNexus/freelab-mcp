@@ -3292,10 +3292,11 @@ def op_open_font(listener, args):
             raise FreeLabError("known_crasher", (
                 u"FontLab 7.2 crashes on opening %s (not every time: it depends on what FontLab's memory held), and a "
                 u"crash loses the unsaved work in every open font. Its GPOS holds %s. Nothing was opened. open_font "
-                u"with safe_copy=True opens a fixed copy instead, written to a temporary folder: %s positions "
-                u"nothing, so %s made an empty single adjustment of format 1, which FontLab opens, and the font is "
-                u"the same; the file itself is not changed.") % (
-                    name, crasher_summary(scan), u"such a subtable" if scan["count"] == 1 else u"such subtables",
+                u"with safe_copy=True opens a fixed copy instead, written to a temporary folder: %s nothing, so %s "
+                u"made an empty single adjustment of format 1, which FontLab opens, and the font is the same; the "
+                u"file itself is not changed.") % (
+                    name, crasher_summary(scan),
+                    u"such a subtable positions" if scan["count"] == 1 else u"such subtables position",
                     u"it is" if scan["count"] == 1 else u"each is"),
                 {"path": path, "format": scan["format"], "count": scan["count"], "fonts": crasher_report(scan)})
         try:

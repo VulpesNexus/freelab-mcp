@@ -274,6 +274,16 @@ FontLab 7.2 can crash as it opens a font whose `GPOS` holds a single adjustment 
 - **Checked offline on the corpus**: of the 911 font files under *%LOCALAPPDATA%\FreeLab\corpus* (the 188 test fonts and their sources), the check flagged 7, and fontTools 4.65 found exactly the same subtables in every file: *NotoSansJP[wght].ttf* (lookups 10 and 11), *NotoSansKR[wght].ttf* (lookups 11 and 12), and the source copies of those two and of *NotoSansSC*, *NotoSansTC*, and *NotoSansHK*. The copy of *NotoSansJP[wght].ttf* read back with every checksum right (fontTools' `checkChecksums=2`), both subtables of format 1 with `ValueFormat` 0 and their coverage of 24 and 17 glyphs, and every other table byte-identical.
 - **FreeLab Script Suite** makes the same check where it opens font files (Family Audit's *Add files...*, Font Compare's *Open a font...*), with its own copy of this code.
 
+### The guard, live (2026-11-19, FontLab 7.2, listener 1.3.0)
+
+- **Refused**: `open_font` of *NotoSansJP[wght].ttf* answered `known_crasher` (lookups 10 and 11, 24 and 17 glyphs, both in extensions, `ValueFormat` 0), and FontLab opened nothing. Its message said *such subtables positions nothing*; it now counts them (*such subtables position nothing, so each is made…*).
+- **The fixed copy, after the heap fill**: a million 64-byte blocks of 0x41, every other one freed (`run_python`, `ucrtbase` through `ctypes.PyDLL`, 1.1 s), then `open_font` with `safe_copy=True`: the copy opened from *%LOCALAPPDATA%\FreeLab\safe-copies*, the font in front, its `path` the copy's (FontLab joins the file name with a forward slash), and FontLab did not crash. The positive control, in a later run of the same session: the same fill, then `requestLoadingFont` of the original through `run_python`, crashed FontLab at once, at *FontLab 7.exe*+0x191A03E (its dump hashed into the repository's local manifest, then deleted).
+- **The copy's feature code**: FontLab writes neither lookup 10 nor 11 in it, with or without rules. Its header counts 12 `GPOS` lookups, but the two are named only by `FeatureVariations`, which FontLab's feature code leaves out: *palt* and *vpal* show their default lookups (6 and 7) alone (*Lookups: 1*), and no rule anywhere has a value of zero. So the two lookups do nothing in FontLab, as in the original's default instance.
+- **Named, not written again**: `open_font` of the same file with `safe_copy=True` answered `already_open` with the copy's font, and the copy's modification time did not change.
+- **A clean font**: *Bellefair-Regular.ttf* with `safe_copy=True` opened from its own file (*No copy was needed*), and no copy was written.
+- **The en dash path**: *NotoSansKR[wght].ttf* copied under the workspace's folder was refused (lookups 11 and 12), then its copy opened with `safe_copy=True`.
+- **WOFF**: a WOFF of *NotoSansJP[wght].ttf* (fontTools) was refused (`format` `woff`), then its copy opened as *NotoSansJP-web.ttf*. The three copies read back with every checksum right (fontTools' `checkChecksums=2`) and no format 2 subtable without values left.
+
 ## Not yet proven live
 
 - **`screenshot` with `source="screen"` above 100 % display scaling**: the display was at 100 %, and the owner's display settings are not changed for a test.
@@ -283,13 +293,6 @@ FontLab 7.2 can crash as it opens a font whose `GPOS` holds a single adjustment 
 - **`set_prefix` inside a rename**: no test font named a candidate glyph in its prefix outside the *Classes* panel's lines.
 - **The state file against another account**: born with one entry (`icacls`); a second account holding it open was not tried.
 
-### The crash guard, still to prove live
-
-- `open_font` of *NotoSansJP[wght].ttf* answers `known_crasher` and FontLab opens nothing.
-- `open_font` with `safe_copy=True` opens the copy from *safe-copies*: the font is the one in front, its `path` the copy's, its `GPOS` read back through FontLab (its feature code shows the two lookups, with no rule or a rule of no value), and FontLab does not crash after the heap fill of the bisect (the million 64-byte blocks of 0x41).
-- The same copy opened a second time is named (`already_open`), not written again.
-- A clean font with `safe_copy=True` opens from its own file.
-- A path under the workspace's en dash folder and a *.woff* of a crasher (its copy a *.ttf*) open as above.
 
 ### The window tools (1.3.0), still to prove live
 
