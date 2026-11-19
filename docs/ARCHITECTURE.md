@@ -100,6 +100,8 @@ Each write op works in the same order, and stops at the first refusal with nothi
 
 The server gives writes 120 seconds (`WRITE_TIMEOUT_S`) and reads 10: a History step waits on the Windows clipboard when another program holds it open (17 s a step, seen live).
 
+A tool that waits for the outcome of what it asked (`open_font`, `close_font`, `save_font`, `export_font`, `answer_dialog`, `quit_fontlab`, and `launch_fontlab` once the listener is there) keeps waiting past its `wait_s` while FontLab's process runs but its listener does not answer, up to 300 seconds more (`SILENCE_MAX_S`), and looks 5 seconds longer (`SILENCE_GRACE_S`) once FontLab answers again: FontLab held by a clipboard another program holds answers nothing for 20 to 60 s at a time, and what it was asked still happens. Silence is a request that timed out, or a connection refused while FontLab runs (the listener refuses connections once its queue of 8 is full); a connection refused once FontLab is gone ends the wait at once. A tool that gives up while FontLab is silent says it does not know the outcome and for how long FontLab did not answer. `wait_idle` counts silence as work, within its own `timeout_s`; an action's tool (`click` and the like) returns at once with the action still `running` and leaves the wait to `wait_idle`.
+
 ## Error model
 
 - **A failed read is never an empty value.** Each property read is guarded; one that fails is `null` in the reply and listed under `unreadable` with its exception. A reply without `unreadable` read everything it shows.

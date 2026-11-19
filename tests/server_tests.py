@@ -1078,5 +1078,139 @@ class WaitIdleReviewTests(unittest.TestCase):
             self.run_wait(answer, window="A", timeout_s=60, settle_s=0)
 
 
+class SilenceTests(unittest.TestCase):
+    """A tool waiting for what it asked keeps waiting while FontLab runs without answering (live, 2026-11-19: a
+    clipboard another program held froze FontLab 20 to 60 s at a time; close_font gave up after its 30 s and
+    reported the font still open, and it closed), up to SILENCE_MAX_S past wait_s, and says so when it gives up."""
+
+    FONT = {"id": 7, "name": "Write Sans Regular"}
+    PATH = os.path.join("C:" + os.sep, "Fonts", "Open.ttf")
+
+    def run_tool(self, tool, answer, runs=True):
+        from types import SimpleNamespace
+        from unittest import mock
+        clock = SimpleNamespace(now=0.0, calls=[])
+
+        async def call(op, args=None, timeout=None):
+            clock.calls.append(op)
+            return answer(clock, op, args)
+
+        async def sleep(seconds):
+            clock.now += seconds
+
+        async def run_sync(func):
+            return func()
+        with mock.patch.object(server, "_call", call), \
+                mock.patch.object(server, "_fontlab_still_runs", lambda: runs), \
+                mock.patch.object(server, "time", SimpleNamespace(monotonic=lambda: clock.now)), \
+                mock.patch.object(server, "anyio", SimpleNamespace(sleep=sleep, to_thread=SimpleNamespace(run_sync=run_sync))):
+            try:
+                return asyncio.run(tool()), clock
+            except RuntimeError as exc:
+                exc.clock = clock
+                raise
+
+    def fontlab(self, silent_until, fonts):
+        """FontLab that does not answer until silent_until (each poll costing 10 s: timed out, or refused once
+        the listener's queue is full), then lists fonts."""
+        def answer(clock, op, args):
+            if op == "close_font":
+                return {"font": self.FONT, "edited": False}
+            if op == "open_font":
+                return {"path": self.PATH, "fonts_before": [1, 7]}
+            if clock.now < silent_until:
+                clock.now += 10
+                raise RuntimeError("[timeout] FontLab did not answer" if len(clock.calls) % 2 else
+                                   "[not_running] The FreeLab listener refused the connection: ...")
+            return {"dialog": None} if op == "dialog" else {"fonts": fonts}
+        return answer
+
+    def test_close_waits_through_silence_past_its_wait(self):
+        result, clock = self.run_tool(lambda: server.close_font(7, wait_s=30), self.fontlab(90, [{"id": 1}]))
+        self.assertEqual((result["closed"], result["font"]), (True, self.FONT))
+        self.assertGreater(clock.now, 90)
+
+    def test_open_waits_through_silence_past_its_wait(self):
+        fonts = [{"id": 1}, {"id": 7}, {"id": 101, "path": self.PATH}]
+        result, clock = self.run_tool(lambda: server.open_font(self.PATH, wait_s=20), self.fontlab(150, fonts))
+        self.assertEqual((result["opened"], result["font"]["id"]), (True, 101))
+
+    def test_a_silence_that_does_not_end_is_given_up_and_named(self):
+        with self.assertRaisesRegex(RuntimeError, r"\[still_open\] Write Sans Regular was not seen closed: .*stopped "
+                                    r"answering\. FontLab still runs but has not answered for \d+ s .*clipboard") as ctx:
+            self.run_tool(lambda: server.close_font(7, wait_s=30), self.fontlab(10_000, []))
+        clock = ctx.exception.clock
+        self.assertGreaterEqual(clock.now, 30 + server.SILENCE_MAX_S)
+        self.assertLess(clock.now, 30 + server.SILENCE_MAX_S + 30, "the ceiling holds")
+        with self.assertRaisesRegex(RuntimeError, r"\[not_opened\] .* was not seen open: .*has not answered for"):
+            self.run_tool(lambda: server.open_font(self.PATH, wait_s=10), self.fontlab(10_000, []))
+
+    def test_fontlab_back_with_the_font_still_open_is_still_open(self):
+        with self.assertRaisesRegex(RuntimeError, r"\[still_open\] Write Sans Regular is still open after 30 s: .*"
+                                    r"FontLab did not answer for \d+ s of the \d+ s waited\.") as ctx:
+            self.run_tool(lambda: server.close_font(7, wait_s=30), self.fontlab(60, [{"id": 1}, self.FONT]))
+        clock = ctx.exception.clock
+        self.assertLessEqual(clock.now, 60 + 10 + server.SILENCE_GRACE_S + 1, "a short look once FontLab answers")
+
+    def test_a_silence_within_the_wait_adds_nothing(self):
+        result, clock = self.run_tool(lambda: server.close_font(7, wait_s=30), self.fontlab(20, [{"id": 1}]))
+        self.assertTrue(result["closed"])
+        self.assertLess(clock.now, 30)
+
+    def test_a_refused_connection_once_fontlab_ended_is_no_silence(self):
+        with self.assertRaisesRegex(RuntimeError, r"^\[not_running\]") as ctx:
+            self.run_tool(lambda: server.close_font(7, wait_s=30), self.fontlab(10_000, []), runs=False)
+        self.assertLess(ctx.exception.clock.now, 30, "no wait for a FontLab that is gone")
+
+    def test_an_action_refused_while_fontlab_runs_still_runs(self):
+        def answer(clock, op, args):
+            if op == "click":
+                return {"action_id": 3, "queued": True, "window": "A"}
+            clock.now += 5
+            raise RuntimeError("[not_running] The FreeLab listener refused the connection: ...")
+        result, _clock = self.run_tool(lambda: server.click("A", "button", wait_s=2), answer)
+        self.assertEqual(result["state"], "running")
+        self.assertIn("wait_idle", result["note"])
+        with self.assertRaisesRegex(RuntimeError, r"^\[not_running\]"):
+            self.run_tool(lambda: server.click("A", "button", wait_s=2), answer, runs=False)
+
+    def test_an_answer_waits_through_silence(self):
+        question = {"class": "DlgRound", "title": "Coordinates Rounding", "text": ["Round?"], "buttons": ["OK"]}
+
+        def answer(clock, op, args):
+            if op == "answer_dialog":
+                return {"dialog": question, "answering": "OK", "answer_id": 4}
+            if clock.now < 40:
+                clock.now += 10
+                raise RuntimeError("[timeout] FontLab did not answer")
+            return {"outcome": "clicked"} if op == "answer_result" else {"dialog": None}
+        from unittest import mock
+        with mock.patch.object(server.risky.Mode, "enabled", True):
+            result, clock = self.run_tool(lambda: server.answer_dialog("OK", wait_s=10), answer)
+        self.assertEqual((result["answered"], result["next_dialog"]), (True, None))
+        self.assertGreater(clock.now, 40)
+
+    def test_launch_waits_through_a_listener_held_but_not_a_missing_one(self):
+        from unittest import mock
+
+        def held(clock, op, args):
+            if len(clock.calls) == 1:  # (before the launch: no FontLab)
+                raise RuntimeError("[not_running] The FreeLab listener is not running (no state file).")
+            if clock.now < 200:
+                clock.now += 5
+                raise RuntimeError("[timeout] FontLab did not answer")
+            return {"listener": "1.3.0"}
+
+        def missing(clock, op, args):
+            raise RuntimeError("[not_running] The FreeLab listener refused the connection: ...")
+        with mock.patch.object(server.launcher, "launch", lambda: 9), \
+                mock.patch.object(server.launcher, "fontlab_running", lambda: False):
+            result, _clock = self.run_tool(lambda: server.launch_fontlab(wait_s=120), held, runs=False)
+            self.assertEqual((result["started"], result["pid"]), (True, 9))
+            with self.assertRaisesRegex(RuntimeError, r"\[no_listener\]") as ctx:
+                self.run_tool(lambda: server.launch_fontlab(wait_s=120), missing, runs=False)
+        self.assertLess(ctx.exception.clock.now, 130, "a refusal does not extend the wait")
+
+
 if __name__ == "__main__":
     unittest.main()

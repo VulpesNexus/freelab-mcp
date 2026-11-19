@@ -442,6 +442,75 @@ async def undo(font: FontRef, expected_state: Int | None = None, expected_title:
 # -- Fonts and windows: open, close, bring to the front, compile, the Output panel, pictures ----------------
 
 POLL_S = 0.5  # how often open_font and close_font look whether FontLab has done it
+# FontLab held by its own work, or by another program holding Windows' clipboard, answers nothing for 20 to 60 s at a
+# time while its process runs (live, 2026-11-19), and what it was asked still happens. A tool waiting for that
+# outcome waits past its wait_s while FontLab is silent, up to SILENCE_MAX_S more, and looks SILENCE_GRACE_S longer
+# once FontLab answers again.
+SILENCE_MAX_S = 300.0
+SILENCE_GRACE_S = 5.0
+
+
+def _fontlab_still_runs() -> bool:
+    """Whether FontLab's process still runs (a refused connection is then FontLab's work, not its end)."""
+    try:
+        return launcher.fontlab_running()
+    except Exception:
+        return False
+
+
+async def _silence(exc: BaseException) -> bool:
+    """Whether a listener error is FontLab's silence rather than an answer or its end: a request that timed out, or
+    a connection refused while FontLab's process still runs (a listener held by FontLab's work refuses connections
+    once its queue of 8 is full, each request that timed out having left one there: live, 2026-11-19)."""
+    text = str(exc)
+    return text.startswith("[timeout]") or (
+        text.startswith("[not_running]") and await anyio.to_thread.run_sync(_fontlab_still_runs))
+
+
+class _Wait:
+    """A tool's wait for the outcome of what it asked: wait_s, then on while FontLab runs without answering, up to
+    SILENCE_MAX_S past wait_s. Each poll says whether FontLab answered (heard) or not (unheard)."""
+
+    def __init__(self, wait_s: float):
+        self.wait_s = wait_s
+        self.started = time.monotonic()
+        self.deadline = self.started + wait_s
+        self.ceiling = self.deadline + SILENCE_MAX_S
+        self.silent_since: float | None = None
+        self.silent_s = 0.0  # (the silences that ended)
+
+    def going(self) -> bool:
+        now = time.monotonic()
+        return now < self.deadline or (self.silent_since is not None and now < self.ceiling)
+
+    def heard(self) -> None:
+        if self.silent_since is None:
+            return
+        now = time.monotonic()
+        self.silent_s += now - self.silent_since
+        self.silent_since = None
+        if now > self.deadline - SILENCE_GRACE_S:  # (what FontLab was held from may happen just after)
+            self.deadline = min(max(self.deadline, now + SILENCE_GRACE_S), self.ceiling)
+
+    def unheard(self) -> None:
+        if self.silent_since is None:
+            self.silent_since = time.monotonic()
+
+    @property
+    def silent(self) -> bool:
+        return self.silent_since is not None
+
+    def about(self) -> str:
+        """What a tool that gives up adds to its message: how long FontLab did not answer, if it did not."""
+        now = time.monotonic()
+        waited = now - self.started
+        if self.silent_since is not None:
+            return (f" FontLab still runs but has not answered for {now - self.silent_since:.0f} s (held by its own work, "
+                    f"or by another program holding Windows' clipboard); the tool waited {waited:.0f} s in all, "
+                    f"{SILENCE_MAX_S:g} s past wait_s at most, and gave up without knowing the outcome.")
+        if self.silent_s >= 1.0:
+            return f" FontLab did not answer for {self.silent_s:.0f} s of the {waited:.0f} s waited."
+        return ""
 
 
 def _wait_arg(wait_s: float) -> None:
@@ -464,14 +533,19 @@ def _dialog_key(dialog: dict[str, Any] | None) -> tuple[Any, Any] | None:
     return None if dialog is None else (dialog.get("class"), dialog.get("title"))
 
 
-async def _open_fonts() -> list[dict[str, Any]] | None:
+async def _open_fonts(wait: _Wait | None = None) -> list[dict[str, Any]] | None:
     """The open fonts, or None while FontLab is too busy to answer (loading a font, for one)."""
     try:
-        return (await _call("fonts", timeout=10.0))["fonts"]
+        fonts = (await _call("fonts", timeout=10.0))["fonts"]
     except RuntimeError as exc:
-        if str(exc).startswith("[timeout]"):
-            return None
-        raise
+        if not await _silence(exc):
+            raise
+        if wait is not None:
+            wait.unheard()
+        return None
+    if wait is not None:
+        wait.heard()
+    return fonts
 
 
 def _words(text: str) -> str:
@@ -485,7 +559,8 @@ async def open_font(path: str, wait_s: float = 120.0, answer: Answer = "") -> di
 
     path is the file's full path (.vfc, .vfj, .ufo, .otf, .ttf, ... : whatever FontLab opens). A font already
     open from that path is named instead (already_open). The tool waits up to wait_s for the font to appear
-    and returns it as list_fonts describes it, with the id the other tools take. When FontLab asks something
+    (and on, up to 300 s more, while FontLab runs without answering) and returns it as list_fonts describes it,
+    with the id the other tools take. When FontLab asks something
     on the way (Coordinates Rounding, for a font with fractional coordinates), the question is left on
     screen for the user and the tool stops ([dialog_open]); the font opens once it is answered. [risky]
     answer (risky mode only) is the button to click on that question instead.
@@ -501,10 +576,10 @@ async def open_font(path: str, wait_s: float = 120.0, answer: Answer = "") -> di
         return {"opened": False, "already_open": True, "font": reply["font"]}
     before = set(reply.get("fonts_before") or [])
     asked = None
-    deadline = time.monotonic() + wait_s
-    while time.monotonic() < deadline:
+    wait = _Wait(wait_s)
+    while wait.going():
         await anyio.sleep(POLL_S)
-        fonts = await _open_fonts()
+        fonts = await _open_fonts(wait)
         if fonts is None:
             continue
         new = [font for font in fonts if font.get("id") not in before]
@@ -522,8 +597,11 @@ async def open_font(path: str, wait_s: float = 120.0, answer: Answer = "") -> di
                 continue
             raise RuntimeError(f"[dialog_open] FontLab is asking: {_question(dialog)}. It was left on screen for the "
                                "user to answer; the font opens once it is answered.")
+    if wait.silent:
+        raise RuntimeError(f"[not_opened] {path} was not seen open: FontLab was asked to open it and stopped "
+                           f"answering.{wait.about()} list_fonts shows it once it is open.")
     raise RuntimeError(f"[not_opened] FontLab did not open {path} within {wait_s:g} s; it may still be loading it "
-                       "(list_fonts shows it once it is open).")
+                       f"(list_fonts shows it once it is open).{wait.about()}")
 
 
 @mcp.tool()
@@ -536,7 +614,8 @@ async def close_font(font: FontRef, discard_changes: DiscardChanges = False, fon
     mode. FontLab's Save question about that font is answered Don't Save. When FontLab asks to save a font
     closed without discard_changes, the question is left on screen for the user and the tool stops
     ([save_prompt]). FontLab 7 does not report a change made to a font outside its History and left
-    unmarked (by a script, for one): such a font counts as unchanged and closes without a question.
+    unmarked (by a script, for one): such a font counts as unchanged and closes without a question. The tool
+    waits up to wait_s for the font to close, and on, up to 300 s more, while FontLab runs without answering.
     """
     _wait_arg(wait_s)
     args: dict[str, Any] = {"discard_changes": discard_changes}
@@ -544,10 +623,10 @@ async def close_font(font: FontRef, discard_changes: DiscardChanges = False, fon
         args["risky"] = True  # (the listener decides: a font open_font opened needs no risky mode)
     reply = await _write("close_font", _named(font_name, args, font))
     target = reply["font"]["id"]
-    deadline = time.monotonic() + wait_s
-    while time.monotonic() < deadline:
+    wait = _Wait(wait_s)
+    while wait.going():
         await anyio.sleep(POLL_S)
-        fonts = await _open_fonts()
+        fonts = await _open_fonts(wait)
         if fonts is None:
             continue
         if not any(entry.get("id") == target for entry in fonts):
@@ -556,8 +635,11 @@ async def close_font(font: FontRef, discard_changes: DiscardChanges = False, fon
         if dialog is not None and dialog.get("class") == SAVE_PROMPT_CLASS and not discard_changes:
             raise RuntimeError(f"[save_prompt] FontLab is asking: {_question(dialog)}. It was left on screen for the user "
                                "to answer; the font stays open until then.")
+    if wait.silent:
+        raise RuntimeError(f"[still_open] {reply['font'].get('name')} was not seen closed: FontLab was asked to close it "
+                           f"and stopped answering.{wait.about()} list_fonts shows whether it closed once FontLab answers.")
     raise RuntimeError(f"[still_open] {reply['font'].get('name')} is still open after {wait_s:g} s: FontLab may be asking "
-                       "something on screen, or another font came to the front first.")
+                       f"something on screen, or another font came to the front first.{wait.about()}")
 
 
 @mcp.tool()
@@ -655,22 +737,34 @@ async def answer_dialog(button: str, expected_title: str = "", wait_s: float = 1
     args = risky.require("answer_dialog", {"button": button, "expected_title": expected_title})
     reply = await _call("answer_dialog", {k: v for k, v in args.items() if v != ""})
     asked = _dialog_seen(reply["dialog"])
-    deadline = time.monotonic() + wait_s
+    wait = _Wait(wait_s)
     outcome = None
-    while time.monotonic() < deadline:
+    while wait.going():
         await anyio.sleep(POLL_S)
         if outcome is None and reply.get("answer_id") is not None:
-            outcome = (await _call("answer_result", {"answer_id": reply["answer_id"]}, timeout=10.0))["outcome"]
+            try:
+                outcome = (await _call("answer_result", {"answer_id": reply["answer_id"]}, timeout=10.0))["outcome"]
+            except RuntimeError as exc:
+                if not await _silence(exc):
+                    raise
+                wait.unheard()
+                continue
+            wait.heard()
             if outcome is None:
                 continue
             if outcome != "clicked":
                 raise RuntimeError(f"[dialog_changed] Nothing was clicked: by the time of the click FontLab no longer "
                                    f"showed {_question(reply['dialog'])} ({outcome.replace('_', ' ')}).")
-        now = await _open_dialog()
+        now = await _open_dialog(wait)
+        if wait.silent:
+            continue  # (no answer is not "no dialog")
         if _dialog_seen(now) != asked:
             return {"answered": True, "button": reply["answering"], "dialog": reply["dialog"], "next_dialog": now}
+    if wait.silent:
+        raise RuntimeError(f"[dialog_open] FontLab was not seen past {_question(reply['dialog'])}: it stopped "
+                           f"answering.{wait.about()}")
     raise RuntimeError(f"[dialog_open] FontLab still shows {_question(reply['dialog'])} after {wait_s:g} s: the click "
-                       "may not have taken, or FontLab asked the same again.")
+                       f"may not have taken, or FontLab asked the same again.{wait.about()}")
 
 
 def _mtime(path: str) -> float | None:
@@ -716,18 +810,18 @@ async def save_font(font: FontRef, path: str = "", overwrite: bool = False, keep
     shown_before = _dialog_key(await _open_dialog())
     reply = await _write("save_font", _named(font_name, args, font))
     target = reply.get("path") or target
-    deadline = time.monotonic() + wait_s
-    while time.monotonic() < deadline:
+    wait = _Wait(wait_s)
+    while wait.going():
         await anyio.sleep(POLL_S)
         now = _mtime(target) if target else None
         if now is not None and now != before:
             return {"saved": True, "path": target, "font": reply["font"], "how": reply.get("how")}
-        dialog = await _open_dialog()
+        dialog = await _open_dialog(wait)
         if dialog is not None and _dialog_key(dialog) != shown_before:
             raise RuntimeError(f"[dialog_open] FontLab is asking: {_question(dialog)}. It was left on screen for the "
                                "user to answer.")
     raise RuntimeError(f"[not_saved] {target or 'The font'} did not change within {wait_s:g} s: FontLab may still be "
-                       "saving it, or did not save it.")
+                       f"saving it, or did not save it.{wait.about()}")
 
 
 @mcp.tool()
@@ -746,20 +840,24 @@ async def export_font(font: FontRef, folder: str, format: str = "", font_name: s
     listed = _listing(folder)
     shown_before = _dialog_key(await _open_dialog())
     reply = await _write("export_font", _named(font_name, args, font))
-    deadline = time.monotonic() + wait_s
-    while time.monotonic() < deadline:
+    wait = _Wait(wait_s)
+    written: list[str] = []
+    while wait.going():
         await anyio.sleep(POLL_S)
         now = _listing(folder)
         written = sorted(name for name, when in now.items() if listed.get(name) != when)
-        dialog = await _open_dialog()
+        dialog = await _open_dialog(wait)
         if dialog is not None and dialog.get("class") != EXPORT_DONE_CLASS and _dialog_key(dialog) != shown_before:
             raise RuntimeError(f"[dialog_open] FontLab is asking: {_question(dialog)}. It was left on screen for the "
                                "user to answer.")
-        if written and (dialog is None or dialog.get("class") != EXPORT_DONE_CLASS):
+        if written and not wait.silent and (dialog is None or dialog.get("class") != EXPORT_DONE_CLASS):
             return {"exported": True, "files": [os.path.join(folder, name) for name in written], "font": reply["font"],
                     "format": reply.get("format")}
+    if written:  # (files came while FontLab did not answer: it may still be writing more)
+        return {"exported": True, "files": [os.path.join(folder, name) for name in written], "font": reply["font"],
+                "format": reply.get("format"), "note": "Not confirmed by FontLab." + wait.about()}
     raise RuntimeError(f"[not_exported] No file appeared in {folder} within {wait_s:g} s: FontLab may still be "
-                       "exporting, or its export settings write elsewhere.")
+                       f"exporting, or its export settings write elsewhere.{wait.about()}")
 
 
 # -- Windows and their controls: any FontLab window, a script's tool windows included -------------------------
@@ -792,7 +890,7 @@ async def _act(op: str, args: dict[str, Any], wait_s: float) -> dict[str, Any]:
         try:
             record = (await _call("action_result", {"action_id": action_id}, timeout=5.0))["action"]
         except RuntimeError as exc:
-            if not str(exc).startswith("[timeout]"):
+            if not await _silence(exc):  # (refused while FontLab runs is the same silence: wait_idle waits through it)
                 raise
             record = {"state": "running", "note": "FontLab is busy and did not answer (the action's work holds it)."}
             break
@@ -935,14 +1033,6 @@ async def run_menu_command(path: str, wait_s: float = 2.0) -> dict[str, Any]:
     return await _act("run_menu_command", {"path": path}, wait_s)
 
 
-def _fontlab_still_runs() -> bool:
-    """Whether FontLab's process still runs (a refused connection is then FontLab's work, not its end)."""
-    try:
-        return launcher.fontlab_running()
-    except Exception:
-        return False
-
-
 @mcp.tool()
 async def wait_idle(window: str = "", timeout_s: float = 60.0, settle_s: float = 0.5) -> dict[str, Any]:
     """Wait until FontLab's windows are idle: no action of these tools queued or running, no window busy (its
@@ -966,10 +1056,7 @@ async def wait_idle(window: str = "", timeout_s: float = 60.0, settle_s: float =
             state = await _call("window_state", {"window": bound} if bound else {}, timeout=5.0)
             silent = False
         except RuntimeError as exc:
-            # A listener held by FontLab's work stops accepting connections once its queue is full (each poll that
-            # timed out left one there): refused while FontLab still runs is the same silence (live, 2026-11-19)
-            if not str(exc).startswith("[timeout]") and not (
-                    str(exc).startswith("[not_running]") and await anyio.to_thread.run_sync(_fontlab_still_runs)):
+            if not await _silence(exc):  # (refused while FontLab still runs is silence too: see _silence)
                 raise
             state, silent = None, True  # (FontLab works without letting its events through: not idle)
             idle_since = None  # (idle must be seen again, held for settle_s, once FontLab answers)
@@ -1050,18 +1137,22 @@ async def launch_fontlab(wait_s: float = 120.0) -> dict[str, Any]:
         pid = await anyio.to_thread.run_sync(launcher.launch)
     except FileNotFoundError as exc:
         raise RuntimeError(f"[not_found] FontLab 7 is not at {exc}; set FREELAB_FONTLAB_EXE to its program file.") from None
-    deadline = time.monotonic() + wait_s
-    while time.monotonic() < deadline:
+    wait = _Wait(wait_s)
+    while wait.going():
         await anyio.sleep(2.0)
         try:
             return {"started": True, "pid": pid, "listener": await _call("ping", timeout=5.0)}
         except RuntimeError as exc:
-            if str(exc).startswith(LISTENER_ABSENT + LISTENER_STARTING):
-                continue
-            raise
+            if not str(exc).startswith(LISTENER_ABSENT + LISTENER_STARTING):
+                raise
+            # (only a timeout shows a listener there but held: a refusal is also a FontLab started without one)
+            if str(exc).startswith("[timeout]"):
+                wait.unheard()
+            else:
+                wait.heard()
     raise RuntimeError(f"[no_listener] FontLab started (process {pid}), but its listener did not answer within "
                        f"{wait_s:g} s. Install with tools/install-fontlab.ps1 -ListenerAtLaunch to start it at launch, "
-                       "or choose Scripts > FreeLab > Start MCP Listener.")
+                       f"or choose Scripts > FreeLab > Start MCP Listener.{wait.about()}")
 
 
 @mcp.tool()
@@ -1079,12 +1170,12 @@ async def quit_fontlab(wait_s: float = 60.0, discard_changes: DiscardAll = False
         await _call("quit", risky.require("quit_fontlab.discard_changes", {"discard_changes": True}))
     else:
         await _call("quit")
-    deadline = time.monotonic() + wait_s
-    while time.monotonic() < deadline:
+    wait = _Wait(wait_s)
+    while wait.going():
         if not await anyio.to_thread.run_sync(launcher.fontlab_running):
             return {"quit": True, **({"changes_discarded": True} if discard_changes else {})}
         await anyio.sleep(1.0)
-        question = await _open_dialog()
+        question = await _open_dialog(wait)
         if question is not None:
             if question.get("class") == WELCOME_CLASS:
                 continue  # (the listener closes FontLab's Welcome window with the main window: it holds no work)
@@ -1094,13 +1185,13 @@ async def quit_fontlab(wait_s: float = 60.0, discard_changes: DiscardAll = False
             words = " ".join(question.get("text") or []) or question.get("title") or question.get("class")
             raise RuntimeError(f"[{code}] FontLab is asking: {words} (buttons: {', '.join(question.get('buttons') or [])}). "
                                "It was left on screen for the user to answer; FontLab stays open until then.")
-    left = await _windows_left()
+    left = None if wait.silent else await _windows_left()
     if left is not None and left.get("main_window") is False:
         others = ", ".join(left.get("windows") or []) or "none visible"
         raise RuntimeError(f"[still_running] FontLab's main window closed, but its process is still running after "
                            f"{wait_s:g} s: a window without a parent (a script's dialog) keeps it open ({others}). "
                            "Close that window to end FontLab.")
-    raise RuntimeError(f"[still_running] FontLab was asked to close but is still running after {wait_s:g} s.")
+    raise RuntimeError(f"[still_running] FontLab was asked to close but is still running after {wait_s:g} s.{wait.about()}")
 
 
 SAVE_PROMPT_CLASS = "DlgClosePackage"  # FontLab 7.2's "Save changes to ... before closing?"
@@ -1115,12 +1206,18 @@ async def _windows_left() -> dict[str, Any] | None:
         return None
 
 
-async def _open_dialog() -> dict[str, Any] | None:
-    """The dialog FontLab is waiting on, or None (none, or the listener already gone)."""
+async def _open_dialog(wait: _Wait | None = None) -> dict[str, Any] | None:
+    """The dialog FontLab is waiting on, or None (none, the listener already gone, or FontLab silent: then wait,
+    when given, is told so)."""
     try:
-        return (await _call("dialog", timeout=5.0)).get("dialog")
-    except RuntimeError:
+        dialog = (await _call("dialog", timeout=5.0)).get("dialog")
+    except RuntimeError as exc:
+        if wait is not None and await _silence(exc):
+            wait.unheard()
         return None
+    if wait is not None:
+        wait.heard()
+    return dialog
 
 
 @mcp.tool()
