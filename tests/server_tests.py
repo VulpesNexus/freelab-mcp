@@ -1170,6 +1170,45 @@ class SilenceTests(unittest.TestCase):
         clock = ctx.exception.clock
         self.assertLessEqual(clock.now, 60 + 10 + server.SILENCE_GRACE_S + 1, "a short look once FontLab answers")
 
+    def test_a_silence_that_starts_on_the_dialog_poll_is_waited_through(self):
+        # (Codex, 2026-11-19: the dialog polls of open_font and close_font did not tell the wait FontLab was silent)
+        def answer(clock, op, args):
+            if op == "close_font":
+                return {"font": self.FONT, "edited": False}
+            if op == "dialog":
+                if 0.4 < clock.now < 60:
+                    clock.now += 5
+                    raise RuntimeError("[timeout] FontLab did not answer")
+                return {"dialog": None}
+            return {"fonts": [{"id": 1}, self.FONT] if clock.now < 60 else [{"id": 1}]}
+        result, clock = self.run_tool(lambda: server.close_font(7, wait_s=1), answer)
+        self.assertTrue(result["closed"])
+        self.assertGreater(clock.now, 60)
+
+    def test_files_that_came_while_fontlab_was_silent_are_no_export(self):
+        # (Codex, 2026-11-19: they were returned as exported, though FontLab may still have been writing them)
+        import tempfile
+        folder = tempfile.mkdtemp(prefix="freelab-export-")
+        self.addCleanup(__import__("shutil").rmtree, folder, True)
+
+        def answer(clock, op, args):
+            if op == "export_font":
+                return {"font": self.FONT, "format": "OpenType PS"}
+            if clock.now > 1:
+                if not os.path.exists(os.path.join(folder, "Write.otf")):
+                    with open(os.path.join(folder, "Write.otf"), "wb") as handle:
+                        handle.write(b"half")
+                clock.now += 10
+                raise RuntimeError("[timeout] FontLab did not answer")
+            return {"dialog": None}
+        from unittest import mock
+        with mock.patch.object(server.risky.Mode, "enabled", True):
+            result, _clock = self.run_tool(lambda: server.export_font(7, folder, wait_s=5), answer)
+        self.assertEqual((result["exported"], result["outcome"], result["files_seen"]),
+                         (None, "unknown", [os.path.join(folder, "Write.otf")]))
+        self.assertNotIn("files", result)
+        self.assertIn("not known to be over", result["note"])
+
     def test_a_silence_within_the_wait_adds_nothing(self):
         result, clock = self.run_tool(lambda: server.close_font(7, wait_s=30), self.fontlab(20, [{"id": 1}]))
         self.assertTrue(result["closed"])

@@ -567,8 +567,8 @@ async def open_font(path: str, wait_s: float = 120.0, answer: Answer = "", safe_
 
     A font file FontLab 7.2 is known to crash on (a GPOS single adjustment of format 2 with no values, as in
     Noto Sans JP's variable font) is refused ([known_crasher]), since a crash loses the unsaved work in every
-    open font. safe_copy=True opens a fixed copy of it instead, written to a temporary folder, the same font to
-    FontLab; the user's file is not changed, and the reply's safe_copy says where the copy is: tell the user.
+    open font. safe_copy=True opens a fixed copy of it instead, written to FreeLab's own folder (safe-copies, beside
+    the listener's state file), the same font to FontLab; the user's file is not changed, and the reply's safe_copy says where the copy is: tell the user.
     A check that could not be made (a WOFF2 without brotli) is said in crash_check.
     """
     _wait_arg(wait_s)
@@ -600,7 +600,7 @@ async def open_font(path: str, wait_s: float = 120.0, answer: Answer = "", safe_
         if len(new) == 1:
             return {"opened": True, "font": new[0], "note": "FontLab gives the font another path than the file opened.",
                     **extra}
-        dialog = await _open_dialog()
+        dialog = await _open_dialog(wait)  # (Codex, 2026-11-19: a silence that began here went untold)
         if dialog is not None and _dialog_key(dialog) != shown_before:
             if answer and any(_words(b) == _words(answer) for b in dialog.get("buttons") or []):
                 asked = dialog  # (the listener clicks it from a timer)
@@ -647,7 +647,7 @@ async def close_font(font: FontRef, discard_changes: DiscardChanges = False, fon
             continue
         if not any(entry.get("id") == target for entry in fonts):
             return {"closed": True, "font": reply["font"], "changes_discarded": bool(discard_changes and reply.get("edited"))}
-        dialog = await _open_dialog()
+        dialog = await _open_dialog(wait)
         if dialog is not None and dialog.get("class") == SAVE_PROMPT_CLASS and not discard_changes:
             raise RuntimeError(f"[save_prompt] FontLab is asking: {_question(dialog)}. It was left on screen for the user "
                                "to answer; the font stays open until then.")
@@ -849,7 +849,8 @@ async def export_font(font: FontRef, folder: str, format: str = "", font_name: s
     folder is an existing folder's full path; FontLab names the file, and replaces a file of that name.
     format is an export profile's name (OpenType TT and OpenType PS are proven); left out, the profile the
     user exported with last. FontLab's export settings are read, never changed. The tool waits up to wait_s
-    for the files to appear and returns them; FontLab's Font Exported message is closed.
+    for the files to appear and returns them; FontLab's Font Exported message is closed. Files that appeared
+    while FontLab stopped answering are returned as files_seen, with exported None (outcome unknown).
     """
     _wait_arg(wait_s)
     args = risky.require("export_font", {"folder": folder, "format": format})
@@ -869,9 +870,12 @@ async def export_font(font: FontRef, folder: str, format: str = "", font_name: s
         if written and not wait.silent and (dialog is None or dialog.get("class") != EXPORT_DONE_CLASS):
             return {"exported": True, "files": [os.path.join(folder, name) for name in written], "font": reply["font"],
                     "format": reply.get("format")}
-    if written:  # (files came while FontLab did not answer: it may still be writing more)
-        return {"exported": True, "files": [os.path.join(folder, name) for name in written], "font": reply["font"],
-                "format": reply.get("format"), "note": "Not confirmed by FontLab." + wait.about()}
+    if written:  # (files came while FontLab did not answer: it may still be writing them, or more; Codex, 2026-11-19:
+        # this said exported True)
+        return {"exported": None, "outcome": "unknown", "files_seen": [os.path.join(folder, name) for name in written],
+                "font": reply["font"], "format": reply.get("format"),
+                "note": "Files appeared, but FontLab did not answer, so the export is not known to be over: they may be "
+                        "incomplete, and more may come. Check them once FontLab answers." + wait.about()}
     raise RuntimeError(f"[not_exported] No file appeared in {folder} within {wait_s:g} s: FontLab may still be "
                        f"exporting, or its export settings write elsewhere.{wait.about()}")
 

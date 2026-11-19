@@ -2866,22 +2866,75 @@ def _u32(data, at):
         raise FontFileError("an offset points past the end of the data")
 
 
-def _coverage_size(data, at):
+class FontFileLimit(FontFileError):
+    """A GPOS that lists more subtables than MAX_GPOS_STEPS: the same data, listed over and over."""
+
+
+MAX_WOFF_TABLE = 256 * 1024 * 1024  # a WOFF table's length at most (a CJK font's glyf is some tens of megabytes)
+MAX_GPOS_STEPS = 200000  # subtables and coverage ranges read in one GPOS at most (a CJK font reads some thousands);
+# lookups and subtables may share their data, so a table of 260 KB could list 4 billion subtables
+
+
+class _Steps(object):
+    """The steps empty_single_adjustments may still take."""
+
+    def __init__(self):
+        self.left = MAX_GPOS_STEPS
+
+    def take(self, count=1):
+        self.left -= count
+        if self.left < 0:
+            raise FontFileLimit("its GPOS lists more than %d subtables and coverage ranges (the same data, listed "
+                                "over and over)" % MAX_GPOS_STEPS)
+
+
+def _coverage_size(data, at, steps=None):
     """How many glyphs the Coverage table at at covers (None for a format that is not 1 or 2)."""
     form = _u16(data, at)
     if form == 1:
         return _u16(data, at + 2)
     if form == 2:
-        return sum(max(0, _u16(data, at + 6 + 6 * k) - _u16(data, at + 4 + 6 * k) + 1)
-                   for k in range(_u16(data, at + 2)))
+        ranges = _u16(data, at + 2)
+        if steps is not None:
+            steps.take(ranges)
+        return sum(max(0, _u16(data, at + 6 + 6 * k) - _u16(data, at + 4 + 6 * k) + 1) for k in range(ranges))
     return None
 
 
-def empty_single_adjustments(gpos):
+def _lookup_empty_singles(gpos, lookups, li, found, steps, coverages):
+    """empty_single_adjustments' reading of lookup li, its findings added to found."""
+    lookup = lookups + _u16(gpos, lookups + 2 + 2 * li)
+    kind = _u16(gpos, lookup)
+    if kind not in (1, 9):
+        return
+    for si in range(_u16(gpos, lookup + 4)):
+        steps.take()
+        at = lookup + _u16(gpos, lookup + 6 + 2 * si)
+        if kind == 9:
+            if _u16(gpos, at) != 1 or _u16(gpos, at + 2) != 1:
+                continue  # (an extension of another lookup type)
+            at += _u32(gpos, at + 4)
+        if _u16(gpos, at) != 2 or _u16(gpos, at + 6) != 0:
+            continue
+        where = at + _u16(gpos, at + 2)
+        if where not in coverages:
+            try:
+                coverages[where] = _coverage_size(gpos, where, steps)
+            except FontFileLimit:
+                raise
+            except FontFileError:
+                coverages[where] = None
+        found.append({"lookup": li, "subtable": si, "extension": kind == 9, "value_format": _u16(gpos, at + 4),
+                      "glyphs": coverages[where], "at": at})
+
+
+def empty_single_adjustments(gpos, errors=None):
     """The single adjustment subtables of format 2 with no values in a GPOS table's bytes, in lookup order:
     [{"lookup", "subtable", "extension", "value_format", "glyphs", "at"}], lookup and subtable counted from 0 as
     fontTools counts them, at the subtable's offset in the table. Raises FontFileError when the table cannot be
-    read that far."""
+    read that far, or lists more than MAX_GPOS_STEPS subtables (FontFileLimit). errors: a list, to read on
+    instead: a lookup that cannot be read adds its error there and the next is read; past the limit, the error is
+    added and what was found is returned (a crasher found is never lost to a later part that cannot be read)."""
     version = _u16(gpos, 0)
     if version != 1:
         raise FontFileError("its GPOS has version %d, which is not known" % version)
@@ -2889,32 +2942,30 @@ def empty_single_adjustments(gpos):
     found = []
     if not lookups:
         return found
+    steps, coverages = _Steps(), {}
     for li in range(_u16(gpos, lookups)):
-        lookup = lookups + _u16(gpos, lookups + 2 + 2 * li)
-        kind = _u16(gpos, lookup)
-        if kind not in (1, 9):
-            continue
-        for si in range(_u16(gpos, lookup + 4)):
-            at = lookup + _u16(gpos, lookup + 6 + 2 * si)
-            if kind == 9:
-                if _u16(gpos, at) != 1 or _u16(gpos, at + 2) != 1:
-                    continue  # (an extension of another lookup type)
-                at += _u32(gpos, at + 4)
-            if _u16(gpos, at) != 2 or _u16(gpos, at + 6) != 0:
-                continue
-            try:
-                glyphs = _coverage_size(gpos, at + _u16(gpos, at + 2))
-            except FontFileError:
-                glyphs = None
-            found.append({"lookup": li, "subtable": si, "extension": kind == 9, "value_format": _u16(gpos, at + 4),
-                          "glyphs": glyphs, "at": at})
+        try:
+            _lookup_empty_singles(gpos, lookups, li, found, steps, coverages)
+        except FontFileError as exc:
+            if errors is None:
+                raise
+            errors.append(exc)
+            if isinstance(exc, FontFileLimit):
+                break
     return found
 
 
 def _reader(source):
-    """read(at, length) over a file object or bytes; FontFileError when the data ends early."""
+    """read(at, length) over a file object or bytes; FontFileError when the data ends early. A file's size is
+    known first, so a length the file declares past its end is refused before anything is read (Codex,
+    2026-11-19: a collection that says it holds 4 billion fonts asked Python for 17 GB at once)."""
     if hasattr(source, "seek"):
+        source.seek(0, 2)
+        size = source.tell()
+
         def read(at, length):
+            if at < 0 or length < 0 or at + length > size:
+                raise FontFileError("the file ends before its tables do")
             source.seek(at)
             data = source.read(length)
             if len(data) != length:
@@ -2922,7 +2973,7 @@ def _reader(source):
             return data
     else:
         def read(at, length):
-            if at + length > len(source):
+            if at < 0 or length < 0 or at + length > len(source):
                 raise FontFileError("the file ends before its tables do")
             return source[at:at + length]
     return read
@@ -2939,13 +2990,14 @@ def _sfnt_tables(read, base):
     return tables
 
 
-def _sfnt_findings(read, base):
-    """The empty single adjustments of the font whose offset table is at base, each at its file offset."""
+def _sfnt_findings(read, base, errors=None):
+    """The empty single adjustments of the font whose offset table is at base, each at its file offset. errors: as
+    empty_single_adjustments takes it (the table directory and the GPOS table must still be read whole)."""
     tables = _sfnt_tables(read, base)
     if b"GPOS" not in tables:
         return []
     offset, length, _entry = tables[b"GPOS"]
-    found = empty_single_adjustments(read(offset, length))
+    found = empty_single_adjustments(read(offset, length), errors)
     for finding in found:
         finding["at"] += offset
     return found
@@ -2969,12 +3021,18 @@ def _woff_tables(read):
 
 
 def _woff_table(read, entry):
-    """A WOFF table's bytes (zlib, unless stored as is)."""
+    """A WOFF table's bytes (zlib, unless stored as is), never more than its directory says, nor than
+    MAX_WOFF_TABLE (a small zlib stream can expand to gigabytes)."""
     _tag, offset, compressed, length, _checksum = entry
+    if length > MAX_WOFF_TABLE:
+        raise FontFileError("a table says it is %d bytes long, more than any font's" % length)
     data = read(offset, compressed)
     if compressed < length:
         try:
-            data = zlib.decompress(bytes(data))
+            inflater = zlib.decompressobj()
+            data = inflater.decompress(bytes(data), length)
+            if inflater.unconsumed_tail:
+                raise FontFileError("a table is longer than its directory says")
         except zlib.error as exc:
             raise FontFileError("a table could not be decompressed (%s)" % exc)
     if len(data) != length:
@@ -3017,9 +3075,9 @@ def _u255(data, at):
     return code, at + 1
 
 
-def _woff2_findings(data):
+def _woff2_findings(data, errors=None):
     """[(font index, findings)] of a WOFF2 file's bytes; None when brotli is missing. Only GPOS is read, which
-    WOFF2 never transforms."""
+    WOFF2 never transforms. errors: as empty_single_adjustments takes it."""
     decompress = _brotli_decompress()
     if decompress is None:
         return None
@@ -3060,7 +3118,7 @@ def _woff2_findings(data):
         if tag == b"GPOS":
             if offset + length > len(stream):
                 raise FontFileError("its GPOS ends past its data")
-            subtables = empty_single_adjustments(stream[offset:offset + length])
+            subtables = empty_single_adjustments(stream[offset:offset + length], errors)
             for font in ([f for f, indexes in enumerate(fonts) if index in indexes] if fonts is not None else [0]):
                 found.setdefault(font, []).extend(dict(s) for s in subtables)
         offset += length
@@ -3071,9 +3129,10 @@ def scan_font_file(path):
     """open_font's check: the single adjustments with no values a font file holds.
 
     {"format": "sfnt", "collection", "woff", "woff2", or None (no binary GPOS to check: a FontLab, UFO, or Glyphs
-    source, a folder, or no font), "checked": whether the check was made, "why_not": why not (when it could not
-    be), "fonts": [{"font": index in the file, "subtables": [...]}] (the fonts that hold some), "count": how many
-    in all}. A collection's fonts are each checked."""
+    source, a folder, or no font), "checked": whether the check was made whole, "why_not": why not (when part of
+    the file could not be read), "fonts": [{"font": index in the file, "subtables": [...]}] (the fonts that hold
+    some, also those found before a part that could not be read), "count": how many in all}. A collection's fonts
+    are each checked."""
     result = {"format": None, "checked": False, "fonts": [], "count": 0}
     if not os.path.isfile(path):
         return result
@@ -3094,28 +3153,39 @@ def scan_font_file(path):
                 result["format"] = "woff2"
             else:
                 return result
+            pairs, problems = [], []  # (what was found is kept when a later part cannot be read)
             try:
                 if result["format"] == "sfnt":
-                    pairs = [(0, _sfnt_findings(read, 0))]
+                    pairs = [(0, _sfnt_findings(read, 0, problems))]
                 elif result["format"] == "collection":
-                    pairs = [(k, _sfnt_findings(read, base)) for k, base in enumerate(_collection_bases(read))]
+                    for k, base in enumerate(_collection_bases(read)):
+                        try:
+                            pairs.append((k, _sfnt_findings(read, base, problems)))
+                        except FontFileError as exc:
+                            problems.append(exc)
                 elif result["format"] == "woff":
                     gpos = [e for e in _woff_tables(read)[1] if e[0] == b"GPOS"]
-                    pairs = [(0, empty_single_adjustments(_woff_table(read, gpos[0])) if gpos else [])]
+                    pairs = [(0, empty_single_adjustments(_woff_table(read, gpos[0]), problems) if gpos else [])]
                 else:
-                    pairs = _woff2_findings(read(0, os.path.getsize(path)))
+                    pairs = _woff2_findings(read(0, os.path.getsize(path)), problems)
                     if pairs is None:
                         result["why_not"] = u"WOFF2 needs brotli, which this Python does not have"
                         return result
             except FontFileError as exc:
-                result["why_not"] = u"its tables could not be read: %s" % _text(exc)
-                return result
+                problems.append(exc)
+            except (MemoryError, OverflowError, struct.error) as exc:  # (a last guard: lengths are checked first)
+                problems.append(FontFileError("it is too large to read (%s)" % type(exc).__name__))
     except (IOError, OSError) as exc:
         result["why_not"] = u"it could not be read: %s" % _exc_text(exc)
         return result
-    result["checked"] = True
     result["fonts"] = [{"font": font, "subtables": found} for font, found in pairs if found]
     result["count"] = sum(len(entry["subtables"]) for entry in result["fonts"])
+    if problems:  # (not checked whole: what was found still counts)
+        more = len(problems) - 1
+        result["why_not"] = u"its tables could not be read: %s%s" % (
+            _text(problems[0]), u" (and %d more %s)" % (more, u"error" if more == 1 else u"errors") if more else u"")
+        return result
+    result["checked"] = True
     return result
 
 
@@ -3181,20 +3251,28 @@ def fixed_font_bytes(data, fmt):
     read = _reader(data)
     bases = [0] if fmt == "sfnt" else _collection_bases(read)
     patched = set()
+    directories = {}  # (as scan_font_file reads: past a part it cannot read; a font whose tables cannot be listed
+    # is left as it is)
     for base in bases:
-        for finding in _sfnt_findings(read, base):
+        try:
+            directories[base] = _sfnt_tables(read, base)
+            findings = _sfnt_findings(read, base, [])
+        except FontFileError:
+            continue
+        for finding in findings:
             if finding["at"] not in patched:
                 struct.pack_into(">H", data, finding["at"], 1)
                 struct.pack_into(">H", data, finding["at"] + 4, 0)
                 patched.add(finding["at"])
     for base in bases:
-        tables = _sfnt_tables(read, base)
+        tables = directories.get(base, {})
         if b"GPOS" in tables:
             offset, length, entry = tables[b"GPOS"]
-            struct.pack_into(">I", data, entry + 4, _checksum(data, offset, length))
+            if offset + length <= len(data):
+                struct.pack_into(">I", data, entry + 4, _checksum(data, offset, length))
     for base in bases:
-        tables = _sfnt_tables(read, base)
-        if b"head" not in tables:
+        tables = directories.get(base, {})
+        if b"head" not in tables or tables[b"head"][0] + 12 > len(data):
             continue
         head = tables[b"head"][0]
         struct.pack_into(">I", data, head + 8, 0)
@@ -3230,21 +3308,31 @@ def write_safe_copy(path, scan, target):
     fmt = scan["format"]
     if fmt == "woff2":
         raise FontFileError("a WOFF2 file is not copied here: convert it to TTF or OTF first, then open that")
-    with open(path, "rb") as handle:
-        if fmt == "woff":
-            data, fmt = _sfnt_from_woff(_reader(handle)), "sfnt"
-        else:
-            data = bytearray(handle.read())
-    data, changed = fixed_font_bytes(data, fmt)
+    try:
+        with open(path, "rb") as handle:
+            if fmt == "woff":
+                data, fmt = _sfnt_from_woff(_reader(handle)), "sfnt"
+            else:
+                data = bytearray(handle.read())
+        data, changed = fixed_font_bytes(data, fmt)
+    except (MemoryError, OverflowError, struct.error) as exc:  # (Codex, 2026-11-19: a head past the file's end)
+        raise FontFileError("its tables could not be rewritten (%s)" % type(exc).__name__)
     parent = os.path.dirname(target)
     if not os.path.isdir(parent):
         os.makedirs(parent)
     temp = u"%s.%d.tmp" % (target, os.getpid())
-    with open(temp, "wb") as handle:
-        handle.write(bytes(data))
-    if os.path.exists(target):
-        os.remove(target)
-    os.rename(temp, target)
+    try:
+        with open(temp, "wb") as handle:
+            handle.write(bytes(data))
+        if os.path.exists(target):
+            os.remove(target)
+        os.rename(temp, target)
+    finally:
+        if os.path.exists(temp):  # (a write or a rename that failed leaves no half copy)
+            try:
+                os.remove(temp)
+            except OSError:
+                pass
     return changed
 
 
@@ -3292,13 +3380,14 @@ def op_open_font(listener, args):
             raise FreeLabError("known_crasher", (
                 u"FontLab 7.2 crashes on opening %s (not every time: it depends on what FontLab's memory held), and a "
                 u"crash loses the unsaved work in every open font. Its GPOS holds %s. Nothing was opened. open_font "
-                u"with safe_copy=True opens a fixed copy instead, written to a temporary folder: %s nothing, so %s "
+                u"with safe_copy=True opens a fixed copy instead, written to FreeLab's own folder: %s nothing, so %s "
                 u"made an empty single adjustment of format 1, which FontLab opens, and the font is the same; the "
                 u"file itself is not changed.") % (
                     name, crasher_summary(scan),
                     u"such a subtable positions" if scan["count"] == 1 else u"such subtables position",
                     u"it is" if scan["count"] == 1 else u"each is"),
-                {"path": path, "format": scan["format"], "count": scan["count"], "fonts": crasher_report(scan)})
+                dict({"path": path, "format": scan["format"], "count": scan["count"], "fonts": crasher_report(scan)},
+                     **({"unchecked": scan["why_not"]} if scan.get("why_not") else {})))
         try:
             target = safe_copy_path(path, scan, _copies_folder(listener))
             package = _open_from(target)
@@ -3317,6 +3406,10 @@ def op_open_font(listener, args):
                         u"empty single adjustment of format 1, which positions nothing either, so the font is the "
                         u"same. The file itself is not changed.") % (
                             name, target, crasher_summary(scan), u"was" if scan["count"] == 1 else u"were each")
+        if scan.get("why_not"):
+            copy["unchecked"] = scan["why_not"]
+            copy["note"] += (u" Part of it was not checked (%s): FontLab may still crash on what is there." %
+                             scan["why_not"])
         path = target
     before = [_font_id(package) for package in open_packages()]
     _check_deadline(listener)

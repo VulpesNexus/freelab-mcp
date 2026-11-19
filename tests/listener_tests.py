@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import socket
+import struct
 import sys
 import tempfile
 import threading
@@ -1845,6 +1846,20 @@ class WindowTests(FontCase):
                       self.fails("open_font", {"path": one}, code="known_crasher")["message"])
         self.assertNotIn("at", error["data"]["fonts"][0]["subtables"][0], "no file offsets")
         self.assertEqual((self.state.timers, self.state.loads), ([], []), "nothing opened")
+
+    def test_a_crasher_found_before_a_damaged_part_is_refused(self):
+        # (Codex, 2026-11-19: a damaged part after the crasher made the check "not made", and the file opened)
+        broken = bytearray(fontbytes.lookup(1, [fontbytes.single(1, 0)]))
+        struct.pack_into(">H", broken, 6, 0xFFF0)
+        gpos = fontbytes.gpos([fontbytes.lookup(1, [fontbytes.single(2, 0, 0)]), bytes(broken)])
+        path = self.crasher_file("Half.ttf", fontbytes.sfnt({b"head": fontbytes.head(), b"GPOS": gpos}))
+        error = self.fails("open_font", {"path": path}, code="known_crasher")
+        self.assertIn("past the end", error["data"]["unchecked"])
+        reply = self.ok("open_font", {"path": path, "safe_copy": True})
+        self.assertIn(u"Part of it was not checked", reply["safe_copy"]["note"])
+        self.assertEqual(reply["safe_copy"]["changed"], 1)
+        self.state.fire_timers()
+        self.assertEqual(self.state.loads, [reply["safe_copy"]["path"]], "the copy, never the file")
 
     def test_open_font_opens_a_fixed_copy_with_safe_copy(self):
         path = self.crasher_file()
