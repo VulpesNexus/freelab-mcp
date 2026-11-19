@@ -952,20 +952,24 @@ async def wait_idle(window: str = "", timeout_s: float = 60.0, settle_s: float =
     idle_since = None
     state: dict[str, Any] | None = None
     silent = False
+    bound = window  # (the window's key once found: a title that changes meanwhile does not move the wait elsewhere)
     while True:
         try:
-            state = await _call("window_state", {"window": window} if window else {}, timeout=5.0)
+            state = await _call("window_state", {"window": bound} if bound else {}, timeout=5.0)
             silent = False
         except RuntimeError as exc:
             if not str(exc).startswith("[timeout]"):
                 raise
             state, silent = None, True  # (FontLab works without letting its events through: not idle)
+            idle_since = None  # (idle must be seen again, held for settle_s, once FontLab answers)
         now = time.monotonic()
         if state is not None:
             waited = round(now - started, 2)
             last = state.get("last_action")
             dialog = state.get("dialog")
             target = state.get("window")
+            if window and target is not None and target.get("window"):
+                bound = target["window"]
             if dialog is not None and not (target and target.get("window") == state.get("dialog_window")):
                 return {"idle": False, "dialog": dialog, "dialog_window": state.get("dialog_window"),
                         "question": state.get("question"), "last_action": last, "waited_s": waited,
@@ -973,7 +977,8 @@ async def wait_idle(window: str = "", timeout_s: float = 60.0, settle_s: float =
                                  "it." if state.get("question") else "A script's dialog waits: list_window_controls "
                                  "with window \"dialog\" shows its controls.")}
             pending = state.get("actions_pending") or []
-            if window:
+            if window:  # (only that window's work counts: another window's actions do not hold it)
+                pending = [p for p in pending if p.get("window") == bound]
                 busy = target is not None and bool(target.get("busy"))
                 closed = target is None
             else:

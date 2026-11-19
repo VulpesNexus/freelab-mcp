@@ -1010,5 +1010,54 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual((result["started"], result["pid"]), (True, 77))
 
 
+class WaitIdleReviewTests(unittest.TestCase):
+    """Codex's review of 1.3.0 (2026-11-19), findings 10 and 11: wait_idle with a window counts that window's work
+    only, and idle seen before FontLab fell silent does not count toward settle_s."""
+
+    def run_wait(self, answer, **kwargs):
+        from types import SimpleNamespace
+        from unittest import mock
+        clock = SimpleNamespace(now=0.0, calls=0)
+
+        async def call(op, args=None, timeout=None):
+            clock.calls += 1
+            return answer(clock, args)
+
+        async def sleep(seconds):
+            clock.now += seconds
+        with mock.patch.object(server, "_call", call), \
+                mock.patch.object(server, "time", SimpleNamespace(monotonic=lambda: clock.now)), \
+                mock.patch.object(server, "anyio", SimpleNamespace(sleep=sleep)):
+            return asyncio.run(server.wait_idle(**kwargs)), clock
+
+    @staticmethod
+    def idle(window="A", pending=()):
+        return {"window": {"window": window, "busy": False}, "dialog": None, "busy_windows": [],
+                "actions_pending": list(pending)}
+
+    def test_another_windows_action_does_not_hold_the_wait(self):
+        other = [{"id": 1, "tool": "click", "state": "running", "window": "B"}]
+        result, _clock = self.run_wait(lambda clock, args: self.idle(pending=other), window="a", timeout_s=2, settle_s=0)
+        self.assertTrue(result["idle"])
+        own = [{"id": 2, "tool": "click", "state": "running", "window": "A"}]
+        with self.assertRaises(RuntimeError):  # (its own action holds it)
+            self.run_wait(lambda clock, args: self.idle(pending=own), window="a", timeout_s=2, settle_s=0)
+        closed, _clock = self.run_wait(lambda clock, args: dict(self.idle(pending=other), window=None),
+                                       window="a", timeout_s=2, settle_s=0)
+        self.assertTrue(closed["window_closed"])
+
+    def test_silence_starts_the_settling_again(self):
+        def answer(clock, args):
+            if clock.calls == 2:
+                clock.now += 5
+                raise RuntimeError("[timeout] FontLab did not answer")
+            if clock.calls >= 4:
+                clock.now += 0.5
+            return self.idle()
+        result, clock = self.run_wait(answer, window="A", timeout_s=20, settle_s=0.5)
+        self.assertTrue(result["idle"])
+        self.assertGreaterEqual(clock.calls, 4, "the idle seen before the silence did not count")
+
+
 if __name__ == "__main__":
     unittest.main()

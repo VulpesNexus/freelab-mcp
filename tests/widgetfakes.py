@@ -27,7 +27,7 @@ PARENTS = {
 }
 
 MEMBERS = {
-    "QObject": ("children", "isWidgetType", "inherits", "metaObject", "objectName", "property"),
+    "QObject": ("children", "isWidgetType", "inherits", "metaObject", "objectName", "property", "setProperty"),
     "QWidget": ("isVisible", "isWindow", "parentWidget", "windowTitle", "enabled", "modal", "layout", "accessibleName",
                 "toolTip", "findChildren"),
     "QAbstractButton": ("text", "checkable", "checked", "click"),
@@ -178,6 +178,9 @@ class Widget(Strict):
     def m_property(self, name):
         return self._f_props.get(name)
 
+    def m_setProperty(self, name, value):
+        self._f_props[name] = value
+
     def m_isVisible(self):
         return self._f_visible()
 
@@ -325,11 +328,13 @@ class Layout(Strict):
         object.__setattr__(self, "_f_members", frozenset(["count", "itemAt"]))
         object.__setattr__(self, "_f_values", {})
         object.__setattr__(self, "_f_items", list(items))
+        object.__setattr__(self, "_f_reads", [0])  # (itemAt calls: a listing reads each layout once)
 
     def m_count(self):
         return len(self._f_items)
 
     def m_itemAt(self, index):
+        self._f_reads[0] += 1
         return _LayoutItem(self._f_items[index])
 
 
@@ -353,9 +358,11 @@ class Action(Strict):
     def __init__(self, text, name=u"", menu=None, separator=False, on=None, props=None, **values):
         object.__setattr__(self, "_f_class", "QAction")
         object.__setattr__(self, "_f_members", frozenset(["text", "enabled", "checkable", "checked", "visible",
-                                                          "isSeparator", "menu", "trigger", "objectName", "property"]))
+                                                          "isSeparator", "menu", "trigger", "objectName", "property",
+                                                          "toolTip"]))
         object.__setattr__(self, "_f_values", dict({"text": text, "objectName": name, "enabled": True,
-                                                    "checkable": False, "checked": False, "visible": True}, **values))
+                                                    "checkable": False, "checked": False, "visible": True,
+                                                    "toolTip": u""}, **values))
         object.__setattr__(self, "_f_menu", menu)
         object.__setattr__(self, "_f_separator", separator)
         object.__setattr__(self, "_f_on", on)
@@ -396,16 +403,48 @@ class Row(object):
 class QModelIndex(Strict):
     """QtCore.QModelIndex: QModelIndex() is the root; the model makes the others."""
 
-    def __init__(self, row=None, number=-1, column=0, siblings=None):
+    def __init__(self, row=None, number=-1, column=0, parent=None):
         object.__setattr__(self, "_f_class", "QModelIndex")
-        object.__setattr__(self, "_f_members", frozenset(["isValid"]))
+        object.__setattr__(self, "_f_members", frozenset(["isValid", "row", "parent"]))
         object.__setattr__(self, "_f_values", {})
         object.__setattr__(self, "_f_row", row)
         object.__setattr__(self, "_f_number", number)
         object.__setattr__(self, "_f_column", column)
+        object.__setattr__(self, "_f_parent_index", parent)
 
     def m_isValid(self):
         return self._f_row is not None
+
+    def m_row(self):
+        return self._f_number
+
+    def m_parent(self):
+        return self._f_parent_index if self._f_parent_index is not None else QModelIndex()
+
+
+class QPersistentModelIndex(Strict):
+    """QtCore.QPersistentModelIndex: it follows its row as rows move (here: the very Row object), and is invalid
+    once its row is gone or its model holds other rows."""
+
+    def __init__(self, index):
+        object.__setattr__(self, "_f_class", "QPersistentModelIndex")
+        object.__setattr__(self, "_f_members", frozenset(["isValid", "row"]))
+        object.__setattr__(self, "_f_values", {})
+        object.__setattr__(self, "_f_row", index._f_row)
+        object.__setattr__(self, "_f_siblings", index._f_values.get("siblings"))
+
+    def _f_place(self):
+        siblings = self._f_siblings
+        for number, row in enumerate(siblings if siblings is not None else ()):
+            if row is self._f_row:
+                return number
+        return -1
+
+    def m_isValid(self):
+        return self._f_row is not None and self._f_place() >= 0
+
+    def m_row(self):
+        return self._f_place()
 
 
 class Model(Strict):
@@ -432,7 +471,17 @@ class Model(Strict):
         return len(self._f_headers)
 
     def m_index(self, row, column, parent):
-        return QModelIndex(self._f_under(parent)[row], row, column)
+        siblings = self._f_under(parent)
+        index = QModelIndex(siblings[row], row, column, parent if parent._f_row is not None else None)
+        index._f_values["siblings"] = siblings
+        return index
+
+    # (a test may give a model its own flags, or a setData that refuses: _f_flags, _f_refuse)
+    def m_flags(self, index):
+        flags = getattr(self, "_f_flags", None)
+        if flags is not None:
+            return flags
+        return 1 | 32 | (16 if index._f_row.check is not None else 0)
 
     def m_data(self, index, role):
         if role == 10:
@@ -445,11 +494,10 @@ class Model(Strict):
         assert (orientation, role) == (1, 0)
         return self._f_headers[section]
 
-    def m_flags(self, index):
-        return 1 | 32 | (16 if index._f_row.check is not None else 0)
-
     def m_setData(self, index, value, role):
         assert role == 10 and index._f_row.check is not None
+        if getattr(self, "_f_refuse", False):
+            return False
         index._f_row.check = value
         self._f_changed.append((index._f_row.texts[0], value))
         return True

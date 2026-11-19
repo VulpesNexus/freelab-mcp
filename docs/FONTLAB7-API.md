@@ -97,7 +97,8 @@ New in 1.3.0 ([WINDOW-TOOLS.md](WINDOW-TOOLS.md)), and **stub-tested only**: the
 | Object | Member | Used by | Suite |
 |---|---|---|---|
 | `QApplication` | `topLevelWidgets()`, `activeModalWidget()` | every window tool | yes |
-| `QObject`, `QWidget` | `children()`, `isWidgetType()`, `isWindow()`, `inherits(name)`, `metaObject().className()`, `objectName`, `property(name)` (a dynamic property; `None` when unset), `isVisible()`, `parentWidget()`, `layout()`, `windowTitle`, `enabled`, `modal`, `accessibleName`, `toolTip`, `findChildren(QProgressBar)`, `findChildren(QMenuBar)` | the walk, the conventions, busy | most |
+| `QObject`, `QWidget` | `children()`, `isWidgetType()`, `isWindow()`, `inherits(name)`, `metaObject().className()`, `objectName`, `property(name)` (a dynamic property; `None` when unset), `setProperty(name, int)` (a window's number when several share a name), `isVisible()`, `parentWidget()`, `layout()`, `windowTitle`, `enabled`, `modal`, `accessibleName`, `toolTip`, `findChildren(QProgressBar)`, `findChildren(QMenuBar)` | the walk, the conventions, busy, window keys | most |
+| `QModelIndex`, `QPersistentModelIndex` | `isValid()`, `row()`, `parent()`; `QtCore.QPersistentModelIndex(index)`, `isValid()`, `row()` | an action's row followed where it moves | no |
 | `QLayout`, `QLayoutItem` | `count()`, `itemAt(i)`; `widget()`, `layout()` | a control's caption from the label before it | yes |
 | `QAbstractButton` | `text`, `checkable`, `checked`, `click()` | `click`, `set_value` | `click()`: no |
 | `QPushButton`, `QToolButton` | `menu()`; `popupMode`, `defaultAction()` | a button's menu entries | partly |
@@ -111,7 +112,7 @@ New in 1.3.0 ([WINDOW-TOOLS.md](WINDOW-TOOLS.md)), and **stub-tested only**: the
 | `QAbstractItemView`, `QTreeView` | `model()`, `selectionModel().isSelected(index)`, `setCurrentIndex(index)`, the signals `clicked`, `doubleClicked`, and `activated(QModelIndex)` emitted; `isExpanded(index)` | `read_list`, `click` and `set_value` on a row | no |
 | `QAbstractItemModel` | `rowCount(parent)`, `columnCount(parent)`, `index(row, column, parent)`, `data(index, role)`, `headerData(section, Qt.Horizontal, role)`, `flags(index)`, `setData(index, value, Qt.CheckStateRole)`; `QtCore.QModelIndex()` for the root | `read_list`, `set_value` on a row | no |
 | `QProgressBar` | `value`, `minimum`, `maximum` | busy | yes |
-| `QMenuBar`, `QMenu`, `QAction` | `actions()`; `text`, `objectName`, `enabled`, `visible`, `checkable`, `checked`, `isSeparator()`, `menu()`, `property(name)`, `trigger()` | `list_menu`, `run_menu_command`, button menus | yes |
+| `QMenuBar`, `QMenu`, `QAction` | `actions()`; `text`, `toolTip`, `objectName`, `enabled`, `visible`, `checkable`, `checked`, `isSeparator()`, `menu()`, `property(name)`, `trigger()` | `list_menu`, `run_menu_command`, button menus, risk | yes |
 
 ## Writes, found live (2026-11-16)
 

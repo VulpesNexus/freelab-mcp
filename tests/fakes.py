@@ -1146,7 +1146,12 @@ def install_qt(state):
             return self.top
 
         def property(self, name):
-            return None
+            return getattr(self, "dynamic", {}).get(name)
+
+        def setProperty(self, name, value):  # (the listener numbers windows of one name: freelabMcpWindow)
+            if "dynamic" not in self.__dict__:
+                self.dynamic = {}
+            self.dynamic[name] = value
 
         def parentWidget(self):
             return None
@@ -1344,10 +1349,12 @@ def install_qt(state):
             return QApplication()
 
         def topLevelWidgets(self):
-            for title in state.windows:
-                if title not in plain:
-                    plain[title] = Window(title)
-            return [main] + [plain[title] for title in state.windows] + list(state.qt_windows) + \
+            # (a window per title listed: two listed alike are two windows, the same ones at each call)
+            keys = [(title, state.windows[:n].count(title)) for n, title in enumerate(state.windows)]
+            for key in keys:
+                if key not in plain:
+                    plain[key] = Window(key[0])
+            return [main] + [plain[key] for key in keys] + list(state.qt_windows) + \
                 ([prompt] if state.prompt is not None else []) + ([question] if state.question else [])
 
         def activeModalWidget(self):
@@ -1401,6 +1408,7 @@ def install_qt(state):
     core.QPointF = QPointF
     core.QTimer, core.QByteArray, core.QBuffer, core.QIODevice = QTimer, QByteArray, QBuffer, QIODevice
     core.QUrl, core.QModelIndex = widgetfakes.QUrl, widgetfakes.QModelIndex
+    core.QPersistentModelIndex = widgetfakes.QPersistentModelIndex
     gui = types.ModuleType("PythonQt.QtGui")
     gui.QTransform, gui.QApplication, gui.QAction = QTransform, QApplication, QAction
     gui.QTabWidget, gui.QAbstractButton, gui.QLabel, gui.QTextEdit = QTabWidget, QAbstractButton, QLabel, QTextEdit

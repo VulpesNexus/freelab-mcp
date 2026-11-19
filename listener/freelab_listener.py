@@ -3272,6 +3272,7 @@ _LINK = re.compile(u'<a\\s[^>]*?href\\s*=\\s*(?:"([^"]*)"|\'([^\']*)\')[^>]*>(.*
 _NUMERIC_ENTITY = re.compile(u"&#([0-9]+);")
 _BREAK = re.compile(u"<br\\s*/?>", re.I)
 _unichr = unichr if PY2 else chr  # noqa: F821
+_lazy_range = xrange if PY2 else range  # noqa: F821  (a model may report millions of rows)
 
 
 def _same(a, b):
@@ -3380,11 +3381,37 @@ def _script_window(widget, waiting):
 
 def _risky_named(*texts):
     """Whether a text names a command that may write files or throw work away (an objectName's words too:
-    actionSaveFont)."""
+    actionSaveFont). Each text is read whole, as shown: its mnemonics out (Sa&ve is Save), rich text's tags
+    out."""
     for text in texts:
-        if text and RISKY_WORDS.search(re.sub(u"([a-z])([A-Z])", u"\\1 \\2", _text(text)).lower()):
+        if not text:
+            continue
+        text = _MNEMONIC.sub(r"\1", _TAGS.sub(u" ", _text(text)))
+        if RISKY_WORDS.search(re.sub(u"([a-z])([A-Z])", u"\\1 \\2", text).lower()):
             return True
     return False
+
+
+def _actions_risky(actions, named=True):
+    """Whether any of these QActions (a command and the menus it is in, or a button's default action) is marked
+    mcpRisky, or, with named, has a text, tooltip, or objectName naming a command that may write files or throw
+    work away."""
+    for action in actions:
+        if action is None:
+            continue
+        if _try(lambda: action.property(RISKY_PROPERTY)):
+            return True
+        if named and _risky_named(_try(lambda: _prop(action, "text")), _try(lambda: _prop(action, "toolTip")),
+                                  _object_name(action)):
+            return True
+    return False
+
+
+def _default_action(widget, kind=None):
+    """A tool button's default action (what its click triggers), or None."""
+    if kind not in (None, "button") or not _try(lambda: widget.inherits("QToolButton"), False):
+        return None
+    return _try(lambda: widget.defaultAction())
 
 
 # -- windows -------------------------------------------------------------------
@@ -3409,9 +3436,41 @@ def _window_entries(QtGui):
         base = u"main" if entry["main"] else (entry["title"] or entry["name"] or entry["class"])
         groups.setdefault(base, []).append(entry)
     for base, group in groups.items():
-        for number, entry in enumerate(group):
-            entry["key"] = base if len(group) == 1 else u"%s#%d" % (base, number + 1)
+        # A key names one window for good: several windows of one name are told apart by a number each window
+        # keeps (WINDOW_ID_PROPERTY, given here once), never by their order, which Qt may change between two
+        # calls (#1 would then name the other one). A window of another kind named main or dialog is numbered
+        # too, so that it never takes the place of FontLab's main window or the dialog waiting.
+        reserved = not group[0]["main"] and base.lower() in (u"main", u"dialog")
+        if len(group) == 1 and not reserved:
+            group[0]["key"] = base
+            continue
+        for entry in group:  # (the numbers the group holds first: a number is never given twice)
+            _window_number(entry["widget"], give=False)
+        for entry in group:
+            entry["key"] = u"main" if entry["main"] else u"%s#%d" % (base, _window_number(entry["widget"]))
     return entries
+
+
+WINDOW_ID_PROPERTY = "freelabMcpWindow"  # a number the listener gives a window that shares its name with others
+_WINDOW_NUMBERS = [0]  # the last number given (numbers are never given twice in a FontLab session)
+
+
+def _window_number(widget, give=True):
+    """The window's own number (WINDOW_ID_PROPERTY), given now if it has none (unless give is False: None): a
+    dynamic property on the window itself, so the listener holds no reference to it (a script's window must die
+    once its script lets it go), and a listener started again goes on from the numbers windows hold."""
+    number = _try(lambda: widget.property(WINDOW_ID_PROPERTY))
+    try:
+        if number is not None and int(number) > 0:
+            _WINDOW_NUMBERS[0] = max(_WINDOW_NUMBERS[0], int(number))
+            return int(number)
+    except Exception:
+        pass
+    if not give:
+        return None
+    _WINDOW_NUMBERS[0] += 1
+    widget.setProperty(WINDOW_ID_PROPERTY, _WINDOW_NUMBERS[0])
+    return _WINDOW_NUMBERS[0]
 
 
 def _find_window(QtGui, wanted, modal):
@@ -3586,9 +3645,9 @@ def _walk_controls(window):
     return found, seen[0] > MAX_WALK
 
 
-def _before_in_layout(layout, widget, depth=0):
-    """The widget just before widget in a layout (nested layouts searched), None when widget comes first, False
-    when it is not in it."""
+def _previous_in_layout(layout, out, depth=0):
+    """Appends (widget, the widget just before it, or None) for every widget of a layout, nested layouts walked
+    (a nested layout's first widget takes the one before the nested layout): each layout is walked once."""
     previous = None
     for index in range(int(layout.count())):
         item = layout.itemAt(index)
@@ -3596,36 +3655,46 @@ def _before_in_layout(layout, widget, depth=0):
             continue
         inner = item.widget()
         if inner is not None:
-            if _same(inner, widget):
-                return previous
+            out.append((inner, previous))
             previous = inner
             continue
         nested = item.layout()
         if nested is not None and depth < 8:
-            found = _before_in_layout(nested, widget, depth + 1)
-            if found is not False:
-                return previous if found is None else found
-    return False
+            found = []
+            _previous_in_layout(nested, found, depth + 1)
+            out.extend((each, before if before is not None else previous) for each, before in found)
+    return out
 
 
-def _layout_caption(widget):
-    """The text of the label just before a control in its layout (Master: before a dropdown), or u""."""
+def _layout_caption(widget, cache=None):
+    """The text of the label just before a control in its layout (Master: before a dropdown), or u"". cache: {id of
+    the parent: (the parent, [(widget, the one before)], {id of a widget: the one before})}, filled once per
+    parent for one listing (a layout scanned again for each of its controls made a listing quadratic)."""
     try:
         parent = widget.parentWidget()
-        layout = parent.layout() if parent is not None else None
-        before = _before_in_layout(layout, widget) if layout is not None else None
+        if parent is None:
+            return u""
+        cache = {} if cache is None else cache
+        held = cache.get(id(parent))
+        if held is None or held[0] is not parent:
+            layout = parent.layout()
+            pairs = _previous_in_layout(layout, []) if layout is not None else []
+            held = cache[id(parent)] = (parent, pairs, dict((id(each), before) for each, before in pairs))
+        if id(widget) in held[2]:
+            before = held[2][id(widget)]
+        else:  # (another wrapper of the same widget)
+            before = next((b for each, b in held[1] if _same(each, widget)), None)
         if before and before.inherits("QLabel"):
             return _caption(_label_text(before))
     except Exception:
         pass
     return u""
 
-
 def _action_text(action):
     return u"" if action is None else _text(_prop(action, "text") or u"")
 
 
-def _control_caption(control, buddies):
+def _control_caption(control, buddies, cache=None):
     """What names a control for its address: a button's text (else its accessible name, its action's text, or
     the first line of its tooltip); another control's accessible name, the label whose buddy it is, or the
     label just before it in its layout. Labels have none: their text is what they show."""
@@ -3650,7 +3719,7 @@ def _control_caption(control, buddies):
             text = _caption(_try(lambda: _label_text(label), u""))
             if text:
                 return text
-    return _layout_caption(widget) or None
+    return _layout_caption(widget, cache) or None
 
 
 def _controls(window):
@@ -3664,9 +3733,9 @@ def _controls(window):
             buddy = _try(lambda: control.widget.buddy())
             if buddy is not None:
                 buddies.append((buddy, control.widget))
-    names = {}
+    names, cache = {}, {}
     for control in controls:
-        control.caption = _control_caption(control, buddies)
+        control.caption = _control_caption(control, buddies, cache)
         if control.name:
             names[control.name] = names.get(control.name, 0) + 1
     groups, order = {}, []
@@ -3697,10 +3766,12 @@ def _find_control(controls, wanted, window_key):
                                        "objectName, or its caption.")
     wanted = _text(wanted).strip()
     words = _entry_words(wanted)
-    for test in (lambda c: c.address == wanted, lambda c: c.name == wanted, lambda c: c.address.lower() == wanted.lower(),
-                 lambda c: bool(c.caption) and _entry_words(c.caption) == words):
+    for caption, test in ((False, lambda c: c.address == wanted), (False, lambda c: c.name == wanted),
+                          (False, lambda c: c.address.lower() == wanted.lower()),
+                          (True, lambda c: bool(c.caption) and _entry_words(c.caption) == words)):
         found = [control for control in controls if test(control)]
-        if len(found) > 1:
+        if len(found) > 1 and caption:  # (a caption names the one shown of several; an address or a name never
+            # picks by what is shown: an objectName equal to another control's address is refused as ambiguous)
             shown = [control for control in found if _shown(control)]
             found = shown if len(shown) == 1 else found
         if len(found) == 1:
@@ -3745,11 +3816,12 @@ def _menu_entries(menu):
 
 
 def _menu_at(level, path, where):
-    """(action, [entry texts]) of the entry path names in a menu or menu bar: entries' texts joined by ">"."""
+    """(action, [entry texts], [actions]) of the entry path names in a menu or menu bar: entries' texts joined by
+    ">"; actions: the entry's and those of the menus it is in, outermost first (their risk counts too)."""
     parts = [part.strip() for part in _text(path).split(u">")]
     if not parts or not all(parts):
         raise FreeLabError("bad_args", u"A menu path names each entry, joined by \">\": File > Open Fonts.")
-    trail = []
+    trail, chain = [], []
     for number, part in enumerate(parts):
         entries = _menu_entries(level)
         found = [(action, text) for action, text in entries if _entry_words(text) == _entry_words(part)]
@@ -3761,12 +3833,13 @@ def _menu_at(level, path, where):
                 u" > ".join(trail) or where, len(found), part))
         action, text = found[0]
         trail.append(text)
+        chain.append(action)
         if number < len(parts) - 1:
             submenu = action.menu()
             if submenu is None:
                 raise FreeLabError("not_found", u"%s is a command, not a menu." % u" > ".join(trail))
             level = submenu
-    return action, trail
+    return action, trail, chain
 
 
 def _number_value(value):
@@ -3845,24 +3918,25 @@ def _describe_control(control, question, script):
     return reads.attach(entry)
 
 
-def _control_risk(control, question, script, click=False, texts=(), marked=None):
+def _control_risk(control, question, script, click=False, chain=None):
     """The risky action a control's use is (RISKY_ACTIONS), or None: any control of a question FontLab asks;
-    a control (or menu command) a script marks mcpRisky; and, outside a script's window, a click on a button
-    (or a menu entry) named like Save, Export, Close, Quit, Exit, Revert, or Discard."""
+    a control a script marks mcpRisky (or a widget holding it), a button whose default action is marked, a menu
+    entry marked or in a menu marked (chain: the entry's action and its menus'); and, outside a script's window,
+    a click on a button, its default action, or a menu entry or a menu it is in, named like Save, Export, Close,
+    Quit, Exit, Revert, or Discard (in its text, tooltip, accessible name, or objectName, mnemonics out)."""
     if question:
         return "question_control"
-    if _flagged(control.widget, RISKY_PROPERTY) or (marked is not None and _try(lambda: marked.property(RISKY_PROPERTY))):
+    widget = control.widget
+    actions = list(chain) if chain is not None else [_default_action(widget, control.kind)]
+    if _flagged(widget, RISKY_PROPERTY) or _actions_risky(actions, named=False):
         return "risky_command"
     if script or not click or control.kind != "button":
         return None
-    widget = control.widget
-    named = list(texts) or [_try(lambda: _prop(widget, "text")), _try(lambda: _prop(widget, "toolTip")),
-                            _try(lambda: _prop(widget, "accessibleName")), control.name]
-    if not texts and _try(lambda: widget.inherits("QToolButton"), False):
-        action = _try(lambda: widget.defaultAction())
-        if action is not None:
-            named += [_try(lambda: _action_text(action)), _object_name(action)]
-    return "risky_command" if _risky_named(*named) else None
+    if chain is not None:  # (a menu's entry: the entry and its menus name the command, not the button)
+        return "risky_command" if _actions_risky(chain) else None
+    named = [_try(lambda: _prop(widget, "text")), _try(lambda: _prop(widget, "toolTip")),
+             _try(lambda: _prop(widget, "accessibleName")), control.name]
+    return "risky_command" if _risky_named(*named) or _actions_risky(actions) else None
 
 
 @op("window_controls")
@@ -3929,7 +4003,7 @@ def _model_rows(model, kind, QtCore, start, count, count_all=True):
     rows, counter, stopped = [], [0], [False]
 
     def walk(parent, depth):
-        for row in range(int(model.rowCount(parent))):
+        for row in _lazy_range(int(model.rowCount(parent))):  # (Python 2.7: never a list of every row)
             if counter[0] >= MAX_TREE_ROWS or (not count_all and counter[0] >= start + count):
                 stopped[0] = True
                 return
@@ -4043,9 +4117,25 @@ class _Plan(object):
     """An action checked and ready: what it acts on (fingerprint, compared again when its timer fires), what
     the reply says of it, and perform(), which does it and returns what changed."""
 
-    def __init__(self, window, fingerprint, about, perform, target=None):
+    def __init__(self, window, fingerprint, about, perform, target=None, row=None):
         self.window, self.fingerprint, self.about, self.perform = window, fingerprint, about, perform
         self.target = target  # the widget or menu command acted on: the very one again when the timer fires
+        self.row = row  # a row acted on: (its model, persistent indexes of it and its parents, its path)
+
+    def same_row(self, again):
+        """Whether the row again resolves is the very row this plan found (not one whose text looks the same):
+        the same model, and the row this plan found, followed where it moved, is where again found its row."""
+        if self.row is None or again.row is None:
+            return self.row is None and again.row is None
+        model, persistent, path = self.row
+        if not _same(model, again.row[0]) or path != again.row[2]:
+            return False
+        if persistent is None:  # (a Qt without QPersistentModelIndex: the path and the texts alone)
+            return True
+        try:
+            return all(p.isValid() for p in persistent) and [int(p.row()) for p in persistent] == again.row[2]
+        except Exception:
+            return False
 
 
 def _refuse_while_waiting(listener, QtGui, modal, waiting, own):
@@ -4122,19 +4212,28 @@ def _start_action(listener, args, tool, plan):
     record = listener.new_action(tool, first.window, first.about)
 
     def run():
+        # A record left queued is the only one that may run: one reported lost (its timer late past
+        # ACTION_LOST_S) stays skipped, whatever its timer does later, so nothing said not done is done.
+        if record["state"] != "queued":
+            return
         if listener.stopped:
             record.update({"state": "skipped", "code": "listener_stopped", "reason": u"The listener stopped."})
             return
         try:
             again = plan(listener, args, record["id"])
-            if again.fingerprint != first.fingerprint or not _same(first.target, again.target):
+            if again.fingerprint != first.fingerprint or not _same(first.target, again.target) or \
+                    not first.same_row(again):
                 raise FreeLabError("changed", u"By the time of the action, what it was to act on had changed (another "
-                                              u"window, control, row, or question): nothing was done.")
+                                              u"window, control, command, row, or question): nothing was done.")
         except FreeLabError as exc:
             record.update({"state": "skipped", "code": exc.code, "reason": exc.message})
             return
-        except Exception as exc:
+        except BaseException as exc:  # (SystemExit too: the record ends, then the timer's own guard records it)
             record.update({"state": "skipped", "code": "exception", "reason": _exc_text(exc)})
+            if not isinstance(exc, Exception):
+                raise
+            return
+        if record["state"] != "queued":  # (lost while it was checked again)
             return
         record["state"] = "running"
         started = time.time()
@@ -4143,8 +4242,10 @@ def _start_action(listener, args, tool, plan):
             record["state"] = "done"
             if result:
                 record["result"] = to_jsonable(result)
-        except Exception as exc:
+        except BaseException as exc:  # (a slot's SystemExit must not leave the action running for good)
             record.update({"state": "failed", "error": _exc_text(exc)})
+            if not isinstance(exc, Exception):
+                raise
         finally:
             record["seconds"] = round(time.time() - started, 3)
     listener.later(ACTION_DELAY_MS, run, "window_action")
@@ -4166,6 +4267,43 @@ def _row_target(view, kind, args):
     return model, parent, row, _row_texts(model, parent, row, columns)
 
 
+ITEM_ENABLED = 32  # Qt::ItemIsEnabled
+
+
+def _row_checked(model, index, number, address, checkable=False):
+    """Refuses a row a user could not use: an invalid one, a disabled one (no ItemIsEnabled), and, to tick, one
+    with no check box."""
+    if not _try(lambda: index.isValid(), True):
+        raise FreeLabError("not_found", u"Row %s of '%s' is gone." % (number, address))
+    flags = int(model.flags(index))
+    if not flags & ITEM_ENABLED:
+        raise FreeLabError("disabled", u"Row %s of '%s' is disabled: nothing was done." % (number, address))
+    if checkable and not flags & USER_CHECKABLE:
+        raise FreeLabError("wrong_kind", u"Row %s of '%s' has no check box." % (number, address))
+
+
+def _row_binding(model, index):
+    """(model, persistent indexes of the row and of each row holding it, outermost first, or None where Qt has no
+    QPersistentModelIndex, the row's path: its number under each parent): what _Plan.same_row compares."""
+    chain, path = [], []
+    for _ in range(MAX_DEPTH):
+        if index is None or not _try(lambda: index.isValid(), False):
+            break
+        chain.append(index)
+        path.append(int(index.row()))
+        index = _try(lambda: index.parent())
+    chain.reverse()
+    path.reverse()
+    make = getattr(_qt()[0], "QPersistentModelIndex", None)
+    persistent = None
+    if make is not None:
+        try:
+            persistent = [make(each) for each in chain]
+        except Exception:
+            persistent = None
+    return model, persistent, path
+
+
 def _plan_click(listener, args, own):
     entry, question, script, fingerprint = _action_window(listener, args, own)
     control = _action_control(entry, args, ("button", "check", "radio") + ROW_KINDS)
@@ -4181,31 +4319,33 @@ def _plan_click(listener, args, own):
         double = _bool_arg(args, "double")
         model, parent, row, texts = _row_target(widget, kind, args)
         column = _int_arg(args, "column", 0, 0, max(0, int(model.columnCount(parent)) - 1))
+        index = model.index(row, column, parent)
+        _row_checked(model, index, args.get("row"), control.address)
         _require_for(args, _control_risk(control, question, script), u"'%s' is a control of a question FontLab asks, or one "
                                                                       u"marked risky." % control.address)
         about.update({"row": args.get("row"), "texts": texts, "double": double})
 
         def perform_row():
-            index = model.index(row, column, parent)
             widget.setCurrentIndex(index)  # (selects it, as the press of a click does)
             widget.clicked(index)  # (PythonQt emits a signal called like a slot; a tree's itemClicked follows)
             if double:
                 widget.doubleClicked(index)
                 widget.activated(index)  # (Windows activates an item on a double click)
             return {"row": args.get("row"), "texts": texts, "double": double}
-        return _Plan(entry["key"], fingerprint + (tuple(texts), column, double), about, perform_row, widget)
+        return _Plan(entry["key"], fingerprint + (tuple(texts), column, double), about, perform_row, widget,
+                     _row_binding(model, index))
     if args.get("row") is not None:
         raise FreeLabError("bad_args", "row is for a list, tree, or table.")
     if item:
         menu = _button_menu(widget) if kind == "button" else None
         if menu is None:
             raise FreeLabError("wrong_kind", u"'%s' has no menu: click it without entry." % control.address)
-        action, trail = _menu_at(menu, item, control.address)
+        action, trail, chain = _menu_at(menu, item, control.address)
         if action.menu() is not None:
             raise FreeLabError("wrong_kind", u"%s is a menu: give one of its entries." % u" > ".join(trail))
         if not _prop(action, "enabled"):
             raise FreeLabError("disabled", u"%s > %s is disabled: nothing was done." % (control.address, u" > ".join(trail)))
-        risk = _control_risk(control, question, script, click=True, texts=(trail[-1], _object_name(action)), marked=action)
+        risk = _control_risk(control, question, script, click=True, chain=chain)
         _require_for(args, risk, u"'%s' > %s is a command that may write files or throw work away, or a control of a "
                                  u"question FontLab asks." % (control.address, u" > ".join(trail)))
         about["entry"] = u" > ".join(trail)
@@ -4228,7 +4368,10 @@ def _plan_click(listener, args, own):
         if kind in ("check", "radio") or _try(lambda: _prop(widget, "checkable"), False):
             result["checked"] = bool(_try(lambda: _prop(widget, "checked"), False))
         return result
-    return _Plan(entry["key"], fingerprint, about, perform, widget)
+    # What the click means is the button's text and, for a tool button, the action it triggers: a named button
+    # that turned from Start to Stop, or was given another action, by the time of the click is not clicked
+    meaning = (_text(_try(lambda: _prop(widget, "text")) or u""),)
+    return _Plan(entry["key"], fingerprint + meaning, about, perform, (widget, _default_action(widget, kind)))
 
 
 @op("click")
@@ -4264,15 +4407,19 @@ def _plan_set_value(listener, args, own):
         wanted = _truth(value)
         model, parent, row, texts = _row_target(widget, kind, args)
         index = model.index(row, 0, parent)
-        if not int(model.flags(index)) & USER_CHECKABLE:
-            raise FreeLabError("wrong_kind", u"Row %s of '%s' has no check box." % (args.get("row"), control.address))
+        _row_checked(model, index, args.get("row"), control.address, checkable=True)
         about.update({"row": args.get("row"), "texts": texts, "value": wanted})
 
         def perform_row():
             before = _try(lambda: model.data(index, CHECK_STATE_ROLE))
-            model.setData(index, 2 if wanted else 0, CHECK_STATE_ROLE)  # (as a user's tick: the view's itemChanged)
-            return {"row": args.get("row"), "before": before, "after": _try(lambda: model.data(index, CHECK_STATE_ROLE))}
-        return _Plan(entry["key"], fingerprint + (tuple(texts), wanted), about, perform_row, widget)
+            kept = model.setData(index, 2 if wanted else 0, CHECK_STATE_ROLE)  # (as a user's tick: itemChanged)
+            after = _try(lambda: model.data(index, CHECK_STATE_ROLE))
+            if kept is False or _try(lambda: int(after)) != (2 if wanted else 0):
+                raise FreeLabError("not_kept", u"Row %s of '%s' refused the tick (it reads %r)." % (
+                    args.get("row"), control.address, after))
+            return {"row": args.get("row"), "before": before, "after": after}
+        return _Plan(entry["key"], fingerprint + (tuple(texts), wanted), about, perform_row, widget,
+                     _row_binding(model, index))
     if args.get("row") is not None:
         raise FreeLabError("bad_args", "row is for a list, tree, or table.")
     if kind in ("check", "radio"):
@@ -4463,11 +4610,11 @@ def _menu_bar(QtGui):
     return bars[0]
 
 
-def _menu_risk(action, trail):
-    """A menu command is risky when it is in FontLab's File menu, named like Save, Export, Close, Quit, Exit,
-    Revert, or Discard, or marked mcpRisky."""
-    if _entry_words(trail[0]) == u"file" or _risky_named(trail[-1], _object_name(action)) or \
-            _try(lambda: action.property(RISKY_PROPERTY)):
+def _menu_risk(chain, trail):
+    """A menu command is risky when it is in FontLab's File menu, or it or a menu it is in (chain: their actions,
+    outermost first) is named like Save, Export, Close, Quit, Exit, Revert, or Discard (in its text, tooltip, or
+    objectName) or marked mcpRisky."""
+    if _entry_words(trail[0]) == u"file" or _actions_risky(chain):
         return "risky_command"
     return None
 
@@ -4482,9 +4629,9 @@ def op_menu(listener, args):
     if not isinstance(path, string_types):
         raise FreeLabError("bad_args", "path must be a menu's path, such as Scripts > FreeLab.")
     bar = _menu_bar(QtGui)
-    trail, level = [], bar
+    trail, chain, level = [], [], bar
     if path.strip():
-        action, trail = _menu_at(bar, path, u"The menu bar")
+        action, trail, chain = _menu_at(bar, path, u"The menu bar")
         level = action.menu()
         if level is None:
             raise FreeLabError("wrong_kind", u"%s is a command, not a menu: run_menu_command runs it." % u" > ".join(trail))
@@ -4496,7 +4643,7 @@ def op_menu(listener, args):
         if submenu is None:
             if _try(lambda: _prop(action, "checkable"), False):
                 item["checked"] = bool(_try(lambda: _prop(action, "checked"), False))
-            if _menu_risk(action, trail + [text]):
+            if _menu_risk(chain + [action], trail + [text]):
                 item["risky"] = True
         entries.append(item)
     reply = {"path": u" > ".join(trail), "entries": entries}
@@ -4511,13 +4658,13 @@ def _plan_menu(listener, args, own):
     path = args.get("path")
     if not isinstance(path, string_types) or not path.strip():
         raise FreeLabError("bad_args", "path must be a menu command's path, such as Scripts > FreeLab > Font Check.")
-    action, trail = _menu_at(_menu_bar(QtGui), path, u"The menu bar")
+    action, trail, chain = _menu_at(_menu_bar(QtGui), path, u"The menu bar")
     command = u" > ".join(trail)
     if action.menu() is not None:
         raise FreeLabError("wrong_kind", u"%s is a menu: list_menu lists its entries." % command)
     if not _prop(action, "enabled"):
         raise FreeLabError("disabled", u"%s is disabled: nothing was done." % command)
-    _require_for(args, _menu_risk(action, trail), u"%s is in FontLab's File menu, named like a command that may write "
+    _require_for(args, _menu_risk(chain, trail), u"%s is in FontLab's File menu, named like a command that may write "
                                                   u"files or throw work away, or marked risky." % command)
 
     def perform():

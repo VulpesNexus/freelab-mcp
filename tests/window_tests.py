@@ -68,6 +68,7 @@ class WindowCase(FontCase):
         FontCase.setUp(self)
         self.tool = ToolWindow()
         self.state.qt_windows = [self.tool.window]
+        fl._WINDOW_NUMBERS[0] = 0  # (windows of one name are numbered from 1 in each test's FontLab)
 
     def queued(self, op, args):
         reply = self.ok(op, args)
@@ -503,6 +504,158 @@ class StateTests(WindowCase):
         self.state.timers = []  # (its timer lost)
         self.assertEqual(self.outcome(reply)["code"], "lost")
         self.assertEqual(self.act("click", {"window": TITLE, "control": u"Apply > button#1"})["state"], "done")
+
+
+class ReviewRoundTwoTests(WindowCase):
+    """Codex's review of 1.3.0 (2026-11-19): each finding's case, which 1.3.0 failed."""
+
+    def test_1_a_mnemonic_never_hides_a_risky_name(self):
+        for text in (u"Sa&ve", u"E&xport", u"C&lose", u"&Discard changes"):
+            button = W.Widget("QPushButton", name=u"operation1", text=text, on={"clicked": lambda: self.tool.applied.append(1)})
+            self.tool.page1._f_add(button)
+            self.assertEqual(self.fails("click", {"window": TITLE, "control": "operation1"}, code="risky_mode_off")["data"]["action"],
+                             "risky_command", text)
+            self.tool.page1._f_children.remove(button)
+        tip = W.Widget("QPushButton", name=u"operation2", text=u"Go", toolTip=u"<b>Save</b>&nbsp;the font")
+        self.tool.page1._f_add(tip)
+        self.fails("click", {"window": TITLE, "control": "operation2"}, code="risky_mode_off")
+        self.assertEqual((self.tool.applied, self.state.timers), ([], []))
+
+    def test_2_a_command_is_judged_by_its_action_and_the_menus_it_is_in(self):
+        action = W.Action(u"Perform", props={"mcpRisky": True})
+        button = W.Widget("QToolButton", name=u"perform", text=u"Perform")
+        button._f_default_action = action
+        self.tool.page1._f_add(button)
+        self.fails("click", {"window": TITLE, "control": "perform"}, code="risky_mode_off")
+        self.tool.window._f_props["mcpScriptWindow"] = True  # (a mark counts in a script's window too)
+        self.fails("click", {"window": TITLE, "control": "perform"}, code="risky_mode_off")
+        del self.tool.window._f_props["mcpScriptWindow"]
+        named = W.Widget("QToolButton", name=u"other", text=u"Other")
+        named._f_default_action = W.Action(u"Other", name=u"actionExportFont")
+        self.tool.page1._f_add(named)
+        self.fails("click", {"window": TITLE, "control": "other"}, code="risky_mode_off")
+        # A menu entry: its tooltip, and the menus it is in, on a button's menu and in the main window's
+        self.state.menu_bar = W.Widget("QMenuBar", actions=[W.Action(u"Tools", menu=W.menu(
+            W.Action(u"Apply", toolTip=u"Save font to disk"), W.Action(u"Export", menu=W.menu(W.Action(u"OpenType"))),
+            W.Action(u"Kern")))])
+        self.fails("run_menu_command", {"path": "Tools > Apply"}, code="risky_mode_off")
+        self.fails("run_menu_command", {"path": "Tools > Export > OpenType"}, code="risky_mode_off")
+        entries = dict((e["text"], e.get("risky")) for e in self.ok("menu", {"path": u"Tools > Export"})["entries"])
+        self.assertEqual(entries, {u"OpenType": True})
+        self.assertEqual(self.act("run_menu_command", {"path": "Tools > Kern"})["state"], "done")
+        self.tool.tools._f_menu = W.menu(W.Action(u"Export", menu=W.menu(W.Action(u"OpenType"))))
+        self.fails("click", {"window": TITLE, "control": u"FreeLab tools", "entry": "Export > OpenType"}, code="risky_mode_off")
+
+    def test_3_rows_that_look_alike_never_stand_in_for_each_other(self):
+        first, second = W.Row(u"same", check=0), W.Row(u"same", check=0)
+        view = W.view("QListWidget", [first, second], name=u"sameRows")
+        self.tool.page1._f_add(view)
+        reply = self.queued("set_value", {"window": TITLE, "control": "sameRows", "row": 0, "value": True})
+        view._f_values["model"]._f_rows[:] = [second, first]  # (swapped before the timer)
+        self.state.fire_timers()
+        self.assertEqual((self.outcome(reply)["code"], first.check, second.check), ("changed", 0, 0))
+        reply = self.queued("click", {"window": TITLE, "control": "sameRows", "row": 1, "double": True})
+        view._f_set(model=W.Model([W.Row(u"same", check=0), W.Row(u"same", check=0)]))  # (another model, alike)
+        self.state.fire_timers()
+        self.assertEqual((self.outcome(reply)["code"], view._f_emitted), ("changed", []))
+        self.assertEqual(self.act("set_value", {"window": TITLE, "control": "sameRows", "row": 1, "value": True})["state"], "done")
+
+    def test_4_an_action_reported_lost_never_runs_later(self):
+        reply = self.queued("click", {"window": TITLE, "control": u"Apply > button#1"})
+        self.listener.actions[reply["action_id"]]["asked"] -= fl.ACTION_LOST_S + 1
+        self.assertEqual(self.outcome(reply)["code"], "lost")
+        self.state.fire_timers()  # (its timer kept: late is not canceled)
+        self.assertEqual((self.tool.applied, self.outcome(reply)["state"]), ([], "skipped"))
+
+    def test_5_a_window_of_a_shared_name_keeps_its_key(self):
+        clicked = []
+        a = W.window("QDialog", u"Same title", [W.Widget("QPushButton", text=u"Apply", on={"clicked": lambda: clicked.append("a")})])
+        b = W.window("QDialog", u"Same title", [W.Widget("QPushButton", text=u"Apply", on={"clicked": lambda: clicked.append("b")})])
+        self.state.qt_windows = [a, b]
+        keys = [w["window"] for w in self.ok("windows")["windows"]]
+        self.assertEqual(keys, [u"main", u"Same title#1", u"Same title#2"])
+        self.state.qt_windows[:] = [b, a]  # (Qt's order changed)
+        self.assertEqual(self.act("click", {"window": u"Same title#1", "control": "Apply"})["state"], "done")
+        self.assertEqual(clicked, ["a"])
+        self.state.qt_windows[:] = [b]  # (a closed: its key names no other window)
+        self.assertEqual([w["window"] for w in self.ok("windows")["windows"]], [u"main", u"Same title"])
+        self.state.qt_windows.append(W.window("QDialog", u"Same title"))
+        self.assertEqual([w["window"] for w in self.ok("windows")["windows"]], [u"main", u"Same title#2", u"Same title#3"])
+        self.fails("window_controls", {"window": u"Same title#1"}, code="not_found")
+        impostor = W.window("QDialog", u"main", [W.Widget("QPushButton", text=u"Apply")])
+        self.state.qt_windows = [impostor]
+        self.assertEqual([w["window"] for w in self.ok("windows")["windows"]], [u"main", u"main#4"])
+        self.assertEqual(self.ok("window_controls", {"window": "main"})["class"], "MainWindow")
+
+    def test_6_an_address_is_never_chosen_by_what_is_shown(self):
+        hidden = W.Widget("QPushButton", name=u"Apply > button#1", text=u"Another operation")
+        hidden._f_shown = False
+        self.tool.page1._f_add(hidden)
+        self.fails("click", {"window": TITLE, "control": u"Apply > button#1"}, code="ambiguous_control")
+        self.assertEqual(self.tool.applied, [])
+
+    def test_7_a_button_that_means_another_command_by_then_is_not_clicked(self):
+        effects = []
+        button = W.Widget("QToolButton", name=u"invoke", text=u"Perform")
+        old, new = W.Action(u"Perform"), W.Action(u"Perform")
+        button._f_default_action = old
+        button._f_on["clicked"] = lambda: effects.append(button._f_default_action is new)
+        self.tool.page1._f_add(button)
+        reply = self.queued("click", {"window": TITLE, "control": "invoke"})
+        button._f_default_action = new
+        self.state.fire_timers()
+        self.assertEqual((self.outcome(reply)["code"], effects), ("changed", []))
+        start = W.Widget("QPushButton", name=u"runStop", text=u"Start", on={"clicked": lambda: effects.append(1)})
+        self.tool.page1._f_add(start)
+        reply = self.queued("click", {"window": TITLE, "control": "runStop"})
+        start._f_set(text=u"Stop")
+        self.state.fire_timers()
+        self.assertEqual((self.outcome(reply)["code"], effects), ("changed", []))
+
+    def test_8_a_disabled_row_is_not_driven_and_a_refused_tick_fails(self):
+        model = self.tool.pairs._f_values["model"]
+        model._f_flags = 1 | 16  # (selectable, checkable, not enabled)
+        self.fails("click", {"window": TITLE, "control": "tree", "row": 0}, code="disabled")
+        self.fails("set_value", {"window": TITLE, "control": "tree", "row": 0, "value": False}, code="disabled")
+        model._f_flags = None
+        model._f_refuse = True
+        outcome = self.act("set_value", {"window": TITLE, "control": "tree", "row": 2, "value": True})
+        self.assertEqual(outcome["state"], "failed")
+        self.assertIn("refused", outcome["error"])
+        self.assertEqual(self.tool.pairs._f_emitted, [])
+
+    def test_9_a_slots_system_exit_ends_the_action(self):
+        def stop():
+            raise SystemExit("test interruption")
+        self.tool.apply._f_on["clicked"] = stop
+        reply = self.queued("click", {"window": TITLE, "control": u"Apply > button#1"})
+        self.state.fire_timers()
+        self.assertEqual(len(self.listener.errors), 1)  # (the timer's own guard recorded it, as before)
+        self.listener.errors[:] = []
+        self.assertEqual(self.outcome(reply)["state"], "failed")
+        self.assertEqual(self.ok("window_state")["actions_pending"], [])
+
+    def test_12_rows_are_counted_lazily_under_python_2(self):
+        with open(fl.__file__.replace(".pyc", ".py"), "rb") as handle:
+            source = handle.read().decode("utf-8")
+        self.assertIn(u"for row in _lazy_range(int(model.rowCount(parent))):", source)
+        self.assertIs(fl._lazy_range, xrange if sys.version_info[0] == 2 else range)  # noqa: F821
+
+    def test_13_a_listing_reads_each_layout_once(self):
+        reads = []
+        for pairs in (50, 200):
+            widgets = []
+            for n in range(pairs):
+                widgets += [W.Widget("QLabel", text=u"Field %d:" % n), W.Widget("QLineEdit", text=u"")]
+            page = W.Widget("QWidget", widgets)
+            layout = W.Layout(*widgets)
+            page._f_layout = layout
+            window = W.window("QDialog", u"Many fields %d" % pairs, [page])
+            self.state.qt_windows = [window]
+            controls = self.ok("window_controls", {"window": u"Many fields %d" % pairs, "kinds": ["field"], "limit": 5000})
+            self.assertEqual(controls["controls"][7]["address"], u"Field 7 > field")
+            reads.append(layout._f_reads[0])
+        self.assertLessEqual(reads[1], 4 * reads[0] + 10, "linear: %r" % reads)
 
 
 if __name__ == "__main__":
