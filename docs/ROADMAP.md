@@ -29,7 +29,7 @@ Proven live on test fonts, with what FontLab did, in [FONTLAB7-API.md](FONTLAB7-
 ## Next
 
 - **The window tools' last live proofs**: the signals not emitted yet, a floating panel, and the controls in a list's cells ([the list](FONTLAB7-API.md#the-window-tools-130-still-to-prove-live)).
-- **What 1.2.0 still lacks live proof of**, as listed in [FONTLAB7-API.md](FONTLAB7-API.md#not-yet-proven-live): `screenshot` from the screen above 100 % scaling, among others.
+- **What 1.2.0 still lacks live proof of**, as listed in [FONTLAB7-API.md](FONTLAB7-API.md#not-yet-proven-live): `answer_dialog` refusing a question that replaced the one it was asked about, among others.
 - **A font with no window tab**: a way to bring it forward or close it (the candidates are listed there).
 - **Classes of the Classes panel** in `update_references` and `remove_references`, if `fgFont.groups` proves to change them.
 - **Exception pairs of a glyph named like its class**, if FontLab's scripting turns out to have a way to address one (renaming the class for the moment is one, but touches the class).

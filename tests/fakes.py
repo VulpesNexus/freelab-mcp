@@ -965,7 +965,8 @@ def install(state):
     class flWorkspace(object):
         @staticmethod
         def instance():
-            return workspace
+            # (None before FontLab has its main window: state.no_workspace)
+            return None if getattr(state, "no_workspace", False) else workspace
 
     class flItems(object):
         @staticmethod

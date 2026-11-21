@@ -494,6 +494,14 @@ class FontTests(ListenerCase):
         error = self.fails("font_info", code="no_current_font")
         self.assertIn("1 font is open", error["message"])
 
+    def test_no_workspace_yet_is_refused_not_raised(self):
+        # (seen live: only FontLab's activation window up, flWorkspace.instance() was None)
+        self.open_sample()
+        self.state.no_workspace = True
+        for op in ("font_info", "fonts"):
+            error = self.fails(op, code="not_ready")
+            self.assertIn("no workspace yet", error["message"])
+
     def test_glyph_names_paging(self):
         self.open_sample()
         first = self.ok("glyph_names", {"limit": 2})

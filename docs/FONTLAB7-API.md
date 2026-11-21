@@ -88,7 +88,7 @@ The rows below are new in 1.2.0, proven live on 2026-11-19 in FontLab 7.2.0 on t
 | `fontlab` module, `flWorkspace` | `ExportControl()`, `load()`, `profileName`, `destinationMode` (3), `destinationFolder`; `exportFont(package, control)` | constructor, settable properties, method | `export_font` | **live** from a timer: *OpenType TT* wrote *Bellefair-Regular.ttf* in 2.5 s and its *Font Exported* message was closed |
 | `PythonQt.QtCore` | `QTimer.singleShot` callbacks clicking a modal question's button (`_keep_answering`) | Qt | `open_font` (`answer`), `quit` (`discard_changes`), `export_font` | **live**: *Round* on Cardo's *Coordinates Rounding*; *Don't Save* on each of three fonts' questions at a quit (12.4 s) |
 | Windows `kernel32`, `advapi32` | `CreateFileW` with a protected one-entry access list in its `SECURITY_ATTRIBUTES`, no sharing; `SetFileSecurityW` as the fallback | Win32, through `ctypes` | the state file and *opened.json* | **live** inside FontLab's Python: `icacls` shows one entry (the user, full access, nothing inherited) on both; `ping` says `state_file_private: true` |
-| Windows `user32`, `gdi32` (the server) | `EnumWindows`, `GetWindowThreadProcessId`, `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT)`, `StretchBlt` into a DIB, `SetThreadDpiAwarenessContext` | Win32, through `ctypes` | `screenshot` with `source="screen"` | **live** at 100 % display scaling: the main window full size (2576 × 1408, its frame included) and scaled, and *Coordinates Rounding* by title, with its title bar (496 × 233, where Qt's picture is 480 × 194); above 100 % unproven |
+| Windows `user32`, `gdi32` (the server) | `EnumWindows`, `GetWindowThreadProcessId`, `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT)`, `StretchBlt` into a DIB, `SetThreadDpiAwarenessContext` | Win32, through `ctypes` | `screenshot` with `source="screen"` | **live** at 100 % display scaling: the main window full size (2576 × 1408, its frame included) and scaled, and *Coordinates Rounding* by title, with its title bar (496 × 233, where Qt's picture is 480 × 194); and at 150 % (2026-11-21, a Windows 10 test machine at 1920 × 1080, FontLab in its trial mode): real pixels, whole and sharp, each with its frame, the main window 1938 × 1028 (Qt's 1916 × 972), *Welcome to FontLab 7!* 1462 × 1106 (1440 × 1050), a script's question 982 × 446 (960 × 390), and the main window scaled down to 1600 × 849 |
 
 ## The window tools (1.3.0)
 
@@ -214,6 +214,7 @@ FontLab 7.2.0, test fonts from the corpus, never saved over their files; the che
 - **An open's answer ends with its open** (Codex's finding, fixed): with an answer no button of Cardo's question had, two answer timers were pending while it was shown and none once *Keep fractional* let the open return.
 - **The fonts `open_font` opened are held by id** (Codex's finding, fixed): Cardo was recorded once it had opened and forgotten once closed; Tinos, opened by `requestLoadingFont` alone, was refused `discard_changes` outside risky mode. A copy saved under another path (a UFO saved as `.vfc`) is no longer the font recorded, and needs risky mode too.
 - **FontLab's own buttons** read their text with `text()` and pad it (*" Cancel "*); labels are rich text, with `&quot;` for the quotes around a font's name.
+- **No workspace before the main window** (2026-11-21, a Windows 10 test machine, FontLab in its trial mode). While FontLab's activation window (`DlgRegister`) was the only one up, the listener already answered, and `flWorkspace.instance()` was `None`: `open_font` raised `'NoneType' object has no attribute 'packages'`. Fixed: every tool that needs the workspace refuses with `not_ready` until there is one. The fix is proven by the tests' stand-in only, not yet live.
 
 ## The window tools, found live (2026-11-19)
 
@@ -287,7 +288,6 @@ FontLab 7.2 can crash as it opens a font whose `GPOS` holds a single adjustment 
 
 ## Not yet proven live
 
-- **`screenshot` with `source="screen"` above 100 % display scaling**: the display was at 100 %, and the owner's display settings are not changed for a test.
 - **`answer_dialog` refusing another question shown by the time of its click** (Codex's finding 2): FontLab shows one question at a time, and swapping one within the 50 ms before the click is not reproducible by hand; the fakes prove it, and live the click and its `answer_result` worked.
 - **A new shape the layer does not take** (Codex's finding 9): FontLab always took it; the read-back from the layer is proven on the fakes, the ordinary case live.
 - **`set_prefix` inside a rename**: no test font named a candidate glyph in its prefix outside the *Classes* panel's lines.

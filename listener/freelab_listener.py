@@ -230,6 +230,17 @@ def _fontlab():
     return fontlab
 
 
+def _workspace():
+    """FontLab's workspace. flWorkspace.instance() is None until FontLab has made its main window:
+    while its activation window is the only one up, as seen live on 2026-11-21."""
+    workspace = _fontlab().flWorkspace.instance()
+    if workspace is None:
+        raise FreeLabError("not_ready", "FontLab has no workspace yet: it is still starting, or a window of its "
+                           "own from before the main window (activation, for one) is waiting. Answer it, then "
+                           "ask again.")
+    return workspace
+
+
 def _is_null(obj, what):
     """True for None or a null FontLab object. A failed isNull read is an error, not 'not null'."""
     if obj is None:
@@ -257,7 +268,7 @@ def current_package():
     count = fl.CountFonts()
     if count < 1:
         raise FreeLabError("no_font", "No font is open in FontLab.")
-    package = fl.flWorkspace.instance().currentPackage
+    package = _workspace().currentPackage
     if _is_null(package, "the current font"):
         raise FreeLabError("no_current_font", "%s, but FontLab reports no current font." % _fonts_open_text(count))
     return package, count
@@ -274,7 +285,7 @@ def _font_id(package):
 def open_packages():
     """Every open font, as flPackage wrappers of the items flWorkspace.packages() lists."""
     fl = _fontlab()
-    items = _real_list(fl.flWorkspace.instance().packages(), "flWorkspace.packages()")
+    items = _real_list(_workspace().packages(), "flWorkspace.packages()")
     packages = []
     for item in items:
         package = fl.flPackage(item)
@@ -516,7 +527,7 @@ def op_status(listener, args):
     result = {"fonts_open": count, "current_font": None}
     if count >= 1:
         reads = _Reads()
-        package = fl.flWorkspace.instance().currentPackage
+        package = _workspace().currentPackage
         if not _is_null(package, "the current font"):
             result["current_font"] = _font_summary(package, reads)
         reads.attach(result)
@@ -532,7 +543,7 @@ def unsaved_work():
     reports (see op_dialog). A read that fails raises: FontLab must never be quit on a guess.
     """
     fl = _fontlab()
-    workspace = fl.flWorkspace.instance()
+    workspace = _workspace()
     try:
         workspace_changed = bool(workspace.hasChanges)
         packages = _real_list(workspace.packages(), "flWorkspace.packages()")
@@ -784,7 +795,7 @@ def _label_text(label):
 def op_fonts(listener, args):
     """Every open font: its id (what the tools take as font), names, path, masters, and whether it is in front."""
     fl = _fontlab()
-    current = fl.flWorkspace.instance().currentPackage
+    current = _workspace().currentPackage
     current_id = None
     try:
         if not _is_null(current, "the current font"):
@@ -1299,7 +1310,7 @@ class _Write(object):
         could not match them). The font is brought forward for the write, as a click on its tab does, and
         the font that was in front is put back afterward (_put_back)."""
         try:
-            current = self.fl.flWorkspace.instance().currentPackage
+            current = _workspace().currentPackage
             previous = None if _is_null(current, "the current font") else current
         except Exception:
             previous = None
@@ -2639,7 +2650,7 @@ class _InFront(object):
         self.previous, self.moved, self.restore = None, False, None
 
     def __enter__(self):
-        current = _fontlab().flWorkspace.instance().currentPackage
+        current = _workspace().currentPackage
         try:
             self.previous = None if _is_null(current, "the current font") else current
         except FreeLabError:
@@ -2764,7 +2775,7 @@ def _main_window(QtGui):
 
 def _current_id():
     """The id of the font in front, or None."""
-    current = _fontlab().flWorkspace.instance().currentPackage
+    current = _workspace().currentPackage
     try:
         return None if _is_null(current, "the current font") else _font_id(current)
     except FreeLabError:
@@ -5411,7 +5422,7 @@ def op_save_font(listener, args):
     except Exception:
         own = None
     _check_deadline(listener)
-    current = _fontlab().flWorkspace.instance().currentPackage
+    current = _workspace().currentPackage
     previous = None if _is_null(current, "the current font") else current
     moved = bring_to_front(package)
 
@@ -5449,7 +5460,7 @@ def op_export_font(listener, args):
         control.profileName = _text(profile).strip()
     control.destinationMode = 3  # (a folder, as proven live)
     control.destinationFolder = folder.replace(u"\\", u"/").rstrip(u"/") + u"/"
-    workspace = fl.flWorkspace.instance()
+    workspace = _workspace()
     _check_deadline(listener)
     progress = {"returned": False}
 
