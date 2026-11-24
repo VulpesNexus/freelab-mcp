@@ -24,8 +24,8 @@ An MCP server that lets an AI app such as Claude Code read the fonts open in Fon
 
 1. Download a [release](https://github.com/VulpesNexus/freelab-mcp/releases)'s source code and unpack it, or clone this repository.
 2. Install the server's one dependency: `pip install "mcp>=1.2,<2"`.
-3. Start FontLab once, so that it writes its startup script, then quit it.
-4. Run *tools/install-fontlab.ps1* in PowerShell. It copies the listener into FontLab's user *Scripts* folder (*Documents\FontLab\FontLab 7\Scripts\FreeLab*); with `-ListenerAtLaunch`, it also makes FontLab start the listener at every launch. `-Uninstall` takes it all out again, leaving FreeLab Script Suite's tools alone.
+3. Quit FontLab, and copy *listener/freelab_listener.py* into a *FreeLab* folder in FontLab's *Scripts* folder (*Documents\FontLab\FontLab 7\Scripts\FreeLab*; make the folder if FreeLab Script Suite has not). That is all the listener needs.
+4. Optional, in place of step 3: run *tools/install-fontlab.ps1* in PowerShell, after FontLab has started once and written its startup script. It copies the same file, and with `-ListenerAtLaunch` it also makes FontLab start the listener at every launch. `-Uninstall` takes it all out again, leaving FreeLab Script Suite's tools alone.
 5. Register the server with your MCP client. For Claude Code:
 
    ```
