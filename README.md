@@ -1,16 +1,17 @@
 # FreeLab MCP
 
-An MCP server that lets an AI app such as Claude Code read the fonts open in FontLab 7, make a small set of undoable edits to them, and start and close FontLab when asked.
+An MCP server that lets an AI app such as Claude Code read the fonts open in FontLab 7, make a small set of undoable edits to them, drive FontLab's windows as a user would, and start and close FontLab when asked.
 
 **Status: 1.3.0.** Every tool of 1.2.0 was proven live in FontLab 7.2 on test fonts (TrueType and CFF, multiple masters, Japanese, Arabic, and Hebrew); the window tools, new in 1.3.0, drove a whole FreeLab Script Suite workflow live on 2026-11-19, a few calls still proven on fakes only. [docs/FONTLAB7-API.md](docs/FONTLAB7-API.md) tracks each FontLab call, how far it is proven, and what is not yet.
 
-FreeLab Script Suite, the separate `freelab-script-suite` repository, holds tools that run inside FontLab, starting with a dark mode. Neither needs the other; installed together, they share FontLab's *Scripts > FreeLab* menu, and the window tools drive the suite's tool windows as a user would.
+[FreeLab Script Suite](https://github.com/VulpesNexus/freelab-script-suite), a separate repository, holds tools that run inside FontLab: a dark mode, kerning and spacing, glyph building, feature code, and font checks. Neither needs the other; installed together, they share FontLab's *Scripts > FreeLab* menu, and the window tools drive the suite's tool windows as a user would.
 
 ## What is here
 
 - *listener/freelab_listener.py*: a script you run inside FontLab. It answers requests on `127.0.0.1` only, from FontLab's main thread.
 - *server/*: the MCP server your AI app starts. It never touches FontLab directly; it passes each tool call to the listener.
 - *tests/*: the test gate (*run_tests.py*).
+- *docs/*: the design, the FontLab calls in use, and the safety rules, listed under [More](#more).
 - *tools/*: the installer and the test gate's Python 2.7 fetcher.
 
 ## Requirements
@@ -21,12 +22,22 @@ FreeLab Script Suite, the separate `freelab-script-suite` repository, holds tool
 
 ## Install
 
-1. Start FontLab once, so that it writes its startup script, then quit it and run *tools/install-fontlab.ps1*. It copies the listener into FontLab's user *Scripts* folder (*Documents\FontLab\FontLab 7\Scripts\FreeLab*). With `-ListenerAtLaunch`, it also adds a marked block to FontLab's startup script that starts the listener at every launch; the original startup script is kept as *startupScript.py.freelab-backup*, and each change keeps the file it replaced as *startupScript.py.freelab-previous*. `-Uninstall` takes it all out again, leaving FreeLab's tools alone. Either way it also removes the single block that FreeLab wrote before the MCP and the tools were split, which started dark mode too; run FreeLab's installer again to keep that. The startup script must be UTF-8 text, and its line endings are kept. Scripts run from that folder, not from this repository: Python 2.7 cannot open files whose path the Windows ANSI code page cannot spell.
-2. Register the server with your MCP client. For Claude Code:
+1. Download a [release](https://github.com/VulpesNexus/freelab-mcp/releases)'s source code and unpack it, or clone this repository.
+2. Install the server's one dependency: `pip install "mcp>=1.2,<2"`.
+3. Start FontLab once, so that it writes its startup script, then quit it.
+4. Run *tools/install-fontlab.ps1* in PowerShell. It copies the listener into FontLab's user *Scripts* folder (*Documents\FontLab\FontLab 7\Scripts\FreeLab*); with `-ListenerAtLaunch`, it also makes FontLab start the listener at every launch. `-Uninstall` takes it all out again, leaving FreeLab Script Suite's tools alone.
+5. Register the server with your MCP client. For Claude Code:
 
    ```
    claude mcp add freelab -- python <path to this repository>\server\run_server.py
    ```
+
+What the installer does to FontLab's startup script:
+
+- With `-ListenerAtLaunch`, it adds a marked block to it. The original startup script is kept as *startupScript.py.freelab-backup*, and each change keeps the file it replaced as *startupScript.py.freelab-previous*. The startup script must be UTF-8 text, and its line endings are kept.
+- Either way, it removes the single block that FreeLab wrote before the MCP and the tools were split, which started dark mode too; run FreeLab Script Suite's installer again to keep that.
+
+The listener runs from FontLab's *Scripts* folder, not from this repository: Python 2.7 cannot open files whose path the Windows ANSI code page cannot spell.
 
 ## Use
 
