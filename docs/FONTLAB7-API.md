@@ -286,6 +286,16 @@ FontLab 7.2 can crash as it opens a font whose `GPOS` holds a single adjustment 
 - **The en dash path**: *NotoSansKR[wght].ttf* copied under the workspace's folder was refused (lookups 11 and 12), then its copy opened with `safe_copy=True`.
 - **WOFF**: a WOFF of *NotoSansJP[wght].ttf* (fontTools) was refused (`format` `woff`), then its copy opened as *NotoSansJP-web.ttf*. The three copies read back with every checksum right (fontTools' `checkChecksums=2`) and no format 2 subtable without values left.
 
+## The canvas and pictures, found live (2026-11-25)
+
+Found by FreeLab Script Suite's dark mode, which leaves a glyph's pictures as they are on a dark canvas; none is a FreeLab MCP tool yet.
+
+- **Where a glyph window's glyphs are on screen.** `flWorkspace.instance().getCanvasForViewport(widget)` gives the `flCanvas` of a glyph window's canvas widget (the `QWidget` named `widget` under `GlyphWindow`); `canvas.textBlocks()` its lines of text; `block.getAllGlyphs()` their `flGlyphInfo`s, whose `glyph` is the `flGlyph` and whose `glyph.activeLayer` is the layer shown. `block.getGlyphTransform(index)` (an `int`, not the info) takes glyph units to the canvas, and `canvas.transform` the canvas to the widget, in pixels. `canvas.mapToViewport(QPointF)` agrees with that.
+- **A picture element** is an `flShape` whose `image` is a non-null `QImage`; `shape.transform` takes the image's pixels to glyph units (a pasted 300 by 200 picture: a scale of 3.625, y flipped, moved up by 725). `flShape.hasImage()` raised `IndexError` on the shapes of `block.visibleShapes()`, and returned `False` on a layer's own shapes; `image.isNull()` is the test that holds.
+- **Placing a picture.** `flCanvas.placeArtwork(QPointF, [QUrl])` returned `False` and placed nothing. A file dropped on the canvas widget does it: `QDragEnterEvent`, `QDragMoveEvent`, then `QDropEvent` sent with `QApplication.sendEvent`, their `QMimeData` holding the file's URL, placed a PNG in the glyph shown as a picture element. Whether that makes a step in the History was not checked.
+- **The clipboard is not a way in.** Saving the clipboard's formats from `QClipboard.mimeData()` and setting them back in a new `QMimeData` after a paste did not put back the image another program had put there (a PNG); a script should never use the clipboard of the person working.
+- **A scratch copy of a font with several masters**: `fgPackage.save(path, True)` wrote each open font, five of them with two to five masters, as `.vfb` (7 to 10 MB each) without a question.
+
 ## Not yet proven live
 
 - **`answer_dialog` refusing another question shown by the time of its click** (Codex's finding 2): FontLab shows one question at a time, and swapping one within the 50 ms before the click is not reproducible by hand; the fakes prove it, and live the click and its `answer_result` worked.

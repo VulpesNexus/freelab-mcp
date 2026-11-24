@@ -32,6 +32,7 @@ Proven live on test fonts, with what FontLab did, in [FONTLAB7-API.md](FONTLAB7-
 - **What 1.2.0 still lacks live proof of**, as listed in [FONTLAB7-API.md](FONTLAB7-API.md#not-yet-proven-live): `answer_dialog` refusing a question that replaced the one it was asked about, among others.
 - **A font with no window tab**: a way to bring it forward or close it (the candidates are listed there).
 - **Classes of the Classes panel** in `update_references` and `remove_references`, if `fgFont.groups` proves to change them.
+- **Pictures in glyphs**: a read of a glyph's pictures (their place and size in glyph units, from `flShape.image` and `transform`), and a `place_image` write that drops a file on a glyph window's canvas, which places it without the clipboard, once its History step is proven ([FONTLAB7-API.md](FONTLAB7-API.md#the-canvas-and-pictures-found-live-2026-11-25)).
 - **Exception pairs of a glyph named like its class**, if FontLab's scripting turns out to have a way to address one (renaming the class for the moment is one, but touches the class).
 
 Tools that run inside FontLab on their own, such as dark mode and the kerning and feature-code helpers, belong to FreeLab Script Suite, the separate `freelab-script-suite` repository, and are on its roadmap.
