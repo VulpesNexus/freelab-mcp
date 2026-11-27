@@ -410,7 +410,7 @@ class DialogTests(WindowCase):
         self.assertEqual((self.state.answers, self.state.question), ([u"OK"], None))
 
     def test_the_welcome_window_closes_outside_risky_mode(self):
-        """The owner, 2026-11-20: closing FontLab's Welcome window loses nothing. Its other controls stay a
+        """The review of 2026-11-20: closing FontLab's Welcome window loses nothing. Its other controls stay a
         question's (its recent fonts open a file without open_font's check), and a Close elsewhere is risky."""
         closed = []
         welcome = W.window("DlgInitialize", u"Welcome to FontLab 7!", [
