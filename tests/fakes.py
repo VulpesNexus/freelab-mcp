@@ -443,9 +443,10 @@ class fgFeatures(Native):
 
 
 class fgFont(Native):
-    _members = ("keys", "id", "features", "rebuildMaps", "save")
+    _members = ("keys", "id", "features", "rebuildMaps", "save", "info")
 
     def __init__(self, names, package=None, font_id=1, features=None):
+        object.__setattr__(self, "info", fgFontInfo())
         object.__setattr__(self, "_f_names", list(names))
         object.__setattr__(self, "_f_package", package)
         object.__setattr__(self, "id", font_id)
@@ -580,13 +581,77 @@ class fgKerning(Native):
             del self._f_pairs[index]
 
 
+class _Flags(Native):
+    _members = ("asDict",)
+
+    def __init__(self, flags):
+        object.__setattr__(self, "_f_flags", flags)
+
+    def asDict(self):
+        return dict(self._f_flags)
+
+
+class _InfoDict(Native):
+    _members = ("flags",)
+
+    def __init__(self, flags):
+        object.__setattr__(self, "flags", _Flags(flags))
+
+
+METRIC_FIELDS = ("openTypeOS2TypoAscender", "openTypeOS2TypoDescender", "openTypeOS2TypoLineGap",
+                 "openTypeHheaAscender", "openTypeHheaDescender", "openTypeHheaLineGap",
+                 "openTypeOS2WinAscent", "openTypeOS2WinDescent")
+
+
+class Info(Native):
+    """flPackage.info: the model, the current master's (live, 2026-11-27); its typo and win values whole numbers."""
+    _members = METRIC_FIELDS
+
+    def __init__(self, typo=(800, -200, 0), hhea=(None, None, None), win=(1000, 250)):
+        for name, value in zip(METRIC_FIELDS, tuple(typo) + tuple(hhea) + tuple(win)):
+            object.__setattr__(self, name, value)
+
+
+class fgFontInfo(Native):
+    """fgPackage.info: the copy the export overwrites; its flags say whether Custom hhea linespacing is on."""
+    _members = METRIC_FIELDS + ("openTypeOS2Selection", "dict")
+
+    def __init__(self, values=(800.0, -200.0, 0.0, None, None, None, 1000.0, 250.0), selection=(), flags=None):
+        for name, value in zip(METRIC_FIELDS, values):
+            object.__setattr__(self, name, value)
+        object.__setattr__(self, "openTypeOS2Selection", list(selection))
+        object.__setattr__(self, "dict", _InfoDict(flags or {}))
+
+
 class flPackage(Native):
     _members = (
         "tfn", "tsn", "psn", "ffn", "path", "upm", "glyphsCount", "master", "mastersCount", "masters",
         "versionMajor", "versionMinor", "hasChanges", "fgPackage", "findName", "findUnicode", "isNull",
         "kerning", "getAllGroups", "renameGlyph", "addGlyph", "deleteGlyph", "setFlag", "currentHistoryState",
-        "initialHistoryState",
+        "initialHistoryState", "info", "setMaster", "xHeight_value", "capsHeight_value",
     )
+
+    @property
+    def info(self):
+        """The current master's model (flPackage.info)."""
+        models = self._f_models
+        if self.master not in models:
+            models[self.master] = Info()
+        return models[self.master]
+
+    @property
+    def xHeight_value(self):
+        return self._f_dimensions.get(self.master, (500.0, 700.0))[0]
+
+    @property
+    def capsHeight_value(self):
+        return self._f_dimensions.get(self.master, (500.0, 700.0))[1]
+
+    def setMaster(self, name, notify=True):
+        if name not in self.masters:
+            raise ValueError("no master %r" % name)
+        self._f_switches.append((name, notify))
+        object.__setattr__(self, "master", name)
 
     def __init__(self, family, style, glyphs, master="Regular", path="fixtures/Test.vfc", masters=None, font_id=1,
                  kerning=None, classes=(), features=None):
@@ -615,6 +680,9 @@ class flPackage(Native):
         object.__setattr__(self, "_f_refuse_delete", False)
         object.__setattr__(self, "_f_rename_ignored", False)
         object.__setattr__(self, "_f_unicode_map", {})
+        object.__setattr__(self, "_f_models", {})  # master → Info
+        object.__setattr__(self, "_f_dimensions", {})  # master → (x-height, cap height)
+        object.__setattr__(self, "_f_switches", [])  # setMaster calls: (name, notify)
         self._f_rebuild()
 
     @property

@@ -36,6 +36,8 @@ mcp = FastMCP(
     instructions=(
         "FreeLab reads and edits fonts open in FontLab through a listener script that runs inside FontLab. "
         "Start with fontlab_status; if FontLab is not running and the user wants it, launch_fontlab starts it. "
+        "Its user field says whether the user is working in FontLab right now (FontLab in front, little idle time): "
+        "then hold off on clicks, window switches, and fonts brought to the front, or ask first. "
         "list_fonts gives each open font's id. Read tools act on the font named by font (its id, path, "
         "PostScript name, or full name), or on the font in front when none is named. Write tools need font: "
         "they never guess which font to change, and font_name (its path or name) confirms an id. Each write is one step of FontLab's History (Edit > Undo, or "
@@ -154,10 +156,47 @@ def _glyph_args(name: str, unicode: int | None, layer: str, key: str = "name") -
 
 @mcp.tool()
 async def fontlab_status() -> dict[str, Any]:
-    """Check the FontLab connection: listener and Python versions, open font count, and the font in front."""
+    """Check the FontLab connection: listener and Python versions, open font count, and the font in front.
+
+    user (Windows): seconds since the last keyboard or mouse input on this computer (idle_s), and whether a
+    FontLab window is the one in front (fontlab_in_front). Before clicking, typing, or switching windows in
+    FontLab, check that the user is not working in it right now (FontLab in front and idle_s low): wait, or ask.
+    """
     ping = await _call("ping")
     status = await _call("status")
-    return {"server": __version__, "listener": ping, **status}
+    result = {"server": __version__, "listener": ping, **status}
+    user = await anyio.to_thread.run_sync(_user_activity)
+    if user is not None:
+        result["user"] = user
+    return result
+
+
+def _user_activity() -> dict[str, Any] | None:
+    """screen.user_activity for FontLab's process, or None where it cannot be told (not Windows, no pid)."""
+    try:
+        pid = read_state().get("pid")
+    except Exception:
+        return None
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        return None
+    try:
+        return screen.user_activity(pid)
+    except Exception:
+        return None
+
+
+@mcp.tool()
+async def get_vertical_metrics(all_masters: bool = True, font: FontRef | None = None) -> dict[str, Any]:
+    """Read a font's vertical metrics as FontLab's export writes them, per master: typo ascender, descender,
+    and line gap (the master's Ascender, Descender, and Line gap), hhea (its own only with Font Info's Custom
+    hhea linespacing on, else the typo values), win ascent and descent (its Safe top and Safe bottom), with
+    x-height and cap height, whether Use Typo Metrics is on, and units per em. Nothing is written.
+
+    Read these, not run_python's fgPackage.info: that is a copy FontLab's export overwrites, which can be stale
+    (export_copy and export_copy_stale show it). all_masters makes each master current in turn, quietly, and
+    the current one current again; false reads the current master alone.
+    """
+    return await _call("vertical_metrics", _font({"all_masters": all_masters}, font))
 
 
 @mcp.tool()
@@ -988,7 +1027,7 @@ async def set_value(window: str, control: str, value: ControlValue, row: Int | N
     """Set a control of a window as a user's edit does, and emit what that edit would besides.
 
     check: true or false (ticked as clicks do); radio: true (chosen); combo: an entry's text (activated, as a
-    user's choice), or its number; spin, slider: a number in its range (editingFinished, as typing ends);
+    user's choice), or its number; spin, slider: a number in its range (a spin box's editingFinished, as typing ends);
     field: a text (textEdited, editingFinished); text: a text; tabs: a tab's text, or its number (currentChanged).
     With row (as read_list numbers rows), a list's, tree's, or table's row: true or false ticks or unticks its
     check box. Refused for a hidden, disabled, or read-only control, and when something else waits or works, as

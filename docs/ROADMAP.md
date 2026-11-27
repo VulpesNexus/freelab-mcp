@@ -26,9 +26,12 @@ Proven live on test fonts, with what FontLab did, in [FONTLAB7-API.md](FONTLAB7-
 
 - **Window tools** ([WINDOW-TOOLS.md](WINDOW-TOOLS.md)): any FontLab window driven as a user would, FreeLab Script Suite's tool windows included, without `run_python`: windows and their controls listed with stable addresses, clicks, values, list rows, texts with their links, menu commands, and `wait_idle` for the work an action starts. Actions run from a timer after the reply and are checked again then; questions of FontLab's and commands that save, export, close, or revert need risky mode; optional conventions (`objectName`, `mcpBusy`, `mcpScriptWindow`, `mcpRisky`) let a script be driven more surely.
 
+- **Vertical metrics** (`get_vertical_metrics`, live 2026-11-27): each master's typo, hhea, and win values read from FontLab's model, as its export writes them, beside the font info copy the export overwrites ([FONTLAB7-API.md](FONTLAB7-API.md#font-info-and-vertical-metrics-as-exported-found-live-2026-11-27)).
+- **Whether the user is at FontLab** (`fontlab_status`'s `user`, live 2026-11-27): seconds since the last input, and whether FontLab is in front, without reading another program's window title.
+
 ## Next
 
-- **The window tools' last live proofs**: the signals not emitted yet, a floating panel, and the controls in a list's cells ([the list](FONTLAB7-API.md#the-window-tools-130-still-to-prove-live)).
+- **The window tools' last live proof**: a floating panel of FontLab's ([the list](FONTLAB7-API.md#the-window-tools-130-still-to-prove-live)).
 - **What 1.2.0 still lacks live proof of**, as listed in [FONTLAB7-API.md](FONTLAB7-API.md#not-yet-proven-live): `answer_dialog` refusing a question that replaced the one it was asked about, among others.
 - **A font with no window tab**: a way to bring it forward or close it (the candidates are listed there).
 - **Classes of the Classes panel** in `update_references` and `remove_references`, if `fgFont.groups` proves to change them.

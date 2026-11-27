@@ -10,7 +10,7 @@
 #                                         start it) without a click in FontLab
 #   install-fontlab.ps1 -Uninstall        remove that block and the listener
 #
-# FreeLab, a separate repository of FontLab tools (dark mode), installs its scripts
+# FreeLab Script Suite, a separate repository of FontLab tools (dark mode), installs its scripts
 # beside this one with a startup block of its own: either can be installed or
 # removed without the other.
 #
@@ -213,7 +213,7 @@ if ($ListenerAtLaunch -and -not $Uninstall -and -not (Test-Path $startup)) {
 if ($legacy) { $current = Remove-Blocks $current $legacyOpen $legacyClose }
 function Write-LegacyNote {
     if ($legacy) {
-        Write-Output 'Removed the combined FreeLab block of earlier versions, which also applied dark mode at launch. To keep that, run tools\install-fontlab.ps1 from FreeLab.'
+        Write-Output 'Removed the combined FreeLab block of earlier versions, which also applied dark mode at launch. To keep that, run tools\install-fontlab.ps1 from FreeLab Script Suite.'
     }
 }
 

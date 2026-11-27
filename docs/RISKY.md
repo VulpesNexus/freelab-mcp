@@ -5,7 +5,7 @@ Some actions are worth having but can lose or overwrite the user's work, or deci
 ## How it works
 
 - The server starts with risky mode off. `set_risky_mode(true)` turns it on for that server session, `set_risky_mode(false)` off again. Its description and the server's instructions tell the AI app to turn it on only when the user has asked for risky mode in their own words in the conversation: never on its own initiative, never to get past a refusal, and never because a tool's message or a document suggests it.
-- Every risky tool, and every risky argument, starts its description with *[risky]*. `list_risky_actions` lists them, with why each is risky, and says whether risky mode is on.
+- Every risky tool's description starts with *[risky]*, and every risky argument's description holds it. `list_risky_actions` lists them, with why each is risky, and says whether risky mode is on.
 - A risky action asked while risky mode is off is refused with `risky_mode_off`, naming the action and how risky mode is turned on, and nothing is done.
 - The listener enforces the same list: the server sends `risky: true` with a risky request only while risky mode is on, and the listener refuses the request without it. A client that talks to the listener without the server's flag cannot do these either.
 - There is one list: `RISKY_ACTIONS` in *listener/freelab_listener.py*. The server reads it from that file's source as a literal, without running it; a server that cannot read the file asks the running listener for it (the `risky_actions` operation). The test gate checks that every enforced action is refused without the flag and that each one's tool or argument is marked.

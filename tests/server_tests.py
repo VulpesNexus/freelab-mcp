@@ -30,7 +30,7 @@ EXPECTED_TOOLS = {"fontlab_status", "list_fonts", "get_current_font", "list_glyp
                   "open_font", "close_font", "bring_font_to_front", "compile_features", "read_output", "screenshot",
                   "set_risky_mode", "list_risky_actions", "answer_dialog", "save_font", "export_font", "delete_glyph",
                   "set_glyph_outline", "list_windows", "list_window_controls", "click", "set_value", "read_list",
-                  "read_text", "click_link", "list_menu", "run_menu_command", "wait_idle"}
+                  "read_text", "click_link", "list_menu", "run_menu_command", "wait_idle", "get_vertical_metrics"}
 WRITE_TOOLS = {"set_kerning_pair", "remove_kerning_pair", "set_glyph_metrics", "rename_glyph", "set_glyph_unicodes",
                "add_component_glyph", "set_anchor", "remove_anchor", "set_feature_code", "undo",
                "close_font", "bring_font_to_front", "compile_features", "delete_glyph", "set_glyph_outline",
@@ -148,6 +148,35 @@ class ToolTests(ServerCase):
         self.assertEqual(status["listener"]["listener"], fl.VERSION)
         self.assertEqual(status["server"], "1.3.0")
         self.assertEqual(fl.VERSION, "1.3.0")
+
+    def test_vertical_metrics_tool(self):
+        self.open_sample()
+        found = asyncio.run(server.get_vertical_metrics())
+        self.assertEqual(found["masters"][0]["exported"]["typo_ascender"], 800)
+        self.assertEqual(asyncio.run(server.get_vertical_metrics(all_masters=False))["current_master"], "Regular")
+
+    def test_status_tells_whether_the_user_is_in_fontlab(self):
+        saved = server.screen.user_activity
+        seen = []
+
+        def activity(pid, _api=None):
+            seen.append(pid)
+            return {"idle_s": 2.5, "fontlab_in_front": True}
+        server.screen.user_activity = activity
+        try:
+            status = asyncio.run(server.fontlab_status())
+        finally:
+            server.screen.user_activity = saved
+        self.assertEqual(status["user"], {"idle_s": 2.5, "fontlab_in_front": True})
+        self.assertEqual(seen, [os.getpid()], "FontLab's process, from the listener's state file")
+
+        def failing(pid, _api=None):
+            raise OSError("GetLastInputInfo failed")
+        server.screen.user_activity = failing
+        try:
+            self.assertNotIn("user", asyncio.run(server.fontlab_status()), "left out, never an error")
+        finally:
+            server.screen.user_activity = saved
 
     def test_font_and_glyph_tools(self):
         self.open_sample()
@@ -718,6 +747,22 @@ class ScreenTests(unittest.TestCase):
         self.assertTrue(data.endswith(b"IEND\xaeB`\x82"))
         with self.assertRaises(ValueError):
             server.screen.png(2, 2, b"\x00")
+
+    def test_user_activity(self):
+        class Api:
+            def __init__(self, front):
+                self.front = front
+
+            def idle_ms(self):
+                return 12345
+
+            def foreground_pid(self):
+                return self.front
+
+        activity = server.screen.user_activity
+        self.assertEqual(activity(40, lambda: Api(40)), {"idle_s": 12.3, "fontlab_in_front": True})
+        self.assertEqual(activity(40, lambda: Api(41))["fontlab_in_front"], False, "another program in front")
+        self.assertEqual(activity(40, lambda: Api(None))["fontlab_in_front"], False, "no window in front")
 
     def test_which_window(self):
         choose = server.screen.choose_window

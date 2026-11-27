@@ -8,10 +8,10 @@ New in 1.3.0: tools that drive any of FontLab's windows the way a user does, wit
 |---|---|
 | `list_windows` | The visible top-level windows: each one's key, title, class, whether it is modal, whether FontLab waits on it (and whether it is then a question of FontLab's), whether a script marks it as its own, and whether it is busy |
 | `list_window_controls` | A window's controls, each with its address, its kind, whether it is shown and enabled, whether a click on it needs risky mode, and what it holds |
-| `click` | A button, check box, or radio button, as a click does; a button's menu entry (`entry`); a row of a list, tree, or table (`row`, `double`) |
+| `click` | A button, check box, or radio button, as a click does; a button's menu entry (`entry`); a row of a list, tree, or table (`row`, the cell of `column`, `double`) |
 | `set_value` | Ticks or unticks a check box (or a row's), chooses a radio button, a dropdown's entry by its text, or a tab, sets a spin box, slider, field, or text box |
 | `read_list` | The rows of a list, tree, or table, a page at a time: text per column, check state, selection, and, in a tree, depth, child count, and whether it is expanded |
-| `read_text` | The whole text of a label, field, text box, or log, with the links it holds |
+| `read_text` | The whole text of a label, field, text box, or log, with the links it holds; a button's, check box's, or radio button's text; a dropdown's current entry |
 | `click_link` | Follows a link of a log or a label, as a click on it does |
 | `list_menu` | The main window's menus, or the entries of one by its path |
 | `run_menu_command` | A command of the main window's menus by its path: *Scripts > FreeLab > Font Check*, *Window > Panels > Features* |
@@ -30,7 +30,7 @@ A control's address is:
 - its objectName, when no other control of the window has it;
 - else the tabs (of a tab widget), group boxes, and docked panels around it, its caption, and its kind, joined by " > ", with *#1*, *#2* when several controls share that: `Pairs > Apply > button`, `Master > combo`, `tree#2`.
 
-A caption is a button's (or check box's) text, else its accessible name, its default action's text, or the first line of its tooltip; for another control, its accessible name, the label whose buddy it is, or the label just before it in its layout (`Master:` before a dropdown). Labels have no caption: their text is what they show, and they are numbered (`label#3`). A control is found by its address, its objectName, or its caption (case and a closing ellipsis or period ignored); when a caption names several controls and only one of them is shown, that one. An address or objectName that names two controls (an objectName spelled like another control's address) is refused (`ambiguous_control`), never settled by which one is shown.
+A caption is a button's text, else its accessible name, its default action's text, or the first line of its tooltip; a check box's or radio button's text, else as for another control; for another control, its accessible name, the label whose buddy it is, or the label just before it in its layout (`Master:` before a dropdown). Labels have no caption: their text is what they show, and they are numbered (`label#3`). A control is found by its address, its objectName, or its caption (case and a closing ellipsis or period ignored); when a caption names several controls and only one of them is shown, that one. An address or objectName that names two controls (an objectName spelled like another control's address) is refused (`ambiguous_control`), never settled by which one is shown.
 
 An address made of labels holds while the window is laid out as it was; text that changes (a button that reads *Start*, then *Stop*) changes it. An objectName does not change: see the conventions.
 
@@ -42,7 +42,7 @@ The tool waits up to `wait_s` (2 seconds by default) for the action to be over, 
 
 A window is busy while:
 
-- its `mcpBusy` property is set and true (a convention, below), or, for a window with no such property but FontLab's main window and its panels, while it shows a progress bar that is not full;
+- its `mcpBusy` property is set and true (a convention, below), or, for a window with no such property other than FontLab's main window (its docked panels with it) and Qt dock widgets, while it shows a progress bar that is not full (or one with no range);
 - an action of these tools on it is queued or running.
 
 ## Safety

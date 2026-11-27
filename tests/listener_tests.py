@@ -466,6 +466,60 @@ class FontTests(ListenerCase):
         self.assertEqual(info["master"], "Regular")
         self.assertEqual(info["fonts_open"], 1)
 
+    def test_vertical_metrics_one_master(self):
+        """Live 2026-11-27: the model (flPackage.info) holds the master's typo and win values; hhea is exported as
+        the typo values while Custom hhea linespacing is off; the export copy agrees here."""
+        self.open_sample()
+        found = self.ok("vertical_metrics")
+        self.assertEqual(found["current_master"], "Regular")
+        self.assertIs(found["custom_hhea"], False)
+        self.assertIs(found["use_typo_metrics"], False)
+        [master] = found["masters"]
+        self.assertEqual(master["model"]["typo_ascender"], 800)
+        self.assertIsNone(master["model"]["hhea_ascender"])
+        self.assertEqual(master["exported"]["hhea_ascender"], 800, "hhea exported as typo")
+        self.assertEqual(master["exported"]["win_descent"], 250)
+        self.assertEqual(master["x_height"], 500.0)
+        self.assertEqual(found["export_copy_stale"], [])
+        self.assertEqual(self.state.current._f_switches, [], "one master: never switched")
+        self.assertNotIn("unreadable", found)
+
+    def test_vertical_metrics_every_master_and_a_stale_copy(self):
+        font = fakes.write_font()
+        self.state.fonts = [font]
+        self.state.current = font
+        font._f_models["Regular"] = fakes.Info(typo=(965, -260, 0), hhea=(1000, -300, 10), win=(1010, 290))
+        font._f_models["Bold"] = fakes.Info(typo=(980, -270, 0), hhea=(1020, -310, 0), win=(1100, 300))
+        font.fgPackage.info.dict.flags._f_flags["hhea_use_custom"] = True
+        font.fgPackage.info.openTypeOS2Selection.append(7)
+        found = self.ok("vertical_metrics", {"font": 7})
+        self.assertIs(found["custom_hhea"], True)
+        self.assertIs(found["use_typo_metrics"], True)
+        bold = [m for m in found["masters"] if m["master"] == "Bold"][0]
+        self.assertEqual(bold["exported"]["hhea_ascender"], 1020, "Custom hhea on: each master's own")
+        self.assertEqual(bold["exported"]["win_ascent"], 1100)
+        self.assertEqual(font.master, "Regular", "the current master current again")
+        self.assertEqual(font._f_switches, [("Regular", False), ("Bold", False), ("Regular", False)], "quietly")
+        self.assertIn("typo_ascender", found["export_copy_stale"], "the copy's 800 is not the model's 965")
+        only = self.ok("vertical_metrics", {"font": 7, "all_masters": False})
+        self.assertEqual([m["master"] for m in only["masters"]], ["Regular"])
+
+    def test_vertical_metrics_a_master_that_will_not_switch(self):
+        font = fakes.write_font()
+        self.state.fonts = [font]
+        self.state.current = font
+        switch = font.setMaster
+
+        def refusing(name, notify=True):
+            if name == "Bold":
+                raise RuntimeError("no switch")
+            switch(name, notify)
+        object.__setattr__(font, "setMaster", refusing)
+        found = self.ok("vertical_metrics", {"font": 7})
+        self.assertEqual([m["master"] for m in found["masters"]], ["Regular"])
+        self.assertIn("Bold: switch", found["unreadable"])
+        self.assertEqual(font.master, "Regular")
+
     def test_unreadable_field_is_reported_not_hidden(self):
         self.open_sample(broken_path=True)
         info = self.ok("font_info")
@@ -1863,11 +1917,35 @@ class WindowTests(FontCase):
         path = self.crasher_file("Half.ttf", fontbytes.sfnt({b"head": fontbytes.head(), b"GPOS": gpos}))
         error = self.fails("open_font", {"path": path}, code="known_crasher")
         self.assertIn("past the end", error["data"]["unchecked"])
-        reply = self.ok("open_font", {"path": path, "safe_copy": True})
-        self.assertIn(u"Part of it was not checked", reply["safe_copy"]["note"])
-        self.assertEqual(reply["safe_copy"]["changed"], 1)
+        # (Codex, 2026-11-27: the copy of a file checked in part was opened, the caveat only in the reply)
+        self.assertIn(u"Part of it could not be checked", error["message"])
+        self.assertIn(u"writes one to FreeLab's own folder", error["message"])
+        self.assertIn(u"and does not open it", error["message"])
+        self.assertNotIn(u"which FontLab opens", error["message"])
+        error = self.fails("open_font", {"path": path, "safe_copy": True}, code="known_crasher")
+        copy = error["data"]["copy"]
+        self.assertIn(u"A copy with it fixed was written to %s, and not opened" % copy, error["message"])
+        self.assertIn(u"FontLab may crash on the copy too", error["message"])
+        self.assertIn(u"once the work in their open fonts is saved", error["message"])
+        self.assertEqual((error["data"]["changed"], fl.scan_font_file(copy)["count"]), (1, 0))
         self.state.fire_timers()
-        self.assertEqual(self.state.loads, [reply["safe_copy"]["path"]], "the copy, never the file")
+        self.assertEqual((self.state.timers, self.state.loads), ([], []), "neither the copy nor the file opened")
+
+    def test_a_crasher_past_the_budget_is_never_opened_by_its_copy(self):
+        # (Codex, 2026-11-27: one found, then 240,000 subtables, then another: the copy kept the second one)
+        empty = fontbytes.lookup(1, [fontbytes.single(2, 0, 0)])
+        count, repeats = 4000, 60
+        shared = struct.pack(">HHH", 1, 0, count) + struct.pack(">H", 6 + 2 * count) * count + fontbytes.single(1, 0)
+        listing = 2 + 2 * (repeats + 2)
+        offsets = [listing] + [listing + len(empty)] * repeats + [listing + len(empty) + len(shared)]
+        gpos = (struct.pack(">HHHHH", 1, 0, 10, 12, 14) + struct.pack(">HH", 0, 0) + struct.pack(">H", repeats + 2) +
+                b"".join(struct.pack(">H", at) for at in offsets) + empty + shared + empty)
+        path = self.crasher_file("Loop.ttf", fontbytes.sfnt({b"head": fontbytes.head(), b"GPOS": gpos}))
+        error = self.fails("open_font", {"path": path, "safe_copy": True}, code="known_crasher")
+        self.assertIn(u"over and over", error["data"]["unchecked"])
+        self.assertIn(u"and not opened", error["message"])
+        self.state.fire_timers()
+        self.assertEqual(self.state.loads, [], "nothing opened")
 
     def test_open_font_opens_a_fixed_copy_with_safe_copy(self):
         path = self.crasher_file()
@@ -1916,7 +1994,7 @@ class WindowTests(FontCase):
 
     def test_a_copy_that_cannot_be_made_opens_nothing(self):
         real = fl._brotli_decompress
-        fl._brotli_decompress = lambda: (lambda data: data)
+        fl._brotli_decompress = lambda: (lambda data, limit: data)  # (fontbytes' stream is not compressed)
         try:
             path = self.crasher_file("Web.woff2", fontbytes.woff2({b"head": fontbytes.head(), b"GPOS": fontbytes.gpos(
                 [fontbytes.lookup(1, [fontbytes.single(2, 0, 0)])])}))

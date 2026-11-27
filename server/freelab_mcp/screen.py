@@ -4,7 +4,7 @@ FontLab's own Qt picture (screenshot source="qt", QWidget.grab) shows what Qt dr
 for the window through user32's PrintWindow with PW_RENDERFULLCONTENT, so it shows what Qt's picture may
 not (native title bars, a window FontLab's main thread is too busy to draw for a grab). FontLab is found by
 the process id its listener records in its state file. Windows only; the PNG is written with zlib and struct.
-Proven live at 100 % display scaling (docs/FONTLAB7-API.md); above it, not yet.
+Proven live at 100 % and 150 % display scaling (docs/FONTLAB7-API.md).
 """
 
 from __future__ import annotations
@@ -100,6 +100,16 @@ def capture(pid: int, title: str = "", max_width: int = 0,
         "window": window["title"], "width": out_width, "height": out_height, "source": "screen"}
 
 
+def user_activity(pid: int, _api: Callable[[], Any] | None = None) -> dict[str, Any] | None:
+    """{"idle_s", "fontlab_in_front"}: seconds since the last keyboard or mouse input in this session, and
+    whether the window in front is one of the process's. None off Windows. The window in front is told only
+    by its process: its title, which may be any program's (a browser's page), is not read."""
+    if sys.platform != "win32" and _api is None:
+        return None
+    api = (_api or _Win32)()
+    return {"idle_s": round(api.idle_ms() / 1000.0, 1), "fontlab_in_front": api.foreground_pid() == pid}
+
+
 class _Win32:
     """The user32 and gdi32 calls, through ctypes (loaded only on Windows)."""
 
@@ -174,6 +184,34 @@ class _Win32:
 
     def minimized(self, hwnd: Any) -> bool:
         return bool(self.user32.IsIconic(hwnd))
+
+    def idle_ms(self) -> int:
+        """Milliseconds since the session's last input (GetLastInputInfo), the tick count's wrap included."""
+        ctypes, wintypes = self.ctypes, self.wintypes
+
+        class LASTINPUTINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+        info = LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(LASTINPUTINFO)
+        self.user32.GetLastInputInfo.argtypes = [ctypes.POINTER(LASTINPUTINFO)]
+        self.user32.GetLastInputInfo.restype = wintypes.BOOL
+        if not self.user32.GetLastInputInfo(ctypes.byref(info)):
+            raise OSError("GetLastInputInfo failed")
+        kernel32 = ctypes.WinDLL("kernel32")
+        kernel32.GetTickCount.restype = wintypes.DWORD
+        return (kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF
+
+    def foreground_pid(self) -> int | None:
+        """The process of the window in front, or None when there is none."""
+        ctypes, wintypes, user32 = self.ctypes, self.wintypes, self.user32
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        return owner.value or None
 
     def print_window(self, hwnd: Any, width: int, height: int, out_width: int, out_height: int) -> bytes:
         """The window drawn by PrintWindow into a bitmap of its size, then scaled (GDI's halftone) into a

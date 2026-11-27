@@ -48,13 +48,72 @@ def font(gpos=None, version=b"\x00\x01\x00\x00"):
     return tables
 
 
+def shared_gpos(heads, repeats, tails=(), count=4000):
+    """A GPOS of these lookups (each lookup's bytes), then repeats lookups that are one lookup of count format 1
+    subtables over glyphs, all one subtable (repeats x count steps of the check, in some 8 KB), then tails."""
+    shared = struct.pack(">HHH", 1, 0, count) + struct.pack(">H", 6 + 2 * count) * count + fb.single(1, 0)
+    total = len(heads) + repeats + len(tails)
+    listing = 2 + 2 * total
+    offsets, body = [], b""
+    for item in heads:
+        offsets.append(listing + len(body))
+        body += item
+    offsets += [listing + len(body)] * repeats
+    body += shared
+    for item in tails:
+        offsets.append(listing + len(body))
+        body += item
+    return (struct.pack(">HHHHH", 1, 0, 10, 12, 14) + struct.pack(">HH", 0, 0) + struct.pack(">H", total) +
+            b"".join(struct.pack(">H", at) for at in offsets) + body)
+
+
+def identity_brotli():
+    """A _brotli_decompress for fontbytes' WOFF2, whose stream is not compressed."""
+    return lambda data, limit: data
+
+
+class FakeBrotli(object):
+    """What the check uses of brotli 1.2 (Decompressor().process(data, output_buffer_limit=...)), for sys.modules:
+    process gives a bomb's stream (zeros without end), cut at the limit; its decompress never bounds what it gives.
+    bounded=False: a brotli older than 1.2, whose process takes no limit."""
+
+    def __init__(self, bounded=True):
+        self.limits = []
+        fake = self
+
+        class Decompressor(object):
+            if bounded:
+                def process(self, data, output_buffer_limit=None):
+                    if output_buffer_limit is None:
+                        raise AssertionError("decompressed without a bound")
+                    if not data:
+                        return b""
+                    fake.limits.append(output_buffer_limit)
+                    return b"\0" * output_buffer_limit
+            else:
+                def process(self, data):
+                    raise AssertionError("decompressed without a bound")
+        self.Decompressor = Decompressor
+
+    def decompress(self, data):
+        raise AssertionError("decompressed without a bound")
+
+
 class Case(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="freelab-crasher-")
-        self._brotli = fl._brotli_decompress
+        self.held = dict((name, getattr(fl, name)) for name in ("_brotli_decompress", "empty_single_adjustments",
+                                                                 "fixed_font_bytes"))
+        self.modules = dict((name, sys.modules.get(name)) for name in ("brotli", "brotlicffi"))
 
     def tearDown(self):
-        fl._brotli_decompress = self._brotli
+        for name, value in self.held.items():
+            setattr(fl, name, value)
+        for name, module in self.modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def write(self, name, data):
@@ -118,7 +177,7 @@ class DetectionTests(Case):
         scan = fl.scan_font_file(path)
         self.assertEqual((scan["format"], scan["checked"], scan["count"]), ("woff2", False, 0))
         self.assertIn("brotli", scan["why_not"])
-        fl._brotli_decompress = lambda: (lambda data: data)  # (the stream fontbytes writes is not compressed)
+        fl._brotli_decompress = identity_brotli  # (the stream fontbytes writes is not compressed)
         scan = fl.scan_font_file(path)
         self.assertEqual((scan["checked"], scan["count"]), (True, 2))
         self.assertEqual(self.found(scan), [(0, 1, 1, False, 0, 3), (0, 2, 0, True, 4, 7)])
@@ -224,6 +283,88 @@ class DetectionTests(Case):
         finally:
             fl.os.rename = real
         self.assertEqual(os.listdir(os.path.join(self.tmp, "other")), [], "no .tmp left")
+
+
+def subtable_count(data, li):
+    """How many subtables lookup li of the sfnt's GPOS lists."""
+    gpos = fb.tables_of(data)[b"GPOS"][0]
+    listing = gpos + struct.unpack_from(">H", data, gpos + 8)[0]
+    lookup = listing + struct.unpack_from(">H", data, listing + 2 + 2 * li)[0]
+    return struct.unpack_from(">H", data, lookup + 4)[0]
+
+
+class PartialCheckTests(Case):
+    """A check that could not read the whole file says so, and costs no more than one budget (Codex, 2026-11-27):
+    a coverage that cannot be read, a collection repeating one GPOS, a WOFF2 that inflates past its tables."""
+
+    def test_a_coverage_that_cannot_be_read_leaves_the_check_unmade(self):
+        lost_one = struct.pack(">HHH", 1, 0xFFF0, 4) + b"\0\0"  # (format 1, its coverage past the table's end)
+        odd_one = struct.pack(">HHH", 1, 8, 4) + b"\0\0" + struct.pack(">HH", 3, 0)  # (a coverage of format 3)
+        for sub in (lost_one, odd_one):
+            scan = fl.scan_font_file(self.write("Lost.ttf", fb.sfnt(font(fb.gpos([fb.lookup(1, [sub, EMPTY])])))))
+            self.assertEqual((scan["checked"], scan["count"]), (False, 1), "the subtable after it still read")
+            self.assertIn(u"coverage of lookup 0's subtable 0 cannot be read", scan["why_not"])
+        lost_two = struct.pack(">HHHH", 2, 0xFFF0, 0, 0)  # (format 2 with no values, its coverage past the end)
+        path = self.write("LostTwo.ttf", fb.sfnt(font(fb.gpos([fb.lookup(1, [fb.single(1, 4), lost_two])]))))
+        scan = fl.scan_font_file(path)
+        self.assertEqual((scan["checked"], self.found(scan)), (False, [(0, 0, 1, False, 0, None)]))
+        target = os.path.join(self.tmp, "copy.ttf")
+        self.assertEqual(fl.write_safe_copy(path, scan, target), 1)
+        with open(target, "rb") as handle:
+            self.assertEqual(subtable_count(handle.read(), 0), 1, "taken out, never made format 1 over that coverage")
+        again = fl.scan_font_file(target)
+        self.assertEqual((again["checked"], again["count"]), (True, 0))
+
+    def test_a_collection_has_one_budget_and_reads_a_shared_gpos_once(self):
+        reads = []
+        real = fl.empty_single_adjustments
+
+        def counted(gpos, *args, **kwargs):
+            reads.append(len(gpos))
+            return real(gpos, *args, **kwargs)
+        fl.empty_single_adjustments = counted
+        shared = font(shared_gpos([fb.lookup(1, [EMPTY])], 30))  # (120,000 steps)
+        scan = fl.scan_font_file(self.write("Shared.ttc", fb.collection([shared, shared, shared])))
+        self.assertEqual((scan["checked"], scan["count"], [e["font"] for e in scan["fonts"]]), (True, 3, [0, 1, 2]))
+        self.assertEqual(len(reads), 1, "one GPOS for three fonts: read once")
+        path = self.write("Shared2.ttc", fb.collection([shared, shared]))
+        self.assertEqual(fl.write_safe_copy(path, fl.scan_font_file(path), os.path.join(self.tmp, "copy.ttc")), 1,
+                         "the shared subtable fixed once, for both fonts")
+        two = fb.collection([font(shared_gpos([fb.lookup(1, [EMPTY])], 30)),
+                             font(shared_gpos([fb.lookup(1, [EMPTY])], 31))])
+        scan = fl.scan_font_file(self.write("Two.ttc", two))
+        self.assertEqual((scan["checked"], scan["count"]), (False, 2), "240,000 steps in one file: past the budget")
+        self.assertIn(u"over and over", scan["why_not"])
+
+    def test_a_woff2_is_inflated_no_further_than_its_tables_say(self):
+        path = self.write("Bomb.woff2", fb.woff2(font(crasher_gpos())))
+        bomb = sys.modules["brotli"] = FakeBrotli()
+        scan = fl.scan_font_file(path)
+        self.assertEqual((scan["checked"], scan["count"]), (False, 0))
+        self.assertIn(u"longer than its table directory says", scan["why_not"])
+        stream = sum(len(data) for data in font(crasher_gpos()).values())
+        self.assertEqual(bomb.limits, [stream + 1], "inflated to one byte past its tables at most")
+        sys.modules["brotli"] = FakeBrotli(bounded=False)
+        scan = fl.scan_font_file(path)
+        self.assertEqual((scan["checked"], scan["count"]), (False, 0))
+        self.assertIn(u"WOFF2 needs brotli 1.2 or later", scan["why_not"])
+        directory = struct.pack(">B", 27) + fb.base128(fl.MAX_WOFF_TABLE + 1)  # (a GPOS said to be 256 MB and more)
+        huge = struct.pack(">4s4sIHHIIHHIIIII", b"wOF2", b"\x00\x01\x00\x00", 52 + len(directory), 1, 0, 0, 4, 1, 0,
+                           0, 0, 0, 0, 0) + directory + b"\0" * 4
+        sys.modules["brotli"] = bomb
+        scan = fl.scan_font_file(self.write("Huge.woff2", huge))
+        self.assertIn(u"more than any font's", scan["why_not"])
+        self.assertEqual(len(bomb.limits), 1, "refused before anything is inflated")
+
+    def test_a_copy_that_still_holds_one_is_not_written(self):
+        path = self.write("Crash.ttf", fb.sfnt(font(crasher_gpos())))
+        scan = fl.scan_font_file(path)
+        fl.fixed_font_bytes = lambda data, fmt: (data, 2)  # (a fix that fixed nothing)
+        target = os.path.join(self.tmp, "copies", "Crash.ttf")
+        with self.assertRaises(fl.FontFileError) as caught:
+            fl.write_safe_copy(path, scan, target)
+        self.assertIn(u"still holds 2", u"%s" % caught.exception)
+        self.assertEqual(os.listdir(os.path.dirname(target)), [], "no copy, and no .tmp left")
 
 
 def filtered_lookup(kind, subtables, mark_set):
@@ -391,7 +532,7 @@ class CopyTests(Case):
             self.assertEqual(copy[offset:offset + length], tables[b"name"])
 
     def test_a_woff2_is_not_copied(self):
-        fl._brotli_decompress = lambda: (lambda data: data)
+        fl._brotli_decompress = identity_brotli
         path = self.write("Web.woff2", fb.woff2(font(crasher_gpos())))
         scan = fl.scan_font_file(path)
         self.assertRaises(fl.FontFileError, fl.safe_copy_path, path, scan, self.tmp)
