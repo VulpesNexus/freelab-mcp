@@ -345,9 +345,13 @@ For scripts and tools that read or drive FontLab's windows.
 
 `bring_font_to_front`, `undo`, `compile_features`, `save_font`, and `close_font` choose a font's window tab, and refuse a font that has none (`not_found`). *Window > New Font Tab* (`actionOpen_Font_Window` in FreeLab Script Suite's notes) opens a tab of the current font only, so it cannot reach another. Calls to probe, one at a time, on a disposable font opened with no window: `flWorkspace.instance().closePackage(package)` and `flPackage.close(False)` (documented: *close(save=False)*) for closing; `fontlab.flItems.requestLoadingFont(path)` with the path of the font already open, to see whether FontLab brings it forward, opens a window of it, or opens it a second time. None is used yet.
 
+Not planned: the tools keep refusing it, a known limit ([ROADMAP.md](ROADMAP.md#known-limits)); the candidates stay recorded here.
+
 ### Classes of the Classes panel (candidate)
 
 `update_references` and `remove_references` refuse a glyph in a class of FontLab's *Classes* panel (`getAllGroups()` with `kernGroup` false): no call to change one is proven. `fgFont.groups` (`fgGroups`: `get`, `asDict`, `fromDict`, of `fgGroup` with a `FeaClassGroupMode`) looks like one; it is documented, and not tried.
+
+Not planned: the tools keep refusing it, a known limit ([ROADMAP.md](ROADMAP.md#known-limits)); the candidate stays recorded here.
 
 ## Proving a call live
 

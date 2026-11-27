@@ -1,5 +1,7 @@
 # Roadmap
 
+Nothing is outstanding, and nothing else is planned: everything below is done, and the [known limits](#known-limits) say what FreeLab MCP leaves as it is, and why.
+
 ## Done in 1.0.0
 
 - Every read proven live on test fonts ([FONTLAB7-API.md](FONTLAB7-API.md)), with fonts named by id, path, or name.
@@ -29,13 +31,15 @@ Proven live on test fonts, with what FontLab did, in [FONTLAB7-API.md](FONTLAB7-
 - **Vertical metrics** (`get_vertical_metrics`, live 2026-11-27): each master's typo, hhea, and win values read from FontLab's model, as its export writes them, beside the font info copy the export overwrites ([FONTLAB7-API.md](FONTLAB7-API.md#font-info-and-vertical-metrics-as-exported-found-live-2026-11-27)).
 - **Whether the user is at FontLab** (`fontlab_status`'s `user`, live 2026-11-27): seconds since the last input, and whether FontLab is in front, without reading another program's window title.
 
-## Next
+## Known limits
 
-- **The window tools' last live proof**: a floating panel of FontLab's ([the list](FONTLAB7-API.md#the-window-tools-130-still-to-prove-live)).
-- **What 1.2.0 still lacks live proof of**, as listed in [FONTLAB7-API.md](FONTLAB7-API.md#not-yet-proven-live): `answer_dialog` refusing a question that replaced the one it was asked about, among others.
-- **A font with no window tab**: a way to bring it forward or close it (the candidates are listed there).
-- **Classes of the Classes panel** in `update_references` and `remove_references`, if `fgFont.groups` proves to change them.
-- **Pictures in glyphs**: a read of a glyph's pictures (their place and size in glyph units, from `flShape.image` and `transform`), and a `place_image` write that drops a file on a glyph window's canvas, which places it without the clipboard, once its History step is proven ([FONTLAB7-API.md](FONTLAB7-API.md#the-canvas-and-pictures-found-live-2026-11-25)).
-- **Exception pairs of a glyph named like its class**, if FontLab's scripting turns out to have a way to address one (renaming the class for the moment is one, but touches the class).
+Nothing is outstanding, and nothing else is planned. What 1.3.0 leaves as it is, and why:
 
-Tools that run inside FontLab on their own, such as dark mode and the kerning and feature-code helpers, belong to FreeLab Script Suite, the separate `freelab-script-suite` repository, and are on its roadmap.
+- **A floating panel of FontLab's** is not proven to be listed and walked by the window tools: FontLab 7 floats a panel by a drag only, which the tools do not do ([FONTLAB7-API.md](FONTLAB7-API.md#the-window-tools-130-still-to-prove-live)). A font tab undocked by *Window > Docking* is proven.
+- **Proven on fakes, not reproducible live** ([FONTLAB7-API.md](FONTLAB7-API.md#not-yet-proven-live)): `answer_dialog` refusing a question swapped for another within its 50 ms, a new shape the layer does not take, `set_prefix` inside a rename, and the state file held by a second account. The ordinary case of each is proven live.
+- **A font with no window tab** is refused (`not_found`) by the tools that bring a font to the front: open a tab of it in FontLab. No call found reaches such a font ([FONTLAB7-API.md](FONTLAB7-API.md#a-font-with-no-window-tab-candidates)).
+- **A class of the *Classes* panel** is refused by `update_references` and `remove_references`: no call to change one is proven ([FONTLAB7-API.md](FONTLAB7-API.md#classes-of-the-classes-panel-candidate)).
+- **An exception pair of a glyph named like its class** cannot be written: FontLab takes such a name as the class. `set_kerning_pair` writes the class pair given `@name`.
+- **Pictures in glyphs** have no tool: what FontLab gives of them is recorded ([FONTLAB7-API.md](FONTLAB7-API.md#the-canvas-and-pictures-found-live-2026-11-25)), and `run_python` reaches them.
+
+Tools that run inside FontLab on their own, such as dark mode and the kerning and feature-code helpers, belong to FreeLab Script Suite, the separate `freelab-script-suite` repository.

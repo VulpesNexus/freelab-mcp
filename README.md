@@ -2,7 +2,7 @@
 
 An MCP server that lets an AI app such as Claude Code read the fonts open in FontLab 7, make a small set of undoable edits to them, drive FontLab's windows as a user would, and start and close FontLab when asked.
 
-**Status: 1.3.0.** Every tool of 1.2.0 was proven live in FontLab 7.2 on test fonts (TrueType and CFF, multiple masters, Japanese, Arabic, and Hebrew); the window tools, new in 1.3.0, drove a whole FreeLab Script Suite workflow live on 2026-11-19; only a floating panel of FontLab's is not yet proven. [docs/FONTLAB7-API.md](docs/FONTLAB7-API.md) tracks each FontLab call, how far it is proven, and what is not yet.
+**Status: 1.3.0.** Every tool of 1.2.0 was proven live in FontLab 7.2 on test fonts (TrueType and CFF, multiple masters, Japanese, Arabic, and Hebrew); the window tools, new in 1.3.0, drove a whole FreeLab Script Suite workflow live on 2026-11-19, and `get_vertical_metrics` and `fontlab_status`'s `user` were proven live on 2026-11-27. Nothing else is planned: the [roadmap](docs/ROADMAP.md) has nothing outstanding, and its known limits say what FreeLab MCP leaves as it is (a floating panel of FontLab's, for one, is not proven). [docs/FONTLAB7-API.md](docs/FONTLAB7-API.md) tracks each FontLab call and how far it is proven.
 
 [FreeLab Script Suite](https://github.com/VulpesNexus/freelab-script-suite), a separate repository, holds tools that run inside FontLab: a dark mode, kerning and spacing, glyph building, feature code, and font checks. Neither needs the other; installed together, they share FontLab's *Scripts > FreeLab* menu, and the window tools drive the suite's tool windows as a user would.
 
@@ -82,7 +82,7 @@ It runs the listener and server tests under Python 3, then the listener tests un
 - [docs/RISKY.md](docs/RISKY.md): risky mode and the actions it allows.
 - [docs/WINDOW-TOOLS.md](docs/WINDOW-TOOLS.md): the window tools, their safety rules, and the conventions a script can follow.
 - [docs/PRIOR-ART.md](docs/PRIOR-ART.md): the existing FontLab MCP servers, and why FreeLab MCP does not build on them.
-- [docs/ROADMAP.md](docs/ROADMAP.md): what comes next.
+- [docs/ROADMAP.md](docs/ROADMAP.md): what is done, and the known limits (nothing else is planned).
 
 ## License
 
