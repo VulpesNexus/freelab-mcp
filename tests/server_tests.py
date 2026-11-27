@@ -385,7 +385,7 @@ class WindowToolTests(WindowCase):
         path = os.path.join(self.tmp, "Crash.ttf")
         Path(path).write_bytes(fontbytes.sfnt({b"head": fontbytes.head(), b"GPOS": gpos}))
         with self.assertRaisesRegex(RuntimeError, r"\[known_crasher\] FontLab 7\.2 crashes on opening Crash\.ttf .*1 single "
-                                                  r"adjustment subtable of format 2 with no values \(lookup 0\).*safe_copy=True"):
+                                                  r"adjustment subtable with no values \(lookup 0\).*safe_copy=True"):
             asyncio.run(server.open_font(path))
         self.assertEqual(self.ids(), [1, 7])
         opened = asyncio.run(server.open_font(path, safe_copy=True))

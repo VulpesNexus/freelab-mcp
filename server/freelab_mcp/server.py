@@ -565,7 +565,7 @@ async def open_font(path: str, wait_s: float = 120.0, answer: Answer = "", safe_
     screen for the user and the tool stops ([dialog_open]); the font opens once it is answered. [risky]
     answer (risky mode only) is the button to click on that question instead.
 
-    A font file FontLab 7.2 is known to crash on (a GPOS single adjustment of format 2 with no values, as in
+    A font file FontLab 7.2 is known to crash on (a GPOS single adjustment with no values, as in
     Noto Sans JP's variable font) is refused ([known_crasher]), since a crash loses the unsaved work in every
     open font. safe_copy=True opens a fixed copy of it instead, written to FreeLab's own folder (safe-copies, beside
     the listener's state file), the same font to FontLab; the user's file is not changed, and the reply's safe_copy says where the copy is: tell the user.

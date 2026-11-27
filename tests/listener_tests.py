@@ -1842,7 +1842,7 @@ class WindowTests(FontCase):
         error = self.fails("open_font", {"path": path}, code="known_crasher")
         self.assertIn(u"FontLab 7.2 crashes on opening NotoSansJP[wght].ttf", error["message"])
         self.assertIn(u"loses the unsaved work in every open font", error["message"])
-        self.assertIn(u"2 single adjustment subtables of format 2 with no values (lookups 0 and 1)", error["message"])
+        self.assertIn(u"2 single adjustment subtables with no values (lookups 0 and 1)", error["message"])
         self.assertIn(u"safe_copy=True", error["message"])
         # (live, 2026-11-19: it read "such subtables positions nothing")
         self.assertIn(u"such subtables position nothing, so each is made", error["message"])

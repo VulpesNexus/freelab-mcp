@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""The check for fonts FontLab 7.2 crashes on (a GPOS single adjustment of format 2 with no values) and the fixed
+"""The check for fonts FontLab 7.2 crashes on (a GPOS single adjustment with no values) and the fixed
 copy open_font opens instead, on tiny fonts built here (fontbytes); Python 2.7 and 3."""
 
 from __future__ import absolute_import, division, print_function
@@ -81,7 +81,7 @@ class DetectionTests(Case):
         self.assertEqual((scan["format"], scan["checked"], scan["count"]), ("sfnt", True, 2))
         self.assertEqual(self.found(scan), [(0, 1, 1, False, 0, 3), (0, 2, 0, True, 4, 7)])
         self.assertEqual(fl.crasher_summary(scan),
-                         u"2 single adjustment subtables of format 2 with no values (lookups 1 and 2)")
+                         u"2 single adjustment subtables with no values (lookups 1 and 2)")
         otf = fl.scan_font_file(self.write("Clean.otf", fb.sfnt(font(clean_gpos()), b"OTTO")))
         self.assertEqual((otf["format"], otf["checked"], otf["count"], otf["fonts"]), ("sfnt", True, 0, []))
         no_gpos = fl.scan_font_file(self.write("NoGpos.ttf", fb.sfnt(font())))
@@ -89,18 +89,18 @@ class DetectionTests(Case):
 
     def test_one_subtable_is_said_in_the_singular(self):
         scan = fl.scan_font_file(self.write("One.ttf", fb.sfnt(font(fb.gpos([fb.lookup(1, [EMPTY])])))))
-        self.assertEqual(fl.crasher_summary(scan), u"1 single adjustment subtable of format 2 with no values (lookup 0)")
+        self.assertEqual(fl.crasher_summary(scan), u"1 single adjustment subtable with no values (lookup 0)")
         three = fb.gpos([fb.lookup(1, [EMPTY]), fb.lookup(1, [EMPTY, EMPTY]), fb.lookup(1, [EMPTY])])
         scan = fl.scan_font_file(self.write("Three.ttf", fb.sfnt(font(three))))
         self.assertEqual(fl.crasher_summary(scan),
-                         u"4 single adjustment subtables of format 2 with no values (lookups 0, 1, and 2)")
+                         u"4 single adjustment subtables with no values (lookups 0, 1, and 2)")
 
     def test_every_font_of_a_collection_is_checked(self):
         data = fb.collection([font(clean_gpos()), font(crasher_gpos()), font(fb.gpos([fb.lookup(1, [EMPTY])]))])
         scan = fl.scan_font_file(self.write("Family.ttc", data))
         self.assertEqual((scan["format"], scan["checked"], scan["count"]), ("collection", True, 3))
         self.assertEqual([entry["font"] for entry in scan["fonts"]], [1, 2])
-        self.assertEqual(fl.crasher_summary(scan), u"3 single adjustment subtables of format 2 with no values "
+        self.assertEqual(fl.crasher_summary(scan), u"3 single adjustment subtables with no values "
                                                    u"(font 1: lookups 1 and 2; font 2: lookup 0)")
         clean = fl.scan_font_file(self.write("Clean.otc", fb.collection([font(clean_gpos()), font()])))
         self.assertEqual((clean["checked"], clean["count"]), (True, 0))
@@ -128,7 +128,7 @@ class DetectionTests(Case):
         tables = [(b"head", fb.head()), (b"GPOS", clean_gpos()), (b"GPOS", crasher_gpos()), (b"Zzzz", b"zz")]
         scan = fl.scan_font_file(self.write("Family.woff2", fb.woff2(tables, collection_of=[[0, 1, 3], [0, 2]])))
         self.assertEqual([entry["font"] for entry in scan["fonts"]], [1])
-        self.assertEqual(fl.crasher_summary(scan), u"2 single adjustment subtables of format 2 with no values "
+        self.assertEqual(fl.crasher_summary(scan), u"2 single adjustment subtables with no values "
                                                    u"(font 1: lookups 1 and 2)")
 
     def test_sources_folders_and_other_files_are_not_checked(self):
@@ -224,6 +224,65 @@ class DetectionTests(Case):
         finally:
             fl.os.rename = real
         self.assertEqual(os.listdir(os.path.join(self.tmp, "other")), [], "no .tmp left")
+
+
+def filtered_lookup(kind, subtables, mark_set):
+    """A lookup with flag 0x10 (UseMarkFilteringSet): its mark filtering set follows the subtable offsets."""
+    out = struct.pack(">HHH", kind, 0x10, len(subtables))
+    at = 6 + 2 * len(subtables) + 2
+    offsets, body = b"", b""
+    for sub in subtables:
+        offsets += struct.pack(">H", at + len(body))
+        body += sub
+    return out + offsets + struct.pack(">H", mark_set) + body
+
+
+NO_GLYPH_2 = fb.single(2, 0, 0, glyphs=())  # format 2 with no values over no glyph
+NO_GLYPH_1 = fb.single(1, 4, glyphs=())  # format 1 over no glyph (the fixed copy of a static instance, 2026-11-27)
+
+
+class NoGlyphTests(Case):
+    """A single adjustment over no glyph crashed FontLab 7.2 as format 1 too (2026-11-27: NotoSansJP[wght] at wght
+    700, its copy fixed to format 1, crashed in the same function): it is found in either format, and the copy
+    takes it out of its lookup."""
+
+    def gpos(self):
+        return fb.gpos([fb.lookup(1, [fb.single(1, 4), NO_GLYPH_2, fb.single(2, 4, 3), NO_GLYPH_1]),
+                        filtered_lookup(1, [NO_GLYPH_1, fb.single(1, 0), EMPTY], 7),
+                        fb.lookup(9, [fb.extension(NO_GLYPH_2)])])
+
+    def test_found_in_either_format(self):
+        found = fl.empty_single_adjustments(self.gpos())
+        self.assertEqual([(f["lookup"], f["subtable"], f["format"], f["glyphs"]) for f in found],
+                         [(0, 1, 2, 0), (0, 3, 1, 0), (1, 0, 1, 0), (1, 2, 2, 3), (2, 0, 2, 0)])
+        self.assertEqual(fl.empty_single_adjustments(fb.gpos([fb.lookup(1, [fb.single(1, 0)])])), [],
+                         "format 1 over glyphs holds its value")
+
+    def test_the_copy_takes_them_out(self):
+        path = self.write("Static.ttf", fb.sfnt(font(self.gpos())))
+        scan = fl.scan_font_file(path)
+        self.assertEqual(scan["count"], 5)
+        self.assertNotIn("lookup_at", fl.crasher_report(scan)[0]["subtables"][0], "offsets stay inside")
+        target = os.path.join(self.tmp, "copy.ttf")
+        self.assertEqual(fl.write_safe_copy(path, scan, target), 5)
+        with open(target, "rb") as handle:
+            copy = handle.read()
+        self.assertEqual(fl.scan_font_file(target)["count"], 0)
+        gpos_at, gpos_length = fb.tables_of(copy)[b"GPOS"][:2]
+        gpos = copy[gpos_at:gpos_at + gpos_length]
+        listing = struct.unpack_from(">H", gpos, 8)[0]
+
+        def subtables(li):
+            lookup = listing + struct.unpack_from(">H", gpos, listing + 2 + 2 * li)[0]
+            kind, flag, count = struct.unpack_from(">HHH", gpos, lookup)
+            offsets = struct.unpack_from(">%dH" % count, gpos, lookup + 6)
+            forms = [struct.unpack_from(">H", gpos, lookup + o)[0] for o in offsets]
+            mark_set = struct.unpack_from(">H", gpos, lookup + 6 + 2 * count)[0] if flag & 0x10 else None
+            return forms, mark_set
+        self.assertEqual(subtables(0), ([1, 2], None), "the two over glyphs kept as they were")
+        self.assertEqual(subtables(1), ([1, 1], 7), "the mark filtering set moved up with the offsets")
+        self.assertEqual(subtables(2), ([], None), "a lookup of one such subtable is left with none")
+        self.assertEqual(len(copy), os.path.getsize(path), "nothing moved")
 
 
 class CopyTests(Case):
